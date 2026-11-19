@@ -1,8 +1,8 @@
 {
   "name": "cortico-provider-gemini-gateway",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
-  "description": "Cortico provider for Gemini Robin desktop OAuth multi-account pools, Web2API Gemini REST, and custom session RPC gateways.",
+  "description": "面向 Cortico 的 Gemini 多协议模型供应商扩展，支持 Robin 桌面 OAuth 多账号调度、Web2API 原生 Gemini 与自定义会话式 RPC 网关，内置额度监控与账号脱敏。",
   "author": "云纪&云洄",
   "license": "MIT",
   "repository": {
