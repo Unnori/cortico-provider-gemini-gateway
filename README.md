@@ -1,49 +1,108 @@
-# Custom Gemini Gateway
+<p align="center">
+  <img src="assets/icon.png" width="120" alt="Gemini 多合一粮仓" />
+</p>
 
-Cortico Provider API 6 扩展。每次生成都携带完整的 Gemini 上下文，可连接自建或企业内部的会话式 RPC 网关，也可连接提供原生 Gemini 路由的 Web2API 实例。
+### 📦**Gemini 多合一粮仓（Robin / Web2API / 自定义 RPC）**
+给自家桌宠搭的三合一 Gemini 喂食通道，WebUI 面板随切随用：
+- **🐦 知更鸟模式（Robin）**：支持绑多个号轮着喂（主备切号 / 雨露均沾 / 谁额度多先吃谁），自带 5h & 周额度小看板、原生传图和账号打码防社死。
+- **🔑 Web2API 模式**：切过去直接填官方 Gemini API Key 或自建反代 Key，零门槛开箱即用。
+- **🛠️ 自定义 RPC**：给喜欢自己搭网关的折腾党留的后门。
 
-## 端点配置
+---
 
-复制 [provider.example.json](resources/provider.example.json) 到部署目录的 `providers/<端点>/config.json`，填写 `baseUrl`、网关支持的 `spec.model` 和实际路由。
+## 🚀 怎么塞进 Coopanion（30 秒装好）
 
-| 配置 | 默认行为 |
-| --- | --- |
-| `options.protocol` | `rpc` 发送单轮上下文剧本。`gemini` 发送原生 Gemini 请求。`robin` 发送 `RobinService` 的 `{ query: { text } }` 载荷。 |
-| `options.generationEndpoint` | RPC 默认 `generate?$alt=json`。Gemini 默认 `v1beta/models/{model}:streamGenerateContent?alt=sse`。Robin 默认 `$rpc/assistant.mobile.robin.RobinService/StreamGenerate`。支持绝对 URL、相对路由和 `{model}` 占位符。 |
-| `options.uploadEndpoint` | 配置后以 multipart POST 发送 `file` 与 `mimeType`，读取 `id`、`attachmentId`、`attachment_id` 或 `fileUri`。RPC / Robin 的 `inlineData` 需要这个端点或上传钩子。原生 Gemini 模式默认直接发送 `inlineData`。 |
-| `options.deleteEndpoint` | 含 `{conversationId}` 时执行 `DELETE`；`robin` 协议下无占位符时向该端点 `POST { conversationId }`。会话 ID 可来自响应事件的 `conversationId` / `conversation_id` / `conversation.conversationId` 或 `options.conversationHeader` 指定的响应头，默认 `x-conversation-id`。 |
-| `options.temporaryChat` | 默认 `true`，通过请求的 `temporary_chat` 传送。服务端实现决定是否遵循此标志。 |
-| `options.headers` / `options.secretHeaders` | 自定义网关请求头。前者保存明文值，后者将请求头映射到部署端点 `.env` 的变量名。 |
-| `secret` / `options.credentialHeader` / `options.credentialPrefix` | `secret` 为网关 API 密钥变量名。默认头为 `x-goog-api-key`，默认前缀为空。 |
-| `options.authHeader` / `options.authPrefix` | 桌面 OAuth 默认使用 `Authorization` 和 `Bearer `。 |
-| `options.modelsDevUrl` / `options.openRouterUrl` | 可覆盖公开模型目录的 URL。目录请求只带 JSON Accept 头。 |
+1. 打开 Coopanion 的 **扩展 → 模型供应商（Provider）** 页面。
+2. 展开 **「手动安装」→「从 npm 安装」**，填包名（不要粘贴网页链接）：
+   ```text
+   cortico-provider-gemini-gateway
+   ```
+   > 小提示：刚发新版未满 24 小时想抢鲜体验，记得把版本号带上，比如 `cortico-provider-gemini-gateway@0.1.2`。
+3. 点 **「安装」**，装完 **重启 Coopanion**，去 **模型供应商 → 新建** 选它就能开喂啦！
 
-`gemini-web2api-go` 使用 `protocol: "gemini"`。该项目的原生端点接受内联图片和视频。配置上传端点时，它要求 `fileData.fileUri` 是 HTTP(S) URL。音频、PDF、`temporary_chat` 以及会话删除取决于所接入的网关版本和路由。 [gemini-web2api-go 原生 Gemini 接口](https://github.com/zexadev/gemini-web2api-go/blob/main/internal/app/gemini_api.go)
+**装不上？先看这两条避坑小纸条：**
+- **提示找不到包 / 404**：多半是国内 npm 镜像还在同步中，去扩展页把 **「npm 源」留空保存**（切回官方源），或者等几分钟再试。
+- **本机连不上 npm**：直接去 [Releases](https://github.com/Unnori/cortico-provider-gemini-gateway/releases) 下压缩包解压，在手动安装里切到 **「从本机目录安装」** 选文件夹照样能装。
 
-## 桌面 OAuth 与多账号池
+---
 
-出于安全与分发合规考虑，扩展包内的 [desktop-oauth.example.json](resources/desktop-oauth.example.json) 仅保留结构模板，**不内置任何 `clientId` / `clientSecret`**。
+## 🍱 三种喂食姿势，随切随用
 
-- **在 WebUI 中配置（推荐）**：在连接配置页第二步「浏览器 OAuth 认证」中，未填写配置时会自动展开 **「OAuth 客户端配置 (desktop-oauth.json)」** 输入框；将自己准备的完整 JSON 粘贴进去点击「保存 OAuth 配置」后，即可点击「打开浏览器认证」登录。支持在单 Provider 内添加多个账号、切换主用号与调度策略（默认主备故障转移 / 平等轮询 / 按周剩余额度优先）、按账号追踪与一键同意 Robin 服务条款，所有账号名默认按 `5***3@gmail.com` 脱敏并可一键切换显示/隐藏。
-- **使用官方 API Key（零 OAuth 授权）**：如不希望使用桌面 OAuth，可在第一步切换为 **「Web2API Gemini」**（认证模式 `api-key`）并填写自己的官方 API Key 或自建网关密钥。
-- **CLI 方式配置**：将 [desktop-oauth.example.json](resources/desktop-oauth.example.json) 复制到端点目录并命名为 `desktop-oauth.json`，填入 `clientId`、可选 `clientSecret`、`scopes`、`authEndpoint` 和 `tokenEndpoint`。可通过 `authParams` 请求离线授权，通过 `tokenHeaders` 配置请求头，通过 `redirectHost` / `redirectPath` 覆盖回调 URI（默认 `http://127.0.0.1:<随机端口>/oauth/callback`，模板使用 `localhost` 与空路径 `""`）。
+不用死记一堆 JSON 字段——在连接配置页 **第一步** 选好模式，**第二步** 和 **第三步** 的面板会自动跟着变身，用到啥才给你看啥。
 
-在扩展目录运行以下命令，并在浏览器中打开打印的授权链接（独立运行 CLI 会自动读取 `HTTPS_PROXY`/`HTTP_PROXY` 及 Windows 系统代理）：
+### 1. 🐦 知更鸟模式（Robin 桌面 OAuth）
 
-```sh
-pnpm login /path/to/deployment/providers/endpoint
-```
+专门为想用消费级账号喂桌宠准备的省心模式：
 
-多账号令牌保存在端点目录的 `oauth-accounts.json`（并同步主用号到 `oauth-tokens.json`），接近到期时自动续期。401 在流尚未对调用方输出分片时最多触发一次强制续期和重放；多账号模式下遇 429 / 403 / 刷新失败会自动冷却并无缝故障转移到下一个健康账号。
+- **先说安全底线**：出于公开分发规范，包里的 [desktop-oauth.example.json](resources/desktop-oauth.example.json) 默认把 `clientId` 和 `clientSecret` 留空，**绝不在安装包里夹带任何密钥**。打开第二步如果还没填过配置，输入框会自动展开，把你自己准备好的 OAuth 客户端 JSON 粘进去点 **「保存 OAuth 配置」**，就可以点 **「打开浏览器认证」** 登录啦（自己换设备或备份时，也能点 **「复制当前配置」** 一键带走）。
+- **多号轮着喂，三种调度随你切**：往同一个供应商里想绑几个 Google 账号就绑几个，面板会按策略自动变样：
+  - **主备切号（故障转移）**：平时盯着主号吃，主号撞 429 限流、报异常或刷新失败，立刻自动冷却并无缝切给备用号顶上。
+  - **雨露均沾（轮询）**：取消主从高低，每个号平起平坐轮流上阵，卡片直接亮出大家的周额度条。
+  - **谁额度多先吃谁（额度优先）**：实时按 **每周剩余额度** 从多到少排队，粮最足的号自动顶到前面，尽量不把单号周额度吃穿。
+- **几个超顺手的小功能**：
+  - **账号打码防社死**：所有邮箱全局默认打成 `5***3@gmail.com`，截图、录屏、发教程都安心；想核对原名时点一下 **「显示账号名」** 就能一键显隐。
+  - **条款状态小助手**：新绑进来的号，或者上游提示还没同意服务条款时，对应卡片会亮出 **「同意条款」** 按钮，点一下搞定，通过后按钮自动消失。
+  - **原生传图不串号**：发给桌宠看的图片会按账号单独缓存和上传，切号重试时绝不会拿 A 号的附件去撞 B 号的墙。
+  - **额度小看板**：第三步自带 **5 小时窗口 + 每周上限** 双进度条；小科普一下，Robin 是按算力权重扣的（上下文越长、开深度思考、用 Pro/Neon 档掉得越快；Fast/Hydrogen 档日常最划算；Flash-Lite 最轻，主额度吃空后通常也会自动回落到它兜底）。
 
-## 会话式 RPC
+---
 
-默认请求编码生成 `model`、`temporary_chat`、`stream` 和 `script`，其中 `script.system` 保存系统指令，`script.tools` 保存 JSON Schema，`script.turns` 按顺序携带文字、历史函数调用、函数结果和附件引用。响应支持 SSE、NDJSON、JSON 对象和流式 JSON 数组。默认映射接受 Gemini `candidates`、RPC `text` 或 `delta.text`，以及 `response` / `data` 对象封装。
+### 2. 🔑 Web2API 模式（官方 API Key / 自建反代）
 
-可直接在 TypeScript 中实例化 `GatewayClient`，通过 `encodeRequest`、`decodeEvent`、`uploadAttachment(blob, mimeType)` 和 `deleteConversation(conversationId)` 接入不同的网关格式。完整的 `<tool_call>{"name":"lookup","args":{"q":"..."}}</tool_call>` 转成 Gemini `functionCall`，普通文字随流输出。提前结束迭代或发生流错误时，已收到的会话 ID 也会进入清理。
+不想折腾 OAuth，只想拿个 Key 直接开聊？选它准没错：
 
-## 模型目录
+1. 第一步切到 **「Web2API Gemini」**，Base URL 填官方 `https://generativelanguage.googleapis.com` 或者你自己的反代地址（比如 [`gemini-web2api-go`](https://github.com/zexadev/gemini-web2api-go)）。
+2. 第二步会自动变成 **「API 密钥配置」**，直接粘进官方 API Key 或反代 Key，按网关习惯选一下 `x-goog-api-key` / `Authorization: Bearer` / 自定义请求头预设，保存就能聊。
+3. 密钥单独保存在端点数据目录里（仅当前用户可读），既不进代码仓库，也不会写死进配置模板。
 
-模型目录优先使用 models.dev 的 Google 条目，失败时读取 OpenRouter，磁盘缓存有效期为 24 小时。目录未收录的 `gemini-*` 使用 1,048,576 上下文、65,536 输出和文本、图像、音频、PDF MIME 基线。远程价格以 USD/百万 token 作为参考价，部署的网关账单可有自己的价格。 [models.dev API](https://github.com/anomalyco/models.dev/blob/dev/README.md) [OpenRouter Models API](https://openrouter.ai/docs/api/api-reference/models/get-models)
+---
 
-在扩展目录运行 `pnpm install` 后可执行 `pnpm verify`（构建 WebUI、Node/Browser 双向类型检查与 Vitest 单元测试）。
+### 3. 🛠️ 自定义 RPC 模式（给折腾党留的后门）
+
+如果你自己手搓了会话式转发网关，第一步切到 **「自定义 RPC」**：
+- 第二步管鉴权（API Key 或自定义 OAuth 都行）。
+- 第三步直接变成 **「自定义路由与端点」**，生成、上传附件、删临时会话、查额度四条路由随便改。
+
+顺手附一张进阶玩家用的字段速查表（WebUI 改完会自动写入 `config.json`，想手写也能参考 [provider.example.json](resources/provider.example.json)）：
+
+| 你想调啥 | 对应字段 | 怎么玩 |
+| --- | --- | --- |
+| 走哪种协议 | `options.protocol` | `robin`（知更鸟）/ `gemini`（原生 REST）/ `rpc`（自定义会话剧本） |
+| 生成接口路由 | `options.generationEndpoint` | 支持相对路由、绝对 URL 和 `{model}` 占位符；不填会按协议自动套默认值 |
+| 附件上传路由 | `options.uploadEndpoint` | 给自建 RPC / 反代用：multipart POST 发 `file` 和 `mimeType`，自动识别返回的 `id` / `attachmentId` / `fileUri` |
+| 聊完自动清会话 | `options.deleteEndpoint` / `options.temporaryChat` | 默认开启无痕（`temporaryChat: true`）；填了删除路由后，哪怕对话中途打断也会帮你把临时会话清干净 |
+| 会话 ID 响应头 | `options.conversationHeader` | 网关把会话 ID 塞在响应头里时改这里，默认读 `x-conversation-id` |
+| 自定义请求头 | `options.headers` / `options.secretHeaders` | 明文头放前者，不想明文暴露的头用后者映射到 `.env` 变量名 |
+| 鉴权头格式 | `options.credentialHeader` / `options.authHeader` | API Key 默认走 `x-goog-api-key`，OAuth 默认走 `Authorization: Bearer `，随时可改 |
+| 模型目录源 | `options.modelsDevUrl` / `options.openRouterUrl` | 默认自动拉 `models.dev`（失败兜底 `OpenRouter`，缓存 24h）；未收录的 `gemini-*` 自动按 1M 上下文 / 64K 输出基线兜底 |
+
+> 协议实现细节都整理在 [docs/DESKTOP_OAUTH.md](docs/DESKTOP_OAUTH.md) 和 [docs/GEMINI_REST.md](docs/GEMINI_REST.md) 里，折腾魔改时可以当字典翻；另外还支持直接 `import { GatewayClient }` 自己写 `encodeRequest` / `decodeEvent` 接奇奇怪怪的网关格式。
+
+---
+
+## 💻 命令行 & 开发者小工具
+
+- **纯命令行登录 OAuth**（跑独立脚本时会自动读 `HTTPS_PROXY` / `HTTP_PROXY` 和 Windows 系统代理，记得让代理放行 `localhost` 回环回调）：
+  ```sh
+  pnpm login /path/to/deployment/providers/<端点目录>
+  ```
+  令牌会自动存在端点目录的 `oauth-accounts.json`（并同步主号到 `oauth-tokens.json`），快过期自动续期，401 自动抢救重放一次。
+
+- **本地改代码 & 跑体检**：
+  ```sh
+  pnpm install
+  pnpm verify   # 一键打 WebUI 包 + 双向 TS 类型检查 + 跑全套单元测试
+  ```
+
+---
+
+## ⚠️ 温馨小提醒
+
+- **知更鸟（Robin）模式**走的是非官方消费级接口，请合理控制频率、善用多账号分摊，别把心爱的账号累到吃红牌；要绝对稳妥直接切 **Web2API 模式** 上官方 API Key 就好。
+- 本扩展采用 **MIT** 协议开源，欢迎提 Issue 或一起来玩。
+
+---
+
+<p align="center">
+  Made with ❤️ by <strong>云纪&云洄</strong>
+</p>
