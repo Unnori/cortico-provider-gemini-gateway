@@ -404,6 +404,10 @@ export class RobinPartFilter {
   private readonly seenCallIds = new Set<string>();
   private lastCallOrdinal: number | null = null;
 
+  get isTruncated(): boolean {
+    return this.truncated;
+  }
+
   private flushSafeText(raw: string, out: GeminiPart[]): void {
     if (!raw || this.truncated) return;
     if (!this.seenVisibleText) {

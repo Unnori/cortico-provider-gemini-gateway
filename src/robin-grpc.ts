@@ -666,6 +666,8 @@ export interface StreamRobinGrpcOptions {
   temporaryChat?: boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Max time to wait for trailing frames / HTTP/2 END_STREAM after receiving `completed: true`. */
+  completedGraceMs?: number;
   connectHttp2?: Http2Connector;
   onStatus?: (httpStatus: number | null, requestId: string | null) => void;
 }
@@ -674,6 +676,7 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
   const origin = new URL(options.baseUrl).origin;
   const path = normalizeGrpcPath(options.path ?? ROBIN_GRPC_PROCESS_QUERY);
   const timeoutMs = options.timeoutMs ?? 180_000;
+  const completedGraceMs = options.completedGraceMs ?? 500;
   const wire = buildProcessQueryWire({
     userText: options.userText,
     images: options.images,
@@ -702,9 +705,12 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
 
   let req: http2.ClientHttp2Stream | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let completedTimer: ReturnType<typeof setTimeout> | undefined;
 
   const stop = (normal: boolean) => {
     clearTimeout(timer);
+    clearTimeout(completedTimer);
+    completedTimer = undefined;
     options.signal?.removeEventListener('abort', onAbort);
     try {
       req?.close(normal ? http2.constants.NGHTTP2_NO_ERROR : http2.constants.NGHTTP2_CANCEL);
@@ -810,7 +816,22 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
     try {
       for (const message of reader.push(chunk)) {
         const decoded = decodeProcessQueryFrame(message);
-        if (decoded) pushFrame(decoded);
+        if (decoded) {
+          pushFrame(decoded);
+          if (decoded.completed && !completedTimer && completedGraceMs >= 0) {
+            completedTimer = setTimeout(() => {
+              if (closed) return;
+              if (grpcStatus !== null && grpcStatus !== 0) {
+                const mapped = grpcStatusToHttp(grpcStatus);
+                const detail = formatGrpcErrorDetail(grpcStatus, grpcMessage, 'generation');
+                fail(new GatewayError(mapped, 'generation', { detail, body: detail }));
+                return;
+              }
+              finish();
+            }, completedGraceMs);
+            completedTimer.unref();
+          }
+        }
       }
     } catch (err) {
       fail(new GatewayError(502, 'generation', { detail: err instanceof Error ? err.message : 'Invalid gRPC frame', cause: err }));

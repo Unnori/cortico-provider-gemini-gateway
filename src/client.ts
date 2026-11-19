@@ -392,13 +392,15 @@ export class GatewayClient {
       }
       const parts = filter.feed(rawParts);
       received ||= Boolean(parts.length || frame.completed || emittedText.length > 0);
-      if (!parts.length && !frame.responseId && !frame.modelVersion) continue;
       if (parts.length) onMeta({ observed: true });
-      yield {
-        ...(parts.length ? { candidates: [{ content: { role: 'model', parts } }] } : {}),
-        responseId: frame.responseId,
-        modelVersion: frame.modelVersion,
-      };
+      if (parts.length || frame.responseId || frame.modelVersion) {
+        yield {
+          ...(parts.length ? { candidates: [{ content: { role: 'model', parts } }] } : {}),
+          responseId: frame.responseId,
+          modelVersion: frame.modelVersion,
+        };
+      }
+      if (filter.isTruncated) break;
     }
 
     if (!received) throw new Error('Gemini gateway stream ended without a complete response');
@@ -523,12 +525,14 @@ export class GatewayClient {
               const parts = robinFilter ? robinFilter.feed(rawParts) : rawParts;
               finishReason = event.finishReason ?? finishReason;
               received ||= Boolean(parts.length || event.parts?.length || event.finishReason);
-              if (!parts.length && !event.usageMetadata && !event.responseId && !event.modelVersion) continue;
-              observed = true;
-              yield {
-                ...(parts.length ? { candidates: [{ content: { role: 'model', parts } }] } : {}),
-                usageMetadata: event.usageMetadata, responseId: event.responseId, modelVersion: event.modelVersion,
-              };
+              if (parts.length || event.usageMetadata || event.responseId || event.modelVersion) {
+                observed = true;
+                yield {
+                  ...(parts.length ? { candidates: [{ content: { role: 'model', parts } }] } : {}),
+                  usageMetadata: event.usageMetadata, responseId: event.responseId, modelVersion: event.modelVersion,
+                };
+              }
+              if (robinFilter?.isTruncated) break;
             }
             if (!received || (!finishReason && this.protocol === 'gemini')) throw new Error('Gemini gateway stream ended without a complete response');
             const parserTail = parser.finish();

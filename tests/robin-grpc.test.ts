@@ -624,4 +624,90 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
     expect(summary.downgraded).toBe(true);
     expect(summary.lastAttribution).toBe('Used auto model selection');
   });
+
+  it('closes cleanly after completed grace period when HTTP/2 END_STREAM stalls, and cancels immediately on tool-call truncation', async () => {
+    let scenario: 'hang-after-completed' | 'hallucinate-after-tool' = 'hang-after-completed';
+    let hallucinateStreamClosedEarly = false;
+    const openStreams: http2.ServerHttp2Stream[] = [];
+    const server = http2.createServer();
+
+    server.on('stream', (stream, headers) => {
+      if (headers[':path'] !== ROBIN_GRPC_PROCESS_QUERY) {
+        stream.respond({ ':status': 404 });
+        stream.end();
+        return;
+      }
+      openStreams.push(stream);
+      const chunks: Buffer[] = [];
+      stream.on('data', c => chunks.push(c as Buffer));
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        if (scenario === 'hang-after-completed') {
+          // Server sends `completed: true` frame, then intentionally NEVER sends END_STREAM / trailers.
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: 'All done!',
+            responseId: 'rc_hang',
+            attribution: 'Gemini 4 Hydrogen',
+            completed: true,
+          })));
+          return;
+        }
+        // Tool call followed immediately by hallucinated [User] follow-up turn; stream intentionally stays open.
+        stream.on('close', () => { hallucinateStreamClosedEarly = true; });
+        stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+          text: '<tool_call>{"name":"pet_say","args":{"script":"你好呀"}}</tool_call>\n[User]\n假装自己是用户继续胡说八道...',
+          responseId: 'rc_trunc',
+          attribution: 'Gemini 4 Hydrogen',
+          completed: false,
+        })));
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const client = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        auth: { accessToken: async () => 'fresh-token' },
+      });
+
+      // Case 1: completed=true arrived, server/proxy never closes H2 stream -> finishes via 500ms grace period.
+      const t0 = Date.now();
+      const chunks1 = await consume(client.stream({
+        model: 'gemini-robin-fast',
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+      }));
+      const elapsed1 = Date.now() - t0;
+      expect(elapsed1).toBeLessThan(2_500);
+      expect(chunks1.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'All done!' }]);
+      expect(chunks1.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+
+      // Case 2: model hallucinates follow-up turn after <tool_call> -> immediately yields valid call & cancels upstream stream!
+      scenario = 'hallucinate-after-tool';
+      const t1 = Date.now();
+      const chunks2 = await consume(client.stream({
+        model: 'gemini-robin-fast',
+        tools: [{ functionDeclarations: [{ name: 'pet_say', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'say hi' }] }],
+      }));
+      const elapsed2 = Date.now() - t1;
+      expect(elapsed2).toBeLessThan(1_000);
+      expect(chunks2.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { functionCall: { name: 'pet_say', args: { script: '你好呀' } } },
+      ]);
+      expect(chunks2.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(hallucinateStreamClosedEarly).toBe(true);
+    } finally {
+      for (const s of openStreams) {
+        try { s.destroy(); } catch { /* ignore */ }
+      }
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
 });
