@@ -1,4 +1,4 @@
-import { proxyFetch, type Http2Connector } from './http.ts';
+import { createHttp2Connector, createProxyFetchFor, type Http2Connector } from './http.ts';
 import type { AccountRoutingMode } from './options.ts';
 import { GatewayError, inspectHttpError } from './queue.ts';
 import { isRobinGrpcRoute, queryRobinGrpcUsageInfo, ROBIN_GRPC_GET_USAGE_INFO } from './robin-grpc.ts';
@@ -64,6 +64,7 @@ export interface QuotaQueryOptions {
   auth?: { accessToken(force?: boolean): Promise<string> };
   authHeader?: string;
   authPrefix?: string;
+  proxyUrl?: string;
   fetch?: typeof fetch;
   connectHttp2?: Http2Connector;
 }
@@ -224,7 +225,8 @@ export async function queryGatewayQuota(options: QuotaQueryOptions, signal?: Abo
 
   const useGrpc = options.protocol === 'robin' && isRobinGrpcRoute(route);
   const url = httpUrl(new URL(route, options.baseUrl.replace(/\/+$/, '') + '/').href).href;
-  const request = options.fetch ?? proxyFetch;
+  const request = options.fetch ?? createProxyFetchFor(options.proxyUrl);
+  const h2Connector = options.connectHttp2 ?? createHttp2Connector(options.proxyUrl);
   const deadline = AbortSignal.timeout(15_000);
   const combinedSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
 
@@ -242,7 +244,7 @@ export async function queryGatewayQuota(options: QuotaQueryOptions, signal?: Abo
           path: route,
           headers,
           signal: combinedSignal,
-          connectHttp2: options.connectHttp2,
+          connectHttp2: h2Connector,
         });
       } catch (error) {
         if (error instanceof GatewayError && error.status === 401 && attempt === 0 && options.auth && !combinedSignal.aborted) {

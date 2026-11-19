@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { requestJson } from 'cortico/providers/transport/response-http.ts';
 import { gatewayFrames } from './frames.ts';
-import { proxyFetch, type Http2Connector } from './http.ts';
+import { createHttp2Connector, createProxyFetchFor, type Http2Connector } from './http.ts';
 import { GatewayError, inspectHttpError, SerialQueue } from './queue.ts';
 import {
   detectRobinImageMime,
@@ -53,6 +53,7 @@ export interface GatewayClientOptions {
   resolveRobinModeCategory?: (model: string, accountId?: string) => number | undefined;
   onRobinRouting?: (observation: RobinRoutingObservation, accountId?: string) => void;
   onCleanupError?: (error: unknown) => void;
+  proxyUrl?: string;
   fetch?: typeof fetch;
   connectHttp2?: Http2Connector;
 }
@@ -89,6 +90,7 @@ const ROBIN_UPLOAD_CACHE_MAX = 32;
 export class GatewayClient {
   private readonly queue = new SerialQueue();
   private readonly request: typeof fetch;
+  private readonly h2Connector: Http2Connector;
   private readonly protocol: GatewayProtocol;
   private readonly base: string;
   private readonly options: GatewayClientOptions;
@@ -97,7 +99,8 @@ export class GatewayClient {
   constructor(options: GatewayClientOptions) {
     this.options = options;
     this.base = httpUrl(options.baseUrl).href;
-    this.request = options.fetch ?? proxyFetch;
+    this.request = options.fetch ?? createProxyFetchFor(options.proxyUrl);
+    this.h2Connector = options.connectHttp2 ?? createHttp2Connector(options.proxyUrl);
     this.protocol = options.protocol ?? 'rpc';
   }
 
@@ -233,13 +236,16 @@ export class GatewayClient {
     input.contents.forEach((turn, turnIndex) => collect('turn', turnIndex, turn.parts));
     if (!candidates.length) return { request: input, uploader: undefined };
 
-    // Keep the newest supported images within Robin's per-request count & byte budgets.
+    // Keep only supported images from the latest turn, within Robin's per-request count & byte budgets.
+    // Earlier-turn images are never re-uploaded or re-inferred; they become compact text placeholders.
+    const lastTurnIndex = input.contents.length - 1;
     const keptKeys = new Set<string>();
     const keptList: InlineCandidate[] = [];
     let totalBytes = 0;
     for (let i = candidates.length - 1; i >= 0; i--) {
       const candidate = candidates[i];
       if (!candidate.mimeType) continue;
+      if (candidate.section !== 'turn' || candidate.turnIndex !== lastTurnIndex) continue;
       if (keptList.length >= ROBIN_MAX_IMAGES_PER_REQUEST) continue;
       if (totalBytes + candidate.bytes.length > ROBIN_MAX_IMAGE_BYTES) continue;
       totalBytes += candidate.bytes.length;
@@ -264,7 +270,7 @@ export class GatewayClient {
         headers,
         origin: this.options.robinUploadOrigin,
         signal,
-        connectHttp2: this.options.connectHttp2,
+        connectHttp2: this.h2Connector,
       });
       const expiresAt = Date.now() + ROBIN_UPLOAD_CACHE_TTL_MS;
       for (let i = 0; i < toUpload.length; i++) {
@@ -287,9 +293,12 @@ export class GatewayClient {
         const key = `${section}:${turnIndex}:${partIndex}`;
         const candidate = byKey.get(key);
         if (!candidate || !keptKeys.has(key)) {
+          if (candidate?.mimeType && (candidate.section !== 'turn' || candidate.turnIndex !== lastTurnIndex)) {
+            return { text: '[Earlier image omitted]' };
+          }
           const reason = !candidate?.mimeType
             ? `unsupported Robin attachment (${part.inlineData.mimeType})`
-            : 'earlier or oversized image omitted';
+            : 'oversized or excess image omitted';
           return { text: `[Attachment omitted: ${reason}]` };
         }
         const cached = this.robinImageCache.get(candidate.cacheKey)!;
@@ -356,7 +365,7 @@ export class GatewayClient {
       overrideModeCategory,
       temporaryChat: this.options.temporaryChat ?? true,
       signal,
-      connectHttp2: this.options.connectHttp2,
+      connectHttp2: this.h2Connector,
       onStatus: (httpStatus, requestId) => onMeta({ status: httpStatus, requestId }),
     })) {
       signal.throwIfAborted();

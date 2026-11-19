@@ -3,8 +3,10 @@ import zlib from 'node:zlib';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createProxyFetch,
+  maskProxyDisplay,
   matchesNoProxy,
   normalizeProxyUrl,
+  parseProxyUrlInput,
   parseWindowsProxyServer,
   proxyForUrl,
   resetProxyCache,
@@ -136,6 +138,30 @@ describe('proxy resolution and transport', () => {
         connectAuthority: 'www.googleapis.com:443',
         proxyAuth: `Basic ${Buffer.from('user:pass').toString('base64')}`,
       });
+
+      // Explicit per-provider proxyUrl overrides host proxy flags (--use-env-proxy / COOPANION_SYSTEM_PROXY=1).
+      expect(parseProxyUrlInput('')).toBeUndefined();
+      expect(parseProxyUrlInput('7890')).toBe('http://127.0.0.1:7890');
+      expect(parseProxyUrlInput(':10809')).toBe('http://127.0.0.1:10809');
+      expect(parseProxyUrlInput('127.0.0.1:7891')).toBe('http://127.0.0.1:7891');
+      expect(parseProxyUrlInput('http://user:pass@127.0.0.1:7891/')).toBe('http://user:pass@127.0.0.1:7891');
+      expect(maskProxyDisplay('http://user:pass@127.0.0.1:7891')).toBe('http://127.0.0.1:7891');
+      expect(() => parseProxyUrlInput('socks5://127.0.0.1:1080')).toThrow(/HTTP\/HTTPS/);
+      expect(() => parseProxyUrlInput('99999')).toThrow(/格式无效/);
+
+      const fallback = vi.fn<typeof fetch>(async () => Response.json({ fallback: true }));
+      const explicitFetch = createProxyFetch({
+        proxyUrl,
+        env: { COOPANION_SYSTEM_PROXY: '1' },
+        execArgv: ['--use-env-proxy'],
+        fallbackFetch: fallback,
+      });
+      const overrideRes = await explicitFetch('http://gateway.example.test/override', { method: 'GET' });
+      expect(overrideRes.status).toBe(200);
+      expect(fallback).not.toHaveBeenCalled();
+      // Loopback targets still bypass even when explicit proxyUrl is configured.
+      await explicitFetch('http://127.0.0.1:9999/local');
+      expect(fallback).toHaveBeenCalledTimes(1);
     } finally {
       await new Promise<void>(resolve => proxyServer.close(() => resolve()));
     }

@@ -1562,6 +1562,12 @@ var gatewayPanel = {
     const tempCheck = ui.checkbox(t("\u542F\u7528\u65E0\u75D5\u4F1A\u8BDD\u6807\u5FD7 (temporary_chat)", "Send temporary_chat flag"), {
       onChange: () => void saveOptions()
     });
+    const proxyUrlInput = ui.input({
+      cls: "mono",
+      placeholder: t("\u7559\u7A7A\u8DDF\u968F\u7CFB\u7EDF\u4EE3\u7406\uFF1B\u652F\u6301 7890 \u6216 http://127.0.0.1:7890", "Leave blank for system proxy; e.g. 7890 or http://127.0.0.1:7890"),
+      onChange: () => void saveOptions()
+    });
+    const proxyUrlField = ui.field(t("\u72EC\u7ACB\u4EE3\u7406\u5730\u5740\uFF08\u53EF\u9009\uFF09", "Dedicated proxy URL (optional)"), proxyUrlInput);
     const testRow = ui.rowbar();
     const testBtn = ui.button(t("\u6D4B\u8BD5\u8FDE\u63A5", "Test connection"), {
       size: "sm",
@@ -1575,11 +1581,13 @@ var gatewayPanel = {
       baseUrlField,
       ui.field(t("\u8BA4\u8BC1\u6A21\u5F0F", "Auth mode"), authModeSelect),
       tempCheck.el,
+      proxyUrlField,
       testRow,
       message
     );
     let saving = false;
     let currentProtocol = "robin";
+    let lastSavedProxyUrl = "";
     function modeDescription(protocol) {
       if (protocol === "robin") return t("RobinService HTTP/2 gRPC\uFF08\u81EA\u52A8\u5207\u6362\u5B98\u65B9\u7AEF\u70B9\u4E0E\u8DEF\u7531\uFF09", "RobinService HTTP/2 gRPC (auto endpoint & routes)");
       if (protocol === "gemini") return t("\u539F\u751F Gemini REST SSE\uFF08\u81EA\u52A8\u62FC\u63A5\u6D41\u5F0F\u751F\u6210\u8DEF\u7531\uFF09", "Native Gemini REST SSE (auto stream route)");
@@ -1592,6 +1600,8 @@ var gatewayPanel = {
       rpcBtn.classList.toggle("primary", state.protocol === "rpc");
       authModeSelect.value = state.authMode;
       tempCheck.setChecked(state.temporaryChat);
+      lastSavedProxyUrl = state.proxyUrl ?? "";
+      proxyUrlInput.value = lastSavedProxyUrl;
       baseUrlField.hidden = state.protocol === "robin";
       if (state.protocol !== "robin") {
         baseUrlInput.value = state.baseUrl;
@@ -1635,7 +1645,7 @@ var gatewayPanel = {
       }
     }
     async function saveOptions(overrides = {}) {
-      if (saving || signal.aborted) return;
+      if (saving || signal.aborted) return false;
       saving = true;
       message.textContent = "";
       message.classList.remove("bad");
@@ -1645,6 +1655,7 @@ var gatewayPanel = {
           protocol: currentProtocol,
           authMode: overrides.authMode ?? authModeSelect.value,
           temporaryChat: tempCheck.checked,
+          proxyUrl: proxyUrlInput.value,
           ...currentProtocol !== "robin" ? { baseUrl: baseUrlInput.value } : {}
         }]);
         if (!signal.aborted) {
@@ -1658,17 +1669,23 @@ var gatewayPanel = {
           });
           message.textContent = t("\u914D\u7F6E\u5DF2\u81EA\u52A8\u540C\u6B65\uFF08\u8BF7\u70B9\u51FB\u9875\u9762\u5E95\u90E8\u300C\u4FDD\u5B58\u300D\u751F\u6548\uFF09\u3002", "Options synced. Click Save below to persist.");
         }
+        return true;
       } catch (err) {
         if (!signal.aborted) {
           message.textContent = err instanceof Error ? err.message : String(err);
           message.classList.add("bad");
         }
+        return false;
       } finally {
         saving = false;
       }
     }
     async function runTest() {
       if (saving || signal.aborted) return;
+      if (proxyUrlInput.value.trim() !== lastSavedProxyUrl) {
+        const savedOk = await saveOptions();
+        if (!savedOk || signal.aborted) return;
+      }
       testBtn.disabled = true;
       message.textContent = t("\u6B63\u5728\u6D4B\u8BD5\u8FDE\u63A5\u2026", "Testing connection\u2026");
       message.classList.remove("bad");

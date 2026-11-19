@@ -361,6 +361,8 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
     let uploadStarts = 0;
     let uploadFinishes = 0;
     const receivedBlobIdsPerTurn: string[][] = [];
+    const receivedTextsPerTurn: string[] = [];
+    const pngBytes2 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xde, 0xad, 0xbe, 0xef]);
 
     const server = http2.createServer();
     let baseUrl = '';
@@ -389,7 +391,8 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
           uploadFinishes += 1;
           expect(headers['x-goog-upload-command']).toBe('upload, finalize');
           expect(headers['x-goog-upload-offset']).toBe('0');
-          expect(Buffer.concat(chunks).equals(pngBytes)).toBe(true);
+          const uploadedBuf = Buffer.concat(chunks);
+          expect(uploadedBuf.equals(pngBytes) || uploadedBuf.equals(pngBytes2)).toBe(true);
           stream.respond({ ':status': 200, 'x-goog-upload-status': 'final' });
           stream.end(`/contrib_service/ttl_1d/uploaded-${uploadFinishes}`);
           return;
@@ -401,6 +404,7 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
           const req1001 = parseProtobuf(reqInit.find(f => f.number === 1001)!.payload);
           const reqTpl = parseProtobuf(req1001.find(f => f.number === 1)!.payload);
           const reqQuery = parseProtobuf(reqTpl.find(f => f.number === 1)!.payload);
+          receivedTextsPerTurn.push(reqQuery.find(f => f.number === 1)?.payload.toString('utf8') ?? '');
           const ids = reqQuery
             .filter(f => f.number === 3)
             .map(f => parseProtobuf(parseProtobuf(f.payload).find(a => a.number === 1)!.payload).find(b => b.number === 1)!.payload.toString('utf8'));
@@ -457,9 +461,60 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
       // Direct helper used 1 upload + client turn 1 used 1 upload; turn 2 hit SHA-256 cache!
       expect(uploadStarts).toBe(2);
       expect(uploadFinishes).toBe(2);
+
+      // Follow-up text-only turn: earlier image in turn 0 is replaced with a placeholder and NOT attached or uploaded.
+      const followUpTextOnly: GeminiRequest = {
+        model: 'gemini-4-hydrogen',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: 'Look at this old image' },
+              { inlineData: { mimeType: 'image/png', data: pngBytes.toString('base64') } },
+            ],
+          },
+          { role: 'model', parts: [{ text: 'It is a cat.' }] },
+          { role: 'user', parts: [{ text: 'Now tell me a joke.' }] },
+        ],
+      };
+      const turn3 = await consume(client.stream(followUpTextOnly));
+      expect(turn3.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'Saw 0 image(s)' }]);
+      expect(uploadStarts).toBe(2);
+      expect(receivedTextsPerTurn[2]).toContain('[Earlier image omitted]');
+      expect(receivedTextsPerTurn[2]).not.toContain('[Attached image:');
+
+      // Follow-up turn with a NEW image: only the latest turn's new image is uploaded and attached; old image stays a placeholder.
+      const followUpWithNewImage: GeminiRequest = {
+        model: 'gemini-4-hydrogen',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: 'Look at this old image' },
+              { inlineData: { mimeType: 'image/png', data: pngBytes.toString('base64') } },
+            ],
+          },
+          { role: 'model', parts: [{ text: 'It is a cat.' }] },
+          {
+            role: 'user',
+            parts: [
+              { text: 'What about this new image?' },
+              { inlineData: { mimeType: 'image/png', data: pngBytes2.toString('base64') } },
+            ],
+          },
+        ],
+      };
+      const turn4 = await consume(client.stream(followUpWithNewImage));
+      expect(turn4.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'Saw 1 image(s)' }]);
+      expect(uploadStarts).toBe(3);
+      expect(uploadFinishes).toBe(3);
+      expect(receivedTextsPerTurn[3]).toContain('[Earlier image omitted]');
+      expect(receivedTextsPerTurn[3]).toContain('[Attached image: image-1.png (image/png)]');
       expect(receivedBlobIdsPerTurn).toEqual([
         ['/contrib_service/ttl_1d/uploaded-2'],
         ['/contrib_service/ttl_1d/uploaded-2'],
+        [],
+        ['/contrib_service/ttl_1d/uploaded-3'],
       ]);
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));

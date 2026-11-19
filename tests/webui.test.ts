@@ -309,6 +309,39 @@ describe('gateway WebUI browser OAuth, persistence, direct call, and quota panel
 
       const testOk = await ui.invoke!('gateway', 'test', [{ name: 'draft' }]) as GatewayTestResult;
       expect(testOk.ok).toBe(true);
+
+      // Save dedicated proxyUrl (shorthand port -> normalized URL), verify persistence across mode switches & clear.
+      const withProxy = await ui.invoke!('gateway', 'save-options', [{
+        name: 'draft',
+        protocol: 'gemini',
+        authMode: 'api-key',
+        temporaryChat: true,
+        proxyUrl: '7891',
+      }]) as GatewayPanelState;
+      expect(withProxy.proxyUrl).toBe('http://127.0.0.1:7891');
+      const testWithProxy = await ui.invoke!('gateway', 'test', [{ name: 'draft' }]) as GatewayTestResult;
+      expect(testWithProxy.ok).toBe(true);
+      expect(testWithProxy.summary).toContain('http://127.0.0.1:7891');
+
+      const switchedPreserveProxy = await ui.invoke!('gateway', 'apply-preset', [{ name: 'draft', preset: 'robin' }]) as GatewayPanelState;
+      expect(switchedPreserveProxy.proxyUrl).toBe('http://127.0.0.1:7891');
+
+      await expect(ui.invoke!('gateway', 'save-options', [{
+        name: 'draft',
+        protocol: 'robin',
+        authMode: 'oauth',
+        temporaryChat: true,
+        proxyUrl: 'socks5://127.0.0.1:1080',
+      }])).rejects.toThrow(/HTTP\/HTTPS/);
+
+      const clearedProxy = await ui.invoke!('gateway', 'save-options', [{
+        name: 'draft',
+        protocol: 'gemini',
+        authMode: 'api-key',
+        temporaryChat: true,
+        proxyUrl: '',
+      }]) as GatewayPanelState;
+      expect(clearedProxy.proxyUrl).toBe('');
       expect(testOk.summary).toContain('API Key');
 
       // 2. Switch Step 1 to Custom RPC -> Step 3 exposes custom routes editor.

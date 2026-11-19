@@ -4,6 +4,7 @@ import type { LLMProviderEntry } from 'cortico/core/types.ts';
 import type { ProviderHost } from 'cortico/providers/base.ts';
 import type { GatewayClientOptions } from './client.ts';
 import { readStoredApiKey } from './api-key.ts';
+import { parseProxyUrlInput } from './http.ts';
 import { OAUTH_ACCOUNTS_FILE, OAUTH_CONFIG_FILE, OAUTH_TOKENS_FILE } from './oauth.ts';
 import type { GatewayProtocol } from './shim.ts';
 import { httpUrl, stringMap } from './state.ts';
@@ -17,6 +18,7 @@ export interface GatewayConfiguration extends GatewayClientOptions {
   authMode: AuthMode;
   accountRouting: AccountRoutingMode;
   quotaEndpoint?: string;
+  proxyUrl?: string;
   credentialHeader?: string;
   credentialPrefix?: string;
   secretHeaders: Record<string, string>;
@@ -72,6 +74,8 @@ export function configuration(entry: LLMProviderEntry): GatewayConfiguration {
   for (const url of [modelsDevUrl, openRouterUrl]) {
     if (url !== undefined) httpUrl(url);
   }
+  const rawProxyUrl = option(entry, 'proxyUrl');
+  const proxyUrl = rawProxyUrl !== undefined ? parseProxyUrlInput(rawProxyUrl) : undefined;
   const oauthProfile = option(entry, 'oauthProfile');
   if (oauthProfile !== undefined && !/^[a-f0-9-]{36}$/.test(oauthProfile)) {
     throw new Error('Invalid OAuth profile');
@@ -102,6 +106,7 @@ export function configuration(entry: LLMProviderEntry): GatewayConfiguration {
     uploadEndpoint,
     deleteEndpoint,
     quotaEndpoint,
+    proxyUrl,
     temporaryChat,
     headers,
     secretHeaders,

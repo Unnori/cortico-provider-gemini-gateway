@@ -167,7 +167,9 @@ function formatRobinPart(
   imageLabels?: Map<ScriptPart, string>,
 ): string {
   if (part.type === 'text') {
-    if (part.thought) return `<thought>\n${part.text}\n</thought>`;
+    // Robin replays history as plain text without native thought signatures;
+    // strip historical thinking traces to avoid compounding token/GXU usage across turns.
+    if (part.thought) return '';
     return role === 'model' ? cleanHistoricalAssistantText(part.text) : part.text;
   }
   if (part.type === 'function_call') return `${TOOL_OPEN}${JSON.stringify(part.call)}${TOOL_CLOSE}`;
@@ -175,6 +177,77 @@ function formatRobinPart(
   const imageLabel = imageLabels?.get(part);
   if (imageLabel) return `[Attached image: ${imageLabel} (${part.mimeType})]`;
   return `[Attachment: ${part.id} (${part.mimeType})]`;
+}
+
+/**
+ * Losslessly strips pure JSON Schema boilerplate ($schema, $id, $comment, boolean
+ * additionalProperties, empty required/properties/description, redundant title)
+ * from Robin's serialized tool list while preserving every semantic constraint,
+ * description, enum, and parameter name.
+ */
+function pruneRobinToolSchema(node: unknown, propName?: string, depth = 0): unknown {
+  if (depth > 16 || !node || typeof node !== 'object') return node;
+  if (Array.isArray(node)) return node.map(item => pruneRobinToolSchema(item, undefined, depth + 1));
+
+  const src = node as Record<string, unknown>;
+  const hasDescription = typeof src.description === 'string' && src.description.trim().length > 0;
+  const out: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(src)) {
+    if (value === undefined) continue;
+    if (key === '$schema' || key === '$id' || key === '$comment') continue;
+    if (key === 'additionalProperties' && typeof value === 'boolean') continue;
+    if (key === 'required' && Array.isArray(value) && value.length === 0) continue;
+    if (key === 'description' && typeof value === 'string' && !value.trim()) continue;
+    if (key === 'title' && typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed || hasDescription || (propName && trimmed.toLowerCase() === propName.toLowerCase())) continue;
+    }
+
+    if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
+      const props: Record<string, unknown> = {};
+      for (const [pName, pSchema] of Object.entries(value as Record<string, unknown>)) {
+        props[pName] = pruneRobinToolSchema(pSchema, pName, depth + 1);
+      }
+      if (Object.keys(props).length === 0) continue;
+      out[key] = props;
+      continue;
+    }
+
+    if ((key === '$defs' || key === 'definitions') && value && typeof value === 'object' && !Array.isArray(value)) {
+      const defs: Record<string, unknown> = {};
+      for (const [dName, dSchema] of Object.entries(value as Record<string, unknown>)) {
+        defs[dName] = pruneRobinToolSchema(dSchema, dName, depth + 1);
+      }
+      if (Object.keys(defs).length === 0) continue;
+      out[key] = defs;
+      continue;
+    }
+
+    if (key === 'items' || key === 'additionalProperties' || key === 'not') {
+      out[key] = pruneRobinToolSchema(value, undefined, depth + 1);
+      continue;
+    }
+
+    if ((key === 'anyOf' || key === 'oneOf' || key === 'allOf' || key === 'prefixItems') && Array.isArray(value)) {
+      out[key] = value.map(item => pruneRobinToolSchema(item, undefined, depth + 1));
+      continue;
+    }
+
+    out[key] = value;
+  }
+  return out;
+}
+
+function compactRobinTools(tools: ContextScript['tools']): unknown[] {
+  return tools.map(tool => {
+    const description = typeof tool.description === 'string' ? tool.description.trim() : '';
+    return {
+      name: tool.name,
+      ...(description ? { description } : {}),
+      parameters: pruneRobinToolSchema(tool.parameters, tool.name),
+    };
+  });
 }
 
 export async function toRobinRequest(request: GeminiRequest, upload?: UploadAttachment, _temporaryChat = true): Promise<{ query: { text: string; attachments?: { id: string; mimeType: string }[] } }> {
@@ -200,7 +273,7 @@ export async function toRobinRequest(request: GeminiRequest, upload?: UploadAtta
   if (systemText) sections.push(`<system_instruction>\n${systemText}\n</system_instruction>`);
 
   if (rpc.script.tools.length) {
-    sections.push(`<available_tools>\n${JSON.stringify(rpc.script.tools)}\n</available_tools>\n<tool_protocol>\n${ROBIN_TOOL_PROTOCOL}\n</tool_protocol>`);
+    sections.push(`<available_tools>\n${JSON.stringify(compactRobinTools(rpc.script.tools))}\n</available_tools>\n<tool_protocol>\n${ROBIN_TOOL_PROTOCOL}\n</tool_protocol>`);
   }
 
   if (rpc.script.turns.length === 1 && rpc.script.turns[0].role === 'user' && !systemText && !rpc.script.tools.length) {
@@ -221,7 +294,7 @@ export async function toRobinRequest(request: GeminiRequest, upload?: UploadAtta
     if (toolResults.length) {
       const toolOnlyAttachments = userParts.length > 0 && userParts.every(part => part.type === 'attachment');
       const resultParts = toolOnlyAttachments ? [...toolResults, ...userParts] : toolResults;
-      historyBlocks.push(`[Caller Tool Result]\n${resultParts.map(part => formatRobinPart(part, 'user', imageLabels)).join('\n')}`);
+      historyBlocks.push(`[Caller Tool Result]\n${resultParts.map(part => formatRobinPart(part, 'user', imageLabels)).filter(Boolean).join('\n')}`);
       if (toolOnlyAttachments) continue;
     }
     if (userParts.length) {

@@ -5,6 +5,7 @@ import { connectionBlocks } from 'cortico/providers/webui/config.ts';
 import type { ProviderWebUiHost } from 'cortico/providers/webui/types.ts';
 import type { WebUiPageContribution } from 'cortico/web/shared/webui-protocol.ts';
 import type { GatewayInstanceControl } from '../index.ts';
+import { maskProxyDisplay, parseProxyUrlInput } from '../http.ts';
 import type { AccountTermsStatus } from '../oauth.ts';
 import {
   configuration,
@@ -98,6 +99,7 @@ export interface GatewayPanelState {
   uploadEndpoint: string;
   deleteEndpoint: string;
   quotaEndpoint: string;
+  proxyUrl: string;
   temporaryChat: boolean;
   authEnabled: boolean;
 }
@@ -133,6 +135,7 @@ function asGatewayState(entry: LLMProviderEntry, authEnabled: boolean): GatewayP
     uploadEndpoint: cfg.uploadEndpoint ?? '',
     deleteEndpoint: cfg.deleteEndpoint ?? '',
     quotaEndpoint: cfg.quotaEndpoint ?? '',
+    proxyUrl: cfg.proxyUrl ?? '',
     temporaryChat: cfg.temporaryChat ?? true,
     authEnabled,
   };
@@ -390,6 +393,7 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
           const apiKeyConfigured = typeof entry.options?.apiKeyConfigured === 'boolean' ? entry.options.apiKeyConfigured : undefined;
           const credentialHeader = typeof entry.options?.credentialHeader === 'string' ? entry.options.credentialHeader : undefined;
           const credentialPrefix = typeof entry.options?.credentialPrefix === 'string' ? entry.options.credentialPrefix : undefined;
+          const proxyUrl = typeof entry.options?.proxyUrl === 'string' ? entry.options.proxyUrl : undefined;
           const next: LLMProviderEntry = {
             ...entry,
             baseUrl: preset.baseUrl,
@@ -405,6 +409,7 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
               ...(apiKeyConfigured !== undefined ? { apiKeyConfigured } : {}),
               ...(credentialHeader ? { credentialHeader } : {}),
               ...(credentialPrefix ? { credentialPrefix } : {}),
+              ...(proxyUrl ? { proxyUrl } : {}),
             },
           };
           configuration(next);
@@ -426,12 +431,19 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
                 ...(typeof entry.options?.apiKeyConfigured === 'boolean' ? { apiKeyConfigured: entry.options.apiKeyConfigured } : {}),
                 ...(typeof entry.options?.credentialHeader === 'string' ? { credentialHeader: entry.options.credentialHeader } : {}),
                 ...(typeof entry.options?.credentialPrefix === 'string' ? { credentialPrefix: entry.options.credentialPrefix } : {}),
+                ...(typeof entry.options?.proxyUrl === 'string' ? { proxyUrl: entry.options.proxyUrl } : {}),
               }
             : { ...entry.options };
 
           if (raw.protocol !== undefined) nextOptions.protocol = raw.protocol;
           if (raw.authMode !== undefined) nextOptions.authMode = raw.authMode;
           if (raw.temporaryChat !== undefined) nextOptions.temporaryChat = raw.temporaryChat;
+          if (raw.proxyUrl !== undefined) {
+            if (typeof raw.proxyUrl !== 'string') throw new Error('Option proxyUrl must be a string');
+            const normalizedProxy = parseProxyUrlInput(raw.proxyUrl);
+            if (normalizedProxy) nextOptions.proxyUrl = normalizedProxy;
+            else delete nextOptions.proxyUrl;
+          }
           for (const key of STRING_OPTION_KEYS) {
             if (raw[key] === undefined) continue;
             if (typeof raw[key] !== 'string') throw new Error(`Option ${key} must be a string`);
@@ -448,15 +460,20 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
           }
 
           const next: LLMProviderEntry = { ...entry, baseUrl: nextBaseUrl, options: nextOptions };
-          configuration(next);
+          const nextCfg = configuration(next);
           host.save(name, next);
           const control = host.instance(name).control as GatewayInstanceControl;
+          control.oauth.setProxyUrl(nextCfg.proxyUrl);
           return asGatewayState(next, control.oauth.authEnabled(next));
         }
         if (method === 'test') {
           const started = Date.now();
           const cfg = configuration(entry);
           const control = host.instance(name).control as GatewayInstanceControl;
+          control.oauth.setProxyUrl(cfg.proxyUrl);
+          const proxyNote = cfg.proxyUrl
+            ? (en ? ` · via ${maskProxyDisplay(cfg.proxyUrl)}` : ` · 经代理 ${maskProxyDisplay(cfg.proxyUrl)}`)
+            : '';
           if (cfg.protocol === 'robin') {
             const quota = await control.queryQuota();
             if (quota.authRequired) {
@@ -483,8 +500,8 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
               ok: true,
               elapsedMs: Date.now() - started,
               summary: en
-                ? `Connected (Robin HTTP/2 gRPC${plan}${poolNote})`
-                : `连接正常（Robin HTTP/2 gRPC${plan}${poolNote}）`,
+                ? `Connected (Robin HTTP/2 gRPC${plan}${poolNote}${proxyNote})`
+                : `连接正常（Robin HTTP/2 gRPC${plan}${poolNote}${proxyNote}）`,
             };
           }
           if (cfg.authMode === 'api-key') {
@@ -500,16 +517,16 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
               ok: true,
               elapsedMs: Date.now() - started,
               summary: en
-                ? `Configuration valid (${cfg.protocol.toUpperCase()} · API Key ready -> ${entry.baseUrl})`
-                : `配置有效（${cfg.protocol.toUpperCase()} · API Key 已就绪 -> ${entry.baseUrl}）`,
+                ? `Configuration valid (${cfg.protocol.toUpperCase()} · API Key ready${proxyNote} -> ${entry.baseUrl})`
+                : `配置有效（${cfg.protocol.toUpperCase()} · API Key 已就绪${proxyNote} -> ${entry.baseUrl}）`,
             };
           }
           return {
             ok: true,
             elapsedMs: Date.now() - started,
             summary: en
-              ? `Configuration valid (${cfg.protocol.toUpperCase()} -> ${entry.baseUrl})`
-              : `配置有效（${cfg.protocol.toUpperCase()} -> ${entry.baseUrl}）`,
+              ? `Configuration valid (${cfg.protocol.toUpperCase()}${proxyNote} -> ${entry.baseUrl})`
+              : `配置有效（${cfg.protocol.toUpperCase()}${proxyNote} -> ${entry.baseUrl}）`,
           };
         }
         throw new Error(en ? 'Unknown gateway action' : '未知配置操作');
@@ -591,6 +608,7 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
           entry = ensureDraftDefaults(name, entry);
         }
         const control = host.instance(name).control as GatewayInstanceControl;
+        control.oauth.setProxyUrl(configuration(entry).proxyUrl);
         control.oauth.refreshBundledConfig();
         if (!control.status().configured) {
           throw new Error(
@@ -614,6 +632,7 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
           throw new Error(en ? 'Paste the callback URL from your browser address bar.' : '请粘贴浏览器地址栏里的回调地址。');
         }
         const control = host.instance(name).control as GatewayInstanceControl;
+        control.oauth.setProxyUrl(configuration(entry).proxyUrl);
         await control.oauth.auth.completeLogin(raw.redirectUrl);
         return asAuthStatus(control, entry, !host.editing);
       }

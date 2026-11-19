@@ -25,6 +25,7 @@ export interface ProxyFetchOptions {
   env?: NodeJS.ProcessEnv;
   execArgv?: readonly string[];
   platform?: NodeJS.Platform;
+  proxyUrl?: string;
   fallbackFetch?: typeof fetch;
   readSystemProxy?: () => ProxyConfig | undefined;
 }
@@ -38,13 +39,50 @@ export function resetProxyCache(): void {
 export function normalizeProxyUrl(value: string): string | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
+  const portMatch = /^:?(\d{1,5})$/.exec(trimmed);
+  if (portMatch) {
+    const port = Number(portMatch[1]);
+    if (port < 1 || port > 65535) return undefined;
+    return `http://127.0.0.1:${port}/`;
+  }
   const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
   try {
     const url = new URL(candidate);
     if (!['http:', 'https:'].includes(url.protocol) || !url.hostname) return undefined;
+    if (url.port) {
+      const p = Number(url.port);
+      if (!Number.isInteger(p) || p < 1 || p > 65535) return undefined;
+    }
     return url.href;
   } catch {
     return undefined;
+  }
+}
+
+export function parseProxyUrlInput(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const schemeMatch = /^([a-z][a-z0-9+.-]*):\/\//i.exec(trimmed);
+  if (schemeMatch && !['http', 'https'].includes(schemeMatch[1].toLowerCase())) {
+    throw new Error('代理地址仅支持 HTTP/HTTPS 代理（例如 http://127.0.0.1:7890 或直接填端口 7890）；使用 Clash/v2rayN 请填写混合/HTTP 端口。');
+  }
+  const normalized = normalizeProxyUrl(trimmed);
+  if (!normalized) {
+    throw new Error('代理地址格式无效，请输入 http://127.0.0.1:7890、127.0.0.1:7890 或纯端口号（如 7890）。');
+  }
+  const parsed = new URL(normalized);
+  return parsed.pathname === '/' && !parsed.search && !parsed.hash ? parsed.href.slice(0, -1) : parsed.href;
+}
+
+export function maskProxyDisplay(proxyUrl: string): string {
+  try {
+    const parsed = new URL(proxyUrl);
+    if (!parsed.username && !parsed.password) return proxyUrl;
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.pathname === '/' && !parsed.search && !parsed.hash ? parsed.href.slice(0, -1) : parsed.href;
+  } catch {
+    return proxyUrl;
   }
 }
 
@@ -431,12 +469,10 @@ export function createProxyFetch(options: ProxyFetchOptions = {}): typeof fetch 
   const execArgv = options.execArgv ?? process.execArgv;
   const platform = options.platform ?? process.platform;
   const fallbackFetch = options.fallbackFetch;
+  const explicitProxy = options.proxyUrl ? normalizeProxyUrl(options.proxyUrl) : undefined;
 
   return async (input: FetchInput, init?: RequestInit): Promise<Response> => {
     const baseFetch = fallbackFetch ?? globalThis.fetch;
-    if (!fallbackFetch && globalThis.fetch !== NATIVE_FETCH) return baseFetch(input, init);
-    if (hasHostProxy(env, execArgv)) return baseFetch(input, init);
-
     const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     let target: URL;
     try {
@@ -444,6 +480,21 @@ export function createProxyFetch(options: ProxyFetchOptions = {}): typeof fetch 
     } catch {
       return baseFetch(input, init);
     }
+
+    if (explicitProxy) {
+      const explicitConfig: ProxyConfig = {
+        httpProxy: explicitProxy,
+        httpsProxy: explicitProxy,
+        allProxy: explicitProxy,
+      };
+      const resolveTargetProxy = (candidate: URL) => proxyForUrl(candidate, explicitConfig);
+      if (!resolveTargetProxy(target)) return baseFetch(input, init);
+      return sendViaProxy(input, init, resolveTargetProxy, baseFetch);
+    }
+
+    if (!fallbackFetch && globalThis.fetch !== NATIVE_FETCH) return baseFetch(input, init);
+    if (hasHostProxy(env, execArgv)) return baseFetch(input, init);
+
     const config = resolveProxyConfig(env, platform, options.readSystemProxy);
     const resolveTargetProxy = (candidate: URL) => proxyForUrl(candidate, config);
     if (!resolveTargetProxy(target)) return baseFetch(input, init);
@@ -453,10 +504,16 @@ export function createProxyFetch(options: ProxyFetchOptions = {}): typeof fetch 
 
 export const proxyFetch: typeof fetch = createProxyFetch();
 
+export function createProxyFetchFor(proxyUrl?: string): typeof fetch {
+  const normalized = proxyUrl ? normalizeProxyUrl(proxyUrl) : undefined;
+  return normalized ? createProxyFetch({ proxyUrl: normalized }) : proxyFetch;
+}
+
 export interface ConnectHttp2Options {
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
+  proxyUrl?: string;
   readSystemProxy?: () => ProxyConfig | undefined;
 }
 
@@ -568,15 +625,24 @@ export async function connectHttp2(origin: string | URL, options: ConnectHttp2Op
   ensureConnectAttemptTimeout();
   const target = typeof origin === 'string' ? new URL(origin) : new URL(origin.href);
   options.signal?.throwIfAborted();
-  const config = resolveProxyConfig(
-    options.env ?? process.env,
-    options.platform ?? process.platform,
-    options.readSystemProxy,
-  );
+  const explicitProxy = options.proxyUrl ? normalizeProxyUrl(options.proxyUrl) : undefined;
+  const config = explicitProxy
+    ? { httpProxy: explicitProxy, httpsProxy: explicitProxy, allProxy: explicitProxy }
+    : resolveProxyConfig(
+      options.env ?? process.env,
+      options.platform ?? process.platform,
+      options.readSystemProxy,
+    );
   const proxyUrl = proxyForUrl(target, config);
   if (proxyUrl && target.protocol === 'https:') {
     const tlsSocket = await openProxyTlsTunnel(target, proxyUrl, options.signal);
     return http2.connect(target.origin, { createConnection: () => tlsSocket });
   }
   return http2.connect(target.origin);
+}
+
+export function createHttp2Connector(proxyUrl?: string): Http2Connector {
+  const normalized = proxyUrl ? normalizeProxyUrl(proxyUrl) : undefined;
+  if (!normalized) return connectHttp2;
+  return (origin, options = {}) => connectHttp2(origin, { ...options, proxyUrl: normalized });
 }

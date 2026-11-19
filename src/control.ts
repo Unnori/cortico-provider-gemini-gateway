@@ -2,7 +2,7 @@ import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { LLMProviderEntry } from 'cortico/core/types.ts';
 import type { ProviderHost } from 'cortico/providers/base.ts';
-import { proxyFetch } from './http.ts';
+import { createHttp2Connector, createProxyFetchFor, normalizeProxyUrl } from './http.ts';
 import {
   API_KEY_FILE,
   maskSecretHint,
@@ -80,6 +80,8 @@ export function gatewayControl(host: Pick<ProviderHost, 'stateDir'>, entry: LLMP
     control = new GatewayControl(oauthDir);
     controls.set(key, control);
   }
+  const rawProxy = typeof entry.options?.proxyUrl === 'string' ? entry.options.proxyUrl : undefined;
+  control.setProxyUrl(rawProxy ? normalizeProxyUrl(rawProxy) : undefined);
   return control;
 }
 
@@ -145,6 +147,8 @@ export class GatewayControl {
   private readonly observedRouting = new Map<string, RobinRoutingObservation>();
   private rrCursor = 0;
   private emailsMasked = true;
+  private activeProxyUrl?: string;
+  private cachedProxyFetch?: { proxyUrl?: string; fn: typeof fetch };
 
   private static emptyOAuthConfig() {
     return {
@@ -155,12 +159,31 @@ export class GatewayControl {
     };
   }
 
-  constructor(oauthDir: string, request: typeof fetch = proxyFetch) {
+  constructor(oauthDir: string, request?: typeof fetch) {
     this.oauthDir = oauthDir;
     const custom = readOAuthConfig(oauthDir);
     const bundled = custom ? undefined : readBundledOAuthConfig();
     const config = custom ?? bundled ?? GatewayControl.emptyOAuthConfig();
-    this.auth = new DesktopOAuth(config, oauthDir, request, Boolean(custom));
+    const oauthFetch: typeof fetch = request ?? ((input, init) => this.fetchForProxy()(input, init));
+    this.auth = new DesktopOAuth(config, oauthDir, oauthFetch, Boolean(custom));
+  }
+
+  private fetchForProxy(): typeof fetch {
+    if (!this.cachedProxyFetch || this.cachedProxyFetch.proxyUrl !== this.activeProxyUrl) {
+      this.cachedProxyFetch = {
+        proxyUrl: this.activeProxyUrl,
+        fn: createProxyFetchFor(this.activeProxyUrl),
+      };
+    }
+    return this.cachedProxyFetch.fn;
+  }
+
+  setProxyUrl(proxyUrl?: string): void {
+    const normalized = proxyUrl ? normalizeProxyUrl(proxyUrl) : undefined;
+    if (this.activeProxyUrl !== normalized) {
+      this.activeProxyUrl = normalized;
+      this.cachedProxyFetch = undefined;
+    }
   }
 
   private ensureRuntime(accountId: string): AccountRuntimeState {
@@ -450,6 +473,7 @@ export class GatewayControl {
   ): Promise<RobinUserStatus | null> {
     this.refreshBundledConfig();
     const config = configuration(entry);
+    this.setProxyUrl(config.proxyUrl);
     if (config.protocol !== 'robin') return null;
     if (!this.authEnabled(entry)) return null;
     const resolvedId = accountId ?? this.auth.primaryAccountId();
@@ -460,6 +484,7 @@ export class GatewayControl {
       return rt.userStatus.value;
     }
     const baseHeaders = resolveHeaders(entry, host, false);
+    const h2Connector = createHttp2Connector(config.proxyUrl);
     for (let attempt = 0; attempt < 2; attempt++) {
       const headers = new Headers(baseHeaders);
       const token = await this.auth.accessTokenFor(resolvedId, attempt === 1);
@@ -469,6 +494,7 @@ export class GatewayControl {
           baseUrl: config.baseUrl,
           headers,
           signal,
+          connectHttp2: h2Connector,
         });
         rt.userStatus = { value: status, expiresAt: Date.now() + ROBIN_STATUS_TTL_MS };
         return status;
@@ -490,6 +516,7 @@ export class GatewayControl {
   ): Promise<QuotaSnapshot> {
     this.refreshBundledConfig();
     const config = configuration(entry);
+    this.setProxyUrl(config.proxyUrl);
     const useOAuth = this.authEnabled(entry);
     const headers = resolveHeaders(entry, host, false, this.oauthDir);
 
@@ -501,6 +528,7 @@ export class GatewayControl {
         headers,
         authHeader: config.authHeader,
         authPrefix: config.authPrefix,
+        ...(config.proxyUrl ? { proxyUrl: config.proxyUrl } : {}),
       }, signal);
       if (snapshot.plan || snapshot.userTier) {
         this.ensureRuntime('__default__').plan = {
@@ -555,6 +583,7 @@ export class GatewayControl {
           auth: { accessToken: force => this.auth.accessTokenFor(acct.id, force) },
           authHeader: config.authHeader,
           authPrefix: config.authPrefix,
+          ...(config.proxyUrl ? { proxyUrl: config.proxyUrl } : {}),
         }, signal);
         rt.quota = snap;
         if (snap.plan || snap.userTier) {
@@ -631,6 +660,7 @@ export class GatewayControl {
   ): Promise<RobinTermsResult> {
     this.refreshBundledConfig();
     const config = configuration(entry);
+    this.setProxyUrl(config.proxyUrl);
     if (config.protocol !== 'robin') {
       throw new Error('仅 Robin 协议需要确认 Gemini 桌面服务条款。');
     }
@@ -639,6 +669,7 @@ export class GatewayControl {
       throw new Error('请先完成浏览器 OAuth 认证后再确认服务条款。');
     }
     const baseHeaders = resolveHeaders(entry, host, false);
+    const h2Connector = createHttp2Connector(config.proxyUrl);
     for (let attempt = 0; attempt < 2; attempt++) {
       const headers = new Headers(baseHeaders);
       const token = await this.auth.accessTokenFor(resolvedId, attempt === 1);
@@ -649,6 +680,7 @@ export class GatewayControl {
           headers,
           language,
           signal,
+          connectHttp2: h2Connector,
         });
         this.markAccountTermsAccepted(resolvedId, { version: result.version, acceptedAt: result.acceptedAt });
         this.clearAccountCooldown(resolvedId);

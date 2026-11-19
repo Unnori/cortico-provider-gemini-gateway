@@ -183,4 +183,117 @@ describe('streamed tool calls', () => {
     });
     expect(replayed.query.text).not.toContain('STOP immediately');
   });
+
+  it('strips historical thought traces from Robin plain-text replays while preserving replies and tool calls', async () => {
+    const req: GeminiRequest = {
+      model: 'gemini-4-hydrogen',
+      contents: [
+        { role: 'user', parts: [{ text: 'First question' }] },
+        {
+          role: 'model',
+          parts: [
+            { text: 'Long private chain of thought that should not be re-sent', thought: true },
+            { text: 'Short final answer' },
+          ],
+        },
+        { role: 'user', parts: [{ text: 'Tool step' }] },
+        {
+          role: 'model',
+          parts: [{ text: 'Thought-only step with no visible text', thought: true }],
+        },
+        {
+          role: 'model',
+          parts: [
+            { text: 'Secret planning before tool call', thought: true },
+            { functionCall: { name: 'lookup', id: 'c1', args: { q: 'hi' } } },
+          ],
+        },
+        { role: 'user', parts: [{ text: 'Latest question' }] },
+      ],
+    };
+    const robin = await toRobinRequest(req);
+    expect(robin.query.text).not.toContain('<thought>');
+    expect(robin.query.text).not.toContain('Long private chain of thought');
+    expect(robin.query.text).not.toContain('Thought-only step');
+    expect(robin.query.text).not.toContain('Secret planning');
+    expect(robin.query.text).toContain('Short final answer');
+    expect(robin.query.text).toContain('<tool_call>{"name":"lookup","id":"c1","args":{"q":"hi"}}</tool_call>');
+    expect(robin.query.text).toContain('Latest question');
+    // Thought-only model turn does not leave an empty [Assistant] header.
+    expect(robin.query.text).not.toMatch(/\[Assistant\]\s*\n\s*\[Assistant\]/);
+
+    // Native Gemini REST & generic RPC adapters remain unaffected.
+    const nativeBody = await toGeminiRequest(req) as { contents: GeminiRequest['contents'] };
+    expect(nativeBody.contents[1].parts[0]).toEqual({ text: 'Long private chain of thought that should not be re-sent', thought: true });
+    const rpcBody = await toRpcRequest(req);
+    expect(rpcBody.script.turns[1].parts[0]).toEqual({ type: 'text', text: 'Long private chain of thought that should not be re-sent', thought: true });
+  });
+
+  it('losslessly prunes JSON Schema boilerplate in Robin tool declarations without dropping semantics or parameter names', async () => {
+    const req: GeminiRequest = {
+      model: 'gemini-4-hydrogen',
+      tools: [{
+        functionDeclarations: [
+          {
+            name: 'pet_say',
+            description: 'Speak aloud',
+            parametersJsonSchema: {
+              $schema: 'http://json-schema.org/draft-07/schema#',
+              $id: 'pet_say_schema',
+              $comment: 'auto generated',
+              title: 'pet_say',
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                title: { type: 'string', title: 'title', description: 'Dialog heading' },
+                mood: { type: 'string', enum: ['happy', 'calm'], description: '   ' },
+                extra: { type: 'object', additionalProperties: { type: 'string', $comment: 'val' } },
+                tags: { type: 'array', items: { type: 'string', additionalProperties: false } },
+                fallbackLabel: { type: 'string', title: 'Display label when no description' },
+              },
+              required: ['title'],
+            },
+          },
+          {
+            name: 'end_turn',
+            description: '   ',
+            parametersJsonSchema: {
+              $schema: 'http://json-schema.org/draft-07/schema#',
+              type: 'object',
+              properties: {},
+              required: [],
+              additionalProperties: false,
+            },
+          },
+        ],
+      }],
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    };
+
+    const robin = await toRobinRequest(req);
+    const match = /<available_tools>\n([\s\S]*?)\n<\/available_tools>/.exec(robin.query.text);
+    expect(match).not.toBeNull();
+    const parsed = JSON.parse(match![1]) as unknown[];
+    expect(parsed).toEqual([
+      {
+        name: 'pet_say',
+        description: 'Speak aloud',
+        parameters: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'Dialog heading' },
+            mood: { type: 'string', enum: ['happy', 'calm'] },
+            extra: { type: 'object', additionalProperties: { type: 'string' } },
+            tags: { type: 'array', items: { type: 'string' } },
+            fallbackLabel: { type: 'string', title: 'Display label when no description' },
+          },
+          required: ['title'],
+        },
+      },
+      {
+        name: 'end_turn',
+        parameters: { type: 'object' },
+      },
+    ]);
+  });
 });

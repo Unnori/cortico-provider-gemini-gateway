@@ -1475,6 +1475,13 @@ const gatewayPanel: WebUiPanel = {
       onChange: () => void saveOptions(),
     });
 
+    const proxyUrlInput = ui.input({
+      cls: 'mono',
+      placeholder: t('留空跟随系统代理；支持 7890 或 http://127.0.0.1:7890', 'Leave blank for system proxy; e.g. 7890 or http://127.0.0.1:7890'),
+      onChange: () => void saveOptions(),
+    });
+    const proxyUrlField = ui.field(t('独立代理地址（可选）', 'Dedicated proxy URL (optional)'), proxyUrlInput);
+
     const testRow = ui.rowbar();
     const testBtn = ui.button(t('测试连接', 'Test connection'), {
       size: 'sm',
@@ -1490,12 +1497,14 @@ const gatewayPanel: WebUiPanel = {
       baseUrlField,
       ui.field(t('认证模式', 'Auth mode'), authModeSelect),
       tempCheck.el,
+      proxyUrlField,
       testRow,
       message,
     );
 
     let saving = false;
     let currentProtocol: GatewayPanelState['protocol'] = 'robin';
+    let lastSavedProxyUrl = '';
 
     function modeDescription(protocol: GatewayPanelState['protocol']): string {
       if (protocol === 'robin') return t('RobinService HTTP/2 gRPC（自动切换官方端点与路由）', 'RobinService HTTP/2 gRPC (auto endpoint & routes)');
@@ -1511,6 +1520,8 @@ const gatewayPanel: WebUiPanel = {
 
       authModeSelect.value = state.authMode;
       tempCheck.setChecked(state.temporaryChat);
+      lastSavedProxyUrl = state.proxyUrl ?? '';
+      proxyUrlInput.value = lastSavedProxyUrl;
 
       baseUrlField.hidden = state.protocol === 'robin';
       if (state.protocol !== 'robin') {
@@ -1558,8 +1569,8 @@ const gatewayPanel: WebUiPanel = {
       }
     }
 
-    async function saveOptions(overrides: { authMode?: AuthMode } = {}) {
-      if (saving || signal.aborted) return;
+    async function saveOptions(overrides: { authMode?: AuthMode } = {}): Promise<boolean> {
+      if (saving || signal.aborted) return false;
       saving = true;
       message.textContent = '';
       message.classList.remove('bad');
@@ -1569,6 +1580,7 @@ const gatewayPanel: WebUiPanel = {
           protocol: currentProtocol,
           authMode: overrides.authMode ?? authModeSelect.value,
           temporaryChat: tempCheck.checked,
+          proxyUrl: proxyUrlInput.value,
           ...(currentProtocol !== 'robin' ? { baseUrl: baseUrlInput.value } : {}),
         }]);
         if (!signal.aborted) {
@@ -1582,11 +1594,13 @@ const gatewayPanel: WebUiPanel = {
           });
           message.textContent = t('配置已自动同步（请点击页面底部「保存」生效）。', 'Options synced. Click Save below to persist.');
         }
+        return true;
       } catch (err) {
         if (!signal.aborted) {
           message.textContent = err instanceof Error ? err.message : String(err);
           message.classList.add('bad');
         }
+        return false;
       } finally {
         saving = false;
       }
@@ -1594,6 +1608,10 @@ const gatewayPanel: WebUiPanel = {
 
     async function runTest() {
       if (saving || signal.aborted) return;
+      if (proxyUrlInput.value.trim() !== lastSavedProxyUrl) {
+        const savedOk = await saveOptions();
+        if (!savedOk || signal.aborted) return;
+      }
       testBtn.disabled = true;
       message.textContent = t('正在测试连接…', 'Testing connection…');
       message.classList.remove('bad');

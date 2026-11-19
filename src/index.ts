@@ -5,6 +5,7 @@ import type { ProviderModule } from 'cortico/providers/base.ts';
 import { geminiBaseline, ModelCatalog, type ModelMetadata } from './catalog.ts';
 import { GatewayClient } from './client.ts';
 import { gatewayControl, type GatewayControl } from './control.ts';
+import { createHttp2Connector, createProxyFetchFor } from './http.ts';
 import { CustomGeminiProvider } from './native.ts';
 import { configuration, option, resolveHeaders } from './options.ts';
 import { resolveProviderPrices } from './pricing.ts';
@@ -22,7 +23,7 @@ import { gatewayWebUi } from './webui/server.ts';
 const catalogs = new Map<string, ModelCatalog>();
 const robinAccounts = new Map<string, GatewayControl>();
 const catalogKey = (entry: LLMProviderEntry) => JSON.stringify([
-  entry.baseUrl, entry.options?.modelsDevUrl, entry.options?.openRouterUrl,
+  entry.baseUrl, entry.options?.modelsDevUrl, entry.options?.openRouterUrl, entry.options?.proxyUrl,
 ]);
 const accountKey = (entry: LLMProviderEntry) => JSON.stringify([
   entry.baseUrl, entry.options?.oauthProfile ?? '',
@@ -162,6 +163,7 @@ export const GEMINI_GATEWAY = {
     const key = catalogKey(entry);
     const constructCatalog = () => new ModelCatalog(host.stateDir, {
       modelsDevUrl: option(entry, 'modelsDevUrl'), openRouterUrl: option(entry, 'openRouterUrl'),
+      fetch: createProxyFetchFor(options.proxyUrl),
       warn: message => host.log.warn(message),
     });
     const catalog = host.resource?.(`gemini-catalog:${key}`, constructCatalog) ?? constructCatalog();
@@ -179,19 +181,24 @@ export const GEMINI_GATEWAY = {
     const gateway = new GatewayClient({
       ...options,
       headers,
+      fetch: (input, init) => createProxyFetchFor(configuration(current()).proxyUrl)(input, init),
+      connectHttp2: (origin, h2Opts) => createHttp2Connector(configuration(current()).proxyUrl)(origin, h2Opts),
       resolveHeaders: () => resolveHeaders(current(), host, true, oauth.oauthDir),
       auth: {
         enabled: () => oauth.authEnabled(current()),
         accessToken: force => {
           oauth.refreshBundledConfig();
+          oauth.setProxyUrl(configuration(current()).proxyUrl);
           return oauth.auth.accessToken(force);
         },
         selectAccounts: () => {
           oauth.refreshBundledConfig();
+          oauth.setProxyUrl(configuration(current()).proxyUrl);
           return oauth.pickAccountOrder(configuration(current()).accountRouting);
         },
         accessTokenFor: (accountId, force) => {
           oauth.refreshBundledConfig();
+          oauth.setProxyUrl(configuration(current()).proxyUrl);
           return oauth.auth.accessTokenFor(accountId, force);
         },
         onAccountSuccess: accountId => {
