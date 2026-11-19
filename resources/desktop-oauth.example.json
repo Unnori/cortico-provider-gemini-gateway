@@ -1,0 +1,23 @@
+{
+  "clientId": "",
+  "clientSecret": "",
+  "scopes": [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/assistant",
+    "https://www.googleapis.com/auth/client_channel",
+    "https://www.googleapis.com/auth/gemini"
+  ],
+  "authEndpoint": "https://accounts.google.com/o/oauth2/auth",
+  "tokenEndpoint": "https://www.googleapis.com/oauth2/v4/token",
+  "redirectHost": "localhost",
+  "redirectPath": "",
+  "authParams": {
+    "access_type": "offline",
+    "prompt": "consent"
+  },
+  "tokenHeaders": {
+    "User-Agent": "Gemini/1.135.1.1291 CFNetwork/1568.200.51 Darwin/24.1.0"
+  }
+}

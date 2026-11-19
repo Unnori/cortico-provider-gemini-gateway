@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Verify tag matches package.json and CHANGELOG.md
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const tag = process.env.GITHUB_REF_NAME || "";
+            const expected = `v${pkg.version}`;
+            if (tag !== expected) {
+              console.error(`Tag ${tag} does not match package.json version ${expected}`);
+              process.exit(1);
+            }
+            const changelog = fs.readFileSync("CHANGELOG.md", "utf8").replace(/\r\n/g, "\n");
+            const escaped = pkg.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const re = new RegExp(`^##\\s+.*\\b${escaped}\\b`, "m");
+            if (!re.test(changelog)) {
+              console.error(`CHANGELOG.md is missing a "## ${pkg.version}" heading`);
+              process.exit(1);
+            }
+            console.log(`Verified release ${tag} matches package.json and CHANGELOG.md`);
+          '
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, typecheck, and test
+        run: pnpm verify
+
+      - name: Pack tarball for GitHub Release
+        run: |
+          TARBALL=$(npm pack --silent | tail -n 1)
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const lines = fs.readFileSync("CHANGELOG.md", "utf8").replace(/\r\n/g, "\n").split("\n");
+            const out = [];
+            let capture = false;
+            for (const line of lines) {
+              if (/^##\s+/.test(line)) {
+                if (capture) break;
+                if (line.includes(pkg.version)) { capture = true; continue; }
+              } else if (capture) {
+                out.push(line);
+              }
+            }
+            fs.writeFileSync("/tmp/release-notes.md", out.join("\n").trim() + "\n");
+          '
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" "${TARBALL}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file /tmp/release-notes.md

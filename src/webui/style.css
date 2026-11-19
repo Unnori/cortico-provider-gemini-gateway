@@ -1,0 +1,261 @@
+.ggw-panel { display: grid; gap: 10px; }
+.ggw-panel .rowbar { flex-wrap: wrap; align-items: center; gap: 8px; }
+.ggw-section { display: grid; gap: 10px; }
+.ggw-section[hidden] { display: none; }
+.ggw-two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
+.ggw-two-col[hidden] { display: none; }
+.ggw-details { padding-top: 4px; }
+.ggw-details summary { cursor: pointer; font-weight: 500; }
+.ggw-details[open] { display: grid; gap: 8px; }
+.ggw-manual { display: grid; gap: 6px; padding-top: 4px; }
+.ggw-link { text-underline-offset: 3px; }
+.ggw-model-label { font-weight: 600; flex: 1 1 auto; }
+
+/* Multi-account management cards (Step 2) */
+.ggw-account-list { display: grid; gap: 8px; }
+.ggw-account-card {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line-2);
+  background: var(--sheet-2);
+  transition: border-color .14s ease;
+}
+.ggw-account-card.is-primary {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line-2));
+  background: color-mix(in srgb, var(--accent) 5%, var(--sheet-2));
+}
+.ggw-account-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ggw-account-ident {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 180px;
+  flex-wrap: wrap;
+}
+.ggw-account-email {
+  font: 600 13px/1.3 var(--mono);
+  color: var(--ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.ggw-account-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+.ggw-account-err {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--danger);
+  word-break: break-word;
+}
+.ggw-account-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 2px;
+}
+.ggw-routing-hint {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+.ggw-acct-quota {
+  display: grid;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--sheet);
+  border: 1px solid var(--line);
+}
+.ggw-acct-quota-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.3;
+}
+.ggw-acct-quota-main {
+  font: 600 12.5px/1.3 var(--mono);
+  color: var(--accent);
+}
+.ggw-acct-quota-main.warn { color: var(--warn); }
+.ggw-acct-quota-main.bad { color: var(--danger); }
+.ggw-acct-quota-sub {
+  font: 11px/1.35 var(--mono);
+  color: var(--ink-dim);
+}
+
+/* Compact inline tags */
+.ggw-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  flex: none;
+}
+.ggw-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font: 600 11px/1.3 var(--sans);
+  border: 1px solid var(--line-2);
+  background: var(--sheet);
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.ggw-tag.primary {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--sheet));
+}
+.ggw-tag.ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+}
+.ggw-tag.warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 48%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, var(--sheet));
+}
+.ggw-tag.bad {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 48%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, var(--sheet));
+}
+.ggw-tag.plan {
+  color: var(--ink);
+  border-color: var(--line-2);
+}
+
+/* Compact bordered per-account quota cards with horizontal bars (Step 3) */
+.ggw-quota-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.ggw-quota-select {
+  min-width: 170px;
+  max-width: 300px;
+  flex: 0 1 auto;
+}
+.ggw-quota-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+}
+.ggw-quota-card {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line-2);
+  background: var(--sheet-2);
+}
+.ggw-quota-card.is-primary {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line-2));
+}
+.ggw-quota-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+.ggw-quota-card-title {
+  font: 600 12.5px/1.3 var(--mono);
+  color: var(--ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+}
+.ggw-qbars { display: grid; gap: 7px; }
+.ggw-qbar { display: grid; gap: 3px; }
+.ggw-qbar-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.3;
+}
+.ggw-qbar-lbl {
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+.ggw-qbar-val {
+  font: 11.5px/1.3 var(--mono);
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.ggw-qbar-val b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.ggw-qbar-track {
+  height: 6px;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--sheet-3);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.ggw-qbar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width .2s ease;
+}
+.ggw-qbar-fill.warn { background: var(--warn); }
+.ggw-qbar-fill.bad { background: var(--danger); }
+.ggw-qbar-foot {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--ink-dim);
+}
+.ggw-quota-card-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+.ggw-quota-err {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--danger);
+  word-break: break-word;
+}
+
+/* The model-settings panel owns multimodal toggles too. Hide the host's duplicate
+   switch only after our toggles render inside this connection's flow. */
+.connection-flow:has(.ggw-input-switches > .connection-toggle)
+  > .connection-step > .connection-section > .foldbody > .connection-toggle {
+  display: none;
+}

@@ -1,0 +1,10 @@
+node_modules/
+.vite/
+test-endpoint/
+ORIGIN_PATH.txt
+*.tgz
+.DS_Store
+oauth-tokens.json
+oauth-accounts.json
+desktop-oauth.json
+api-key.json

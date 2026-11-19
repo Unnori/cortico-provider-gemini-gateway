@@ -1,0 +1,18 @@
+{
+  "kind": "gemini-gateway",
+  "baseUrl": "https://robinfrontend-pa.googleapis.com",
+  "multimodal": true,
+  "spec": {
+    "model": "gemini-4-hydrogen",
+    "thinking": true
+  },
+  "options": {
+    "protocol": "robin",
+    "authMode": "oauth",
+    "generationEndpoint": "/assistant.mobile.robin.RobinService/ProcessQuery",
+    "quotaEndpoint": "/assistant.mobile.robin.RobinService/GetUsageInfo",
+    "temporaryChat": true,
+    "headers": {},
+    "secretHeaders": {}
+  }
+}

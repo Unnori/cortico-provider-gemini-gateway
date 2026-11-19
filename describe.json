@@ -1,0 +1,51 @@
+{
+  "provider": {
+    "protocols": [
+      "gemini",
+      "custom-gemini-rpc"
+    ],
+    "auth": [
+      "oauth",
+      "api-key"
+    ],
+    "local": false,
+    "input": [
+      "text",
+      "image",
+      "audio",
+      "video"
+    ],
+    "title": "Custom Gemini Gateway",
+    "description": "Self-hosted Gemini REST and session RPC with configurable desktop OAuth.",
+    "reasoningTiers": [
+      {
+        "id": "off",
+        "label": "不思考",
+        "thinking": false
+      },
+      {
+        "id": "default",
+        "label": "思考 · 默认",
+        "thinking": true
+      },
+      {
+        "id": "low",
+        "label": "思考 · 快",
+        "thinking": true,
+        "effort": "low"
+      },
+      {
+        "id": "medium",
+        "label": "思考 · 标准",
+        "thinking": true,
+        "effort": "medium"
+      },
+      {
+        "id": "high",
+        "label": "思考 · 深入",
+        "thinking": true,
+        "effort": "high"
+      }
+    ]
+  }
+}
