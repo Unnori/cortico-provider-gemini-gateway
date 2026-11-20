@@ -1,9 +1,25 @@
 import { randomUUID } from 'node:crypto';
-import { GenerationError, priceUsage, unknownMeters, type GenerateOptions, type Generation, type ProviderAttempt } from 'cortico/core/generation.ts';
-import type { Request, StreamEvent } from 'cortico/protocol/open-responses/index.ts';
+import {
+  GenerationError,
+  priceUsage,
+  standardUsage,
+  unknownMeters,
+  type GenerateOptions,
+  type Generation,
+  type ProviderAttempt,
+  type TokenMeters,
+} from 'cortico/core/generation.ts';
+import {
+  createResponse,
+  type OutputItem,
+  type Request,
+  type Response,
+  type StreamEvent,
+} from 'cortico/protocol/open-responses/index.ts';
+import { ResponseAccumulator, ResponseProtocolError } from 'cortico/protocol/open-responses/stream.ts';
 import { BaseProvider, type ProviderHost } from 'cortico/providers/base.ts';
 import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
-import { ChatResponseAssembly } from 'cortico/providers/transport/response-assembly.ts';
+import { chatMeters } from 'cortico/providers/transport/response-meters.ts';
 import { canonicalMime, geminiModelId } from './catalog.ts';
 import { GatewayClient, type GatewayAttempt } from './client.ts';
 import { GatewayError } from './queue.ts';
@@ -123,6 +139,176 @@ function chatFinish(reason: string): string {
   throw new Error(`Gemini gateway finished with ${reason}`);
 }
 
+type MutableOutput = {
+  id: string;
+  type: string;
+  status?: string;
+  content?: Array<{ type: string; text: string; annotations?: unknown[] }>;
+  summary?: unknown[];
+  call_id?: string;
+  name?: string;
+  arguments?: string;
+  role?: string;
+};
+
+type ChunkMeta = { id?: string; model?: string; usage?: Record<string, unknown> };
+
+/**
+ * Open Responses stream assembly that eagerly closes each completed tool call
+ * (and any preceding reasoning/text item) as soon as it arrives, unlocking Cortico's
+ * native `EagerDispatch` so tools like `pet_say` / `console_send` run immediately
+ * instead of waiting for HTTP/2 stream shutdown or idle timers.
+ */
+class GatewayResponseAssembly {
+  private readonly response: Response;
+  private readonly accumulator = new ResponseAccumulator();
+  private sequence = 0;
+  private started = false;
+  private finishReason: string | null = null;
+  private usage: TokenMeters = unknownMeters();
+  private readonly output: MutableOutput[] = [];
+  private readonly closed = new Set<number>();
+  private openText: { kind: 'reasoning' | 'content'; index: number } | null = null;
+  private lastTouched: number | null = null;
+
+  constructor(request: Request) {
+    this.response = createResponse(`resp_${randomUUID()}`, request);
+  }
+
+  private send(event: Record<string, unknown>, emit: (event: StreamEvent) => void): void {
+    const complete = structuredClone({ ...event, sequence_number: this.sequence++ }) as StreamEvent;
+    this.accumulator.accept(complete);
+    emit(complete);
+  }
+
+  private ensureStarted(meta: ChunkMeta, emit: (event: StreamEvent) => void): void {
+    if (meta.usage) this.usage = chatMeters(meta.usage);
+    if (this.started) return;
+    if (meta.id) this.response.id = meta.id;
+    if (meta.model) this.response.model = meta.model;
+    this.send({ type: 'response.created', response: this.response }, emit);
+    this.started = true;
+  }
+
+  private closeOpenText(incomplete: boolean, emit: (event: StreamEvent) => void): void {
+    if (!this.openText) return;
+    const { index } = this.openText;
+    this.openText = null;
+    if (this.closed.has(index)) return;
+    const item = this.output[index];
+    const part = item.content![0];
+    this.send({ type: 'response.content_part.done', output_index: index, item_id: item.id, content_index: 0, part }, emit);
+    if (item.type !== 'reasoning') item.status = incomplete ? 'incomplete' : 'completed';
+    this.send({ type: 'response.output_item.done', output_index: index, item }, emit);
+    this.closed.add(index);
+  }
+
+  feedMeta(meta: ChunkMeta, emit: (event: StreamEvent) => void): void {
+    this.ensureStarted(meta, emit);
+  }
+
+  feedText(kind: 'reasoning' | 'content', delta: string, meta: ChunkMeta, emit: (event: StreamEvent) => void): void {
+    this.ensureStarted(meta, emit);
+    if (!delta) return;
+    if (this.openText && this.openText.kind !== kind) {
+      this.closeOpenText(false, emit);
+    }
+    if (!this.openText) {
+      const index = this.output.length;
+      const item: MutableOutput = kind === 'reasoning'
+        ? { type: 'reasoning', id: `rs_${randomUUID()}`, summary: [], content: [] }
+        : { type: 'message', id: `msg_${randomUUID()}`, role: 'assistant', status: 'in_progress', content: [] };
+      this.output.push(item);
+      this.send({ type: 'response.output_item.added', output_index: index, item }, emit);
+      const part = kind === 'reasoning'
+        ? { type: 'reasoning_text', text: '' }
+        : { type: 'output_text', text: '', annotations: [] };
+      this.send({ type: 'response.content_part.added', output_index: index, item_id: item.id, content_index: 0, part }, emit);
+      item.content = [part];
+      this.openText = { kind, index };
+    }
+    const { index } = this.openText;
+    const item = this.output[index];
+    this.send({
+      type: kind === 'reasoning' ? 'response.reasoning.delta' : 'response.output_text.delta',
+      output_index: index,
+      item_id: item.id,
+      content_index: 0,
+      delta,
+      ...(kind === 'content' ? { logprobs: [] } : {}),
+    }, emit);
+    item.content![0].text += delta;
+    this.lastTouched = index;
+  }
+
+  feedFunctionCall(
+    call: { id: string; name: string; argumentsJson: string },
+    meta: ChunkMeta,
+    emit: (event: StreamEvent) => void,
+  ): void {
+    this.ensureStarted(meta, emit);
+    this.closeOpenText(false, emit);
+    const index = this.output.length;
+    const item: MutableOutput = {
+      type: 'function_call',
+      id: `fc_${randomUUID()}`,
+      call_id: call.id,
+      name: call.name,
+      arguments: '',
+      status: 'in_progress',
+    };
+    this.output.push(item);
+    this.send({ type: 'response.output_item.added', output_index: index, item }, emit);
+    if (call.argumentsJson) {
+      this.send({
+        type: 'response.function_call_arguments.delta',
+        output_index: index,
+        item_id: item.id,
+        delta: call.argumentsJson,
+      }, emit);
+      item.arguments = call.argumentsJson;
+    }
+    this.send({
+      type: 'response.function_call_arguments.done',
+      output_index: index,
+      item_id: item.id,
+      arguments: item.arguments,
+    }, emit);
+    item.status = 'completed';
+    this.send({ type: 'response.output_item.done', output_index: index, item }, emit);
+    this.closed.add(index);
+    this.lastTouched = index;
+  }
+
+  setFinishReason(reason: string, meta: ChunkMeta, emit: (event: StreamEvent) => void): void {
+    this.ensureStarted(meta, emit);
+    this.finishReason = reason;
+  }
+
+  finish(emit: (event: StreamEvent) => void): Response {
+    if (!this.finishReason) throw new ResponseProtocolError('Chat transport ended without finish_reason');
+    const incomplete = this.finishReason === 'length' || this.finishReason === 'content_filter';
+    this.closeOpenText(incomplete && this.openText?.index === this.lastTouched, emit);
+    this.response.output = this.output as OutputItem[];
+    this.response.usage = standardUsage(this.usage);
+    this.response.status = incomplete ? 'incomplete' : 'completed';
+    this.response.completed_at = Math.floor(Date.now() / 1000);
+    this.response.incomplete_details = incomplete
+      ? { reason: this.finishReason === 'length' ? 'max_output_tokens' : 'content_filter' }
+      : null;
+    this.send({ type: `response.${this.response.status}`, response: this.response }, emit);
+    return this.accumulator.finish();
+  }
+
+  snapshot(): Response | null {
+    return this.accumulator.snapshot();
+  }
+
+  meters(): TokenMeters {
+    return structuredClone(this.usage);
+  }
+}
+
 export class CustomGeminiProvider extends BaseProvider {
   private readonly name: string;
   private readonly client: GatewayClient;
@@ -145,12 +331,11 @@ export class CustomGeminiProvider extends BaseProvider {
   async respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
     const model = request.model ?? options.nativeSpec?.model ?? '';
     const origin = options.origin ?? { instance: this.name, module: 'gemini-gateway', model, compatibilityDomain: this.name };
-    const assembly = new ChatResponseAssembly({ ...request, model });
+    const assembly = new GatewayResponseAssembly({ ...request, model });
     const attempts: GatewayAttempt[] = [];
     const generationId = randomUUID();
     const outputLimit = (requestSpec(request, options).maxTokens ?? 65_536) * 12;
     let outputLength = 0;
-    let callIndex = 0;
     let nativeUsage: Record<string, unknown> | undefined;
     const emit = (event: StreamEvent) => {
       if ('delta' in event && typeof event.delta === 'string') {
@@ -178,21 +363,27 @@ export class CustomGeminiProvider extends BaseProvider {
       if (!/^gemini-[\w.:-]+$/.test(input.model)) throw new Error('Configure a Gemini model ID for this gateway');
       for await (const chunk of this.client.stream(input, { signal: options.signal, onAttempt: attempt => attempts.push(attempt) })) {
         if (chunk.usageMetadata) nativeUsage = chunk.usageMetadata;
-        const metadata = { id: chunk.responseId, model: chunk.modelVersion, usage: chunk.usageMetadata && chatUsage(chunk.usageMetadata) };
+        const metadata: ChunkMeta = { id: chunk.responseId, model: chunk.modelVersion, usage: chunk.usageMetadata && chatUsage(chunk.usageMetadata) };
         const candidate = chunk.candidates?.[0];
-        for (const part of candidate?.content?.parts ?? []) {
+        const parts = candidate?.content?.parts ?? [];
+        for (const part of parts) {
           const call = part.functionCall;
           if (call) {
             if (!call.name || (call.args !== undefined && !record(call.args))) throw new Error('Invalid Gemini functionCall');
-            const delta = { tool_calls: [{ index: callIndex++, id: call.id || `call_${randomUUID()}`,
-              function: { name: call.name, arguments: JSON.stringify(call.args ?? {}) } }] };
-            assembly.feed({ ...metadata, choices: [{ delta }] }, emit);
+            assembly.feedFunctionCall({
+              id: call.id || `call_${randomUUID()}`,
+              name: call.name,
+              argumentsJson: JSON.stringify(call.args ?? {}),
+            }, metadata, emit);
           } else if (typeof part.text === 'string' && part.text) {
-            const delta = part.thought ? { reasoning_content: part.text } : { content: part.text };
-            assembly.feed({ ...metadata, choices: [{ delta }] }, emit);
+            assembly.feedText(part.thought ? 'reasoning' : 'content', part.text, metadata, emit);
           }
         }
-        assembly.feed({ ...metadata, choices: candidate?.finishReason ? [{ finish_reason: chatFinish(candidate.finishReason) }] : [] }, emit);
+        if (candidate?.finishReason) {
+          assembly.setFinishReason(chatFinish(candidate.finishReason), metadata, emit);
+        } else if (!parts.length) {
+          assembly.feedMeta(metadata, emit);
+        }
       }
       options.signal?.throwIfAborted();
       const response = assembly.finish(emit);

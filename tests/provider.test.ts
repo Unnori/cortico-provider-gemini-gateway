@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs';
+import http2 from 'node:http2';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
@@ -6,7 +7,16 @@ import type { LLMProviderEntry } from 'cortico/core/types.ts';
 import { nullLogger } from 'cortico/core/util.ts';
 import type { StreamEvent } from 'cortico/protocol/open-responses/index.ts';
 import { validateEntry } from 'cortico/providers/configuration.ts';
+import { GatewayClient } from '../src/client.ts';
 import provider from '../src/index.ts';
+import { CustomGeminiProvider } from '../src/native.ts';
+import {
+  frameGrpcMessage,
+  lengthDelimited,
+  ROBIN_GRPC_PROCESS_QUERY,
+  stringField,
+  varintField,
+} from '../src/robin-grpc.ts';
 
 it('mounts a Cortico endpoint, quotes metadata and round-trips history and tool events', async () => {
   const stateDir = mkdtempSync(join(tmpdir(), 'gemini-provider-'));
@@ -93,4 +103,97 @@ it('validates legacy thinking-without-effort configs and normalizes reasoning ef
     ...legacyRobin,
     spec: { model: 'gemini-4-neon', thinking: true, reasoningEffort: 'bogus' },
   }, 'zh')).toThrow();
+});
+
+it('eagerly emits output_item.done for closed tool calls before the HTTP/2 stream finishes closing', async () => {
+  const openStreams: http2.ServerHttp2Stream[] = [];
+  const server = http2.createServer();
+  server.on('stream', (stream, headers) => {
+    if (headers[':path'] !== ROBIN_GRPC_PROCESS_QUERY) {
+      stream.respond({ ':status': 404 });
+      stream.end();
+      return;
+    }
+    openStreams.push(stream);
+    stream.resume();
+    stream.on('end', () => {
+      stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+      const modelParts = Buffer.concat([
+        stringField(1, 'rc_eager'),
+        lengthDelimited(2, stringField(1, '<tool_call>{"name":"pet_say","id":"call_0_say","args":{"script":"秒回！"}}</tool_call>')),
+        lengthDelimited(12, stringField(1, '先想一下怎么打招呼')),
+      ]);
+      const clientParts = Buffer.concat([
+        lengthDelimited(1, modelParts),
+        varintField(9, 0),
+        stringField(30, 'Gemini 4 Hydrogen'),
+      ]);
+      const frame = lengthDelimited(1003, lengthDelimited(1, clientParts));
+      // Send complete tool call with completed=0 and deliberately keep HTTP/2 stream hanging open!
+      stream.write(frameGrpcMessage(frame));
+    });
+  });
+
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const client = new GatewayClient({
+      baseUrl,
+      protocol: 'robin',
+      generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+      robinToolIdleTimeoutMs: 450,
+      robinTextIdleTimeoutMs: 800,
+      auth: { accessToken: async () => 'fresh-token' },
+    });
+    const customProvider = new CustomGeminiProvider('robin-eager', client, {
+      stateDir: tmpdir(),
+      secret: () => '',
+      readBlob: () => null,
+      keepThinking: () => false,
+      log: nullLogger(),
+    }, () => () => true);
+
+    const startedAt = Date.now();
+    const doneOrder: Array<{ index: number; type: string; status?: string; at: number }> = [];
+    const result = await customProvider.respond({
+      model: 'gemini-robin-fast',
+      tools: [{ type: 'function', name: 'pet_say', parameters: { type: 'object' } }],
+      input: [{ type: 'message', role: 'user', content: 'hi' }],
+    }, {
+      nativeSpec: { model: 'gemini-robin-fast', thinking: true },
+      onEvent: event => {
+        if (event.type === 'response.output_item.done' && event.item) {
+          doneOrder.push({
+            index: event.output_index,
+            type: event.item.type,
+            status: 'status' in event.item ? String(event.item.status) : undefined,
+            at: Date.now() - startedAt,
+          });
+        }
+      },
+    });
+    const totalMs = Date.now() - startedAt;
+
+    // Reasoning (index 0) and pet_say (index 1) must BOTH emit output_item.done IMMEDIATELY,
+    // well before the 450ms background tool idle timer ends the HTTP/2 stream!
+    expect(doneOrder.map(d => ({ index: d.index, type: d.type, status: d.status }))).toEqual([
+      { index: 0, type: 'reasoning', status: undefined },
+      { index: 1, type: 'function_call', status: 'completed' },
+    ]);
+    expect(doneOrder[1].at).toBeLessThan(250);
+    expect(totalMs - doneOrder[1].at).toBeGreaterThanOrEqual(300);
+    expect(result.response.status).toBe('completed');
+    expect(result.response.output).toEqual([
+      expect.objectContaining({ type: 'reasoning' }),
+      expect.objectContaining({ type: 'function_call', call_id: 'call_0_say', name: 'pet_say', status: 'completed' }),
+    ]);
+  } finally {
+    for (const s of openStreams) {
+      try { s.destroy(); } catch { /* ignore */ }
+    }
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 });

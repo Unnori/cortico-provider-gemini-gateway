@@ -865,4 +865,98 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });
+
+  it('uses shorter end_turn idle timeout and ignores empty heartbeat frames when counting idle time', async () => {
+    let mode: 'end-turn' | 'heartbeat-spam' = 'end-turn';
+    const openStreams: http2.ServerHttp2Stream[] = [];
+    const intervals: ReturnType<typeof setInterval>[] = [];
+    const server = http2.createServer();
+
+    server.on('stream', (stream, headers) => {
+      if (headers[':path'] !== ROBIN_GRPC_PROCESS_QUERY) {
+        stream.respond({ ':status': 404 });
+        stream.end();
+        return;
+      }
+      openStreams.push(stream);
+      stream.resume();
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        if (mode === 'end-turn') {
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: '<tool_call>{"name":"pet_say","args":{"script":"晚安"}}</tool_call><tool_call>{"name":"end_turn","args":{}}</tool_call>',
+            responseId: 'rc_end_turn',
+            completed: false,
+          })));
+          return;
+        }
+        // Send visible text once, then keep sending empty outer=[1014] & duplicate-length frames every 40ms.
+        stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+          text: '正文已说完，后面全是空心跳',
+          responseId: 'rc_hb',
+          completed: false,
+        })));
+        const iv = setInterval(() => {
+          if (stream.closed || stream.destroyed) {
+            clearInterval(iv);
+            return;
+          }
+          stream.write(frameGrpcMessage(lengthDelimited(1014, Buffer.from('hb'))));
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: '正文已说完，后面全是空心跳',
+            responseId: 'rc_hb',
+            completed: false,
+          })));
+        }, 40);
+        intervals.push(iv);
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const client = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        robinTextIdleTimeoutMs: 220,
+        robinToolIdleTimeoutMs: 600,
+        robinEndTurnIdleTimeoutMs: 90,
+        auth: { accessToken: async () => 'fresh-token' },
+      });
+
+      // 1. Trailing end_turn exits via endTurnIdleTimeoutMs (90ms), well below toolIdleTimeoutMs (600ms).
+      const t0 = Date.now();
+      const res1 = await consume(client.stream({
+        model: 'gemini-robin-fast',
+        tools: [{ functionDeclarations: [{ name: 'pet_say', parametersJsonSchema: { type: 'object' } }, { name: 'end_turn', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'goodnight' }] }],
+      }));
+      const elapsed1 = Date.now() - t0;
+      expect(elapsed1).toBeLessThan(400);
+      expect(res1.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).filter(p => p.functionCall).map(p => p.functionCall?.name)).toEqual(['pet_say', 'end_turn']);
+      expect(res1.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+
+      // 2. Empty/duplicate heartbeat frames every 40ms must NOT extend the 220ms text idle timer.
+      mode = 'heartbeat-spam';
+      const t1 = Date.now();
+      const res2 = await consume(client.stream({
+        model: 'gemini-robin-fast',
+        contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+      }));
+      const elapsed2 = Date.now() - t1;
+      expect(elapsed2).toBeLessThan(650);
+      expect(res2.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text).join('')).toBe('正文已说完，后面全是空心跳');
+      expect(res2.at(-1)?.candidates?.[0]?.finishReason).toBe('MAX_TOKENS');
+    } finally {
+      for (const iv of intervals) clearInterval(iv);
+      for (const s of openStreams) {
+        try { s.destroy(); } catch { /* ignore */ }
+      }
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
 });

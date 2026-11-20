@@ -57,6 +57,7 @@ export interface GatewayClientOptions {
   proxyUrl?: string;
   robinTextIdleTimeoutMs?: number;
   robinToolIdleTimeoutMs?: number;
+  robinEndTurnIdleTimeoutMs?: number;
   fetch?: typeof fetch;
   connectHttp2?: Http2Connector;
 }
@@ -374,6 +375,7 @@ export class GatewayClient {
       signal,
       ...(this.options.robinTextIdleTimeoutMs !== undefined ? { textIdleTimeoutMs: this.options.robinTextIdleTimeoutMs } : {}),
       ...(this.options.robinToolIdleTimeoutMs !== undefined ? { toolIdleTimeoutMs: this.options.robinToolIdleTimeoutMs } : {}),
+      ...(this.options.robinEndTurnIdleTimeoutMs !== undefined ? { endTurnIdleTimeoutMs: this.options.robinEndTurnIdleTimeoutMs } : {}),
       connectHttp2: this.h2Connector,
       onStatus: (httpStatus, requestId) => onMeta({ status: httpStatus, requestId }),
       onStreamSummary: summary => { streamSummary = summary; },

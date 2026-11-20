@@ -678,16 +678,31 @@ export interface StreamRobinGrpcOptions {
   textIdleTimeoutMs?: number;
   /** Shorter idle time once a closed `</tool_call>` block has arrived and no open `<tool_call>` tag remains. */
   toolIdleTimeoutMs?: number;
+  /** Shortest idle time once a terminal `end_turn` tool call has closed at the tail of visible text. */
+  endTurnIdleTimeoutMs?: number;
   connectHttp2?: Http2Connector;
   onStatus?: (httpStatus: number | null, requestId: string | null) => void;
   onStreamSummary?: (summary: RobinGrpcStreamSummary) => void;
 }
 
-function hasClosedToolCallWithoutOpenTail(text: string): boolean {
+function detectClosedToolIdleKind(text: string): 'end_turn' | 'tool' | 'none' {
   const lastClose = text.lastIndexOf('</tool_call>');
-  if (lastClose < 0) return false;
+  if (lastClose < 0) return 'none';
   const lastOpen = text.lastIndexOf('<tool_call>');
-  return lastClose > lastOpen;
+  if (lastOpen < 0 || lastOpen > lastClose) return 'none';
+  const trailing = text.slice(lastClose + '</tool_call>'.length);
+  if (!trailing.trim()) {
+    const inner = text.slice(lastOpen + '<tool_call>'.length, lastClose).trim();
+    try {
+      const parsed = JSON.parse(inner) as { name?: unknown };
+      if (parsed && typeof parsed === 'object' && parsed.name === 'end_turn') {
+        return 'end_turn';
+      }
+    } catch {
+      // Fall through to generic closed tool_call delay.
+    }
+  }
+  return 'tool';
 }
 
 export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGenerator<DecodedProcessQueryFrame> {
@@ -696,7 +711,8 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
   const timeoutMs = options.timeoutMs ?? 180_000;
   const completedGraceMs = options.completedGraceMs ?? 500;
   const textIdleTimeoutMs = options.textIdleTimeoutMs ?? 12_000;
-  const toolIdleTimeoutMs = options.toolIdleTimeoutMs ?? 6_000;
+  const toolIdleTimeoutMs = options.toolIdleTimeoutMs ?? 2_500;
+  const endTurnIdleTimeoutMs = options.endTurnIdleTimeoutMs ?? 1_200;
   const wire = buildProcessQueryWire({
     userText: options.userText,
     images: options.images,
@@ -725,6 +741,7 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
   let sawCompleted = false;
   let sawVisibleText = false;
   let latestText = '';
+  let latestThoughtLen = 0;
   let endedByIdleTimeout = false;
   let summaryReported = false;
 
@@ -796,7 +813,12 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
     if (closed || sawCompleted || !sawVisibleText) return;
     clearTimeout(idleTimer);
     idleTimer = undefined;
-    const delay = hasClosedToolCallWithoutOpenTail(latestText) ? toolIdleTimeoutMs : textIdleTimeoutMs;
+    const toolKind = detectClosedToolIdleKind(latestText);
+    const delay = toolKind === 'end_turn'
+      ? endTurnIdleTimeoutMs
+      : toolKind === 'tool'
+        ? toolIdleTimeoutMs
+        : textIdleTimeoutMs;
     if (delay <= 0) return;
     idleTimer = setTimeout(() => {
       if (closed) return;
@@ -873,13 +895,21 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
       return;
     }
     try {
+      let madeProgress = false;
       for (const message of reader.push(chunk)) {
         const decoded = decodeProcessQueryFrame(message);
         if (decoded) {
           pushFrame(decoded);
+          if (typeof decoded.thought === 'string' && decoded.thought.length > latestThoughtLen) {
+            latestThoughtLen = decoded.thought.length;
+            madeProgress = true;
+          }
           if (typeof decoded.text === 'string' && decoded.text.length > 0) {
             sawVisibleText = true;
-            if (decoded.text.length >= latestText.length) latestText = decoded.text;
+            if (decoded.text.length > latestText.length) {
+              latestText = decoded.text;
+              madeProgress = true;
+            }
           }
           if (decoded.completed) {
             sawCompleted = true;
@@ -901,7 +931,8 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
           }
         }
       }
-      if (sawVisibleText && !sawCompleted) {
+      // Only reset the idle countdown when text/thought actually grows (never let empty/heartbeat frames extend it).
+      if (sawVisibleText && !sawCompleted && (madeProgress || !idleTimer)) {
         armIdleTimer();
       }
     } catch (err) {
