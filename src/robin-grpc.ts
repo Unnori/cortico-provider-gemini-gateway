@@ -653,6 +653,12 @@ function copySafeGrpcHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
+export interface RobinGrpcStreamSummary {
+  sawCompleted: boolean;
+  sawGrpcStatusOk: boolean;
+  endedByIdleTimeout: boolean;
+}
+
 export interface StreamRobinGrpcOptions {
   baseUrl: string;
   path?: string;
@@ -668,8 +674,20 @@ export interface StreamRobinGrpcOptions {
   timeoutMs?: number;
   /** Max time to wait for trailing frames / HTTP/2 END_STREAM after receiving `completed: true`. */
   completedGraceMs?: number;
+  /** Max idle time after visible text starts arriving when `completed` has not yet arrived. */
+  textIdleTimeoutMs?: number;
+  /** Shorter idle time once a closed `</tool_call>` block has arrived and no open `<tool_call>` tag remains. */
+  toolIdleTimeoutMs?: number;
   connectHttp2?: Http2Connector;
   onStatus?: (httpStatus: number | null, requestId: string | null) => void;
+  onStreamSummary?: (summary: RobinGrpcStreamSummary) => void;
+}
+
+function hasClosedToolCallWithoutOpenTail(text: string): boolean {
+  const lastClose = text.lastIndexOf('</tool_call>');
+  if (lastClose < 0) return false;
+  const lastOpen = text.lastIndexOf('<tool_call>');
+  return lastClose > lastOpen;
 }
 
 export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGenerator<DecodedProcessQueryFrame> {
@@ -677,6 +695,8 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
   const path = normalizeGrpcPath(options.path ?? ROBIN_GRPC_PROCESS_QUERY);
   const timeoutMs = options.timeoutMs ?? 180_000;
   const completedGraceMs = options.completedGraceMs ?? 500;
+  const textIdleTimeoutMs = options.textIdleTimeoutMs ?? 12_000;
+  const toolIdleTimeoutMs = options.toolIdleTimeoutMs ?? 6_000;
   const wire = buildProcessQueryWire({
     userText: options.userText,
     images: options.images,
@@ -702,15 +722,33 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
   let grpcMessage = '';
   let requestId: string | null = null;
   let receivedBytes = 0;
+  let sawCompleted = false;
+  let sawVisibleText = false;
+  let latestText = '';
+  let endedByIdleTimeout = false;
+  let summaryReported = false;
 
   let req: http2.ClientHttp2Stream | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let completedTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const reportSummary = () => {
+    if (summaryReported) return;
+    summaryReported = true;
+    options.onStreamSummary?.({
+      sawCompleted,
+      sawGrpcStatusOk: grpcStatus === 0,
+      endedByIdleTimeout,
+    });
+  };
 
   const stop = (normal: boolean) => {
     clearTimeout(timer);
     clearTimeout(completedTimer);
+    clearTimeout(idleTimer);
     completedTimer = undefined;
+    idleTimer = undefined;
     options.signal?.removeEventListener('abort', onAbort);
     try {
       req?.close(normal ? http2.constants.NGHTTP2_NO_ERROR : http2.constants.NGHTTP2_CANCEL);
@@ -745,12 +783,33 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
     if (closed) return;
     closed = true;
     ended = true;
+    reportSummary();
     if (waiting) {
       const { resolve } = waiting;
       waiting = null;
       resolve({ value: undefined, done: true });
     }
     stop(true);
+  };
+
+  const armIdleTimer = () => {
+    if (closed || sawCompleted || !sawVisibleText) return;
+    clearTimeout(idleTimer);
+    idleTimer = undefined;
+    const delay = hasClosedToolCallWithoutOpenTail(latestText) ? toolIdleTimeoutMs : textIdleTimeoutMs;
+    if (delay <= 0) return;
+    idleTimer = setTimeout(() => {
+      if (closed) return;
+      if (grpcStatus !== null && grpcStatus !== 0) {
+        const mapped = grpcStatusToHttp(grpcStatus);
+        const detail = formatGrpcErrorDetail(grpcStatus, grpcMessage, 'generation');
+        fail(new GatewayError(mapped, 'generation', { detail, body: detail }));
+        return;
+      }
+      endedByIdleTimeout = true;
+      finish();
+    }, delay);
+    idleTimer.unref();
   };
 
   const onAbort = () => {
@@ -818,20 +877,32 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
         const decoded = decodeProcessQueryFrame(message);
         if (decoded) {
           pushFrame(decoded);
-          if (decoded.completed && !completedTimer && completedGraceMs >= 0) {
-            completedTimer = setTimeout(() => {
-              if (closed) return;
-              if (grpcStatus !== null && grpcStatus !== 0) {
-                const mapped = grpcStatusToHttp(grpcStatus);
-                const detail = formatGrpcErrorDetail(grpcStatus, grpcMessage, 'generation');
-                fail(new GatewayError(mapped, 'generation', { detail, body: detail }));
-                return;
-              }
-              finish();
-            }, completedGraceMs);
-            completedTimer.unref();
+          if (typeof decoded.text === 'string' && decoded.text.length > 0) {
+            sawVisibleText = true;
+            if (decoded.text.length >= latestText.length) latestText = decoded.text;
+          }
+          if (decoded.completed) {
+            sawCompleted = true;
+            clearTimeout(idleTimer);
+            idleTimer = undefined;
+            if (!completedTimer && completedGraceMs >= 0) {
+              completedTimer = setTimeout(() => {
+                if (closed) return;
+                if (grpcStatus !== null && grpcStatus !== 0) {
+                  const mapped = grpcStatusToHttp(grpcStatus);
+                  const detail = formatGrpcErrorDetail(grpcStatus, grpcMessage, 'generation');
+                  fail(new GatewayError(mapped, 'generation', { detail, body: detail }));
+                  return;
+                }
+                finish();
+              }, completedGraceMs);
+              completedTimer.unref();
+            }
           }
         }
+      }
+      if (sawVisibleText && !sawCompleted) {
+        armIdleTimer();
       }
     } catch (err) {
       fail(new GatewayError(502, 'generation', { detail: err instanceof Error ? err.message : 'Invalid gRPC frame', cause: err }));

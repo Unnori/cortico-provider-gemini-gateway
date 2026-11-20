@@ -1,6 +1,6 @@
 {
   "name": "cortico-provider-gemini-gateway",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "description": "### 📦**Gemini 多合一粮仓（Robin / Web2API / 自定义 RPC）**\n给自家桌宠搭的三合一 Gemini 喂食通道，WebUI 面板随切随用：\n- **🐦 知更鸟模式（Robin）**：支持绑多个号轮着喂（主备切号 / 雨露均沾 / 谁额度多先吃谁），自带 5h & 周额度小看板、原生传图和账号打码防社死。\n- **🔑 Web2API 模式**：切过去直接填官方 Gemini API Key 或自建反代 Key，零门槛开箱即用。\n- **🛠️ 自定义 RPC**：给喜欢自己搭网关的折腾党留的后门。",
   "author": "云纪&云洄",

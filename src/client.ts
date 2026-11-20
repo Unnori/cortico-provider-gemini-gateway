@@ -13,6 +13,7 @@ import {
   ROBIN_NATIVE_IMAGE_MIMES,
   streamRobinGrpc,
   uploadRobinImages,
+  type RobinGrpcStreamSummary,
   type RobinImageMime,
   type RobinRoutingObservation,
   type RobinUploadedImage,
@@ -54,6 +55,8 @@ export interface GatewayClientOptions {
   onRobinRouting?: (observation: RobinRoutingObservation, accountId?: string) => void;
   onCleanupError?: (error: unknown) => void;
   proxyUrl?: string;
+  robinTextIdleTimeoutMs?: number;
+  robinToolIdleTimeoutMs?: number;
   fetch?: typeof fetch;
   connectHttp2?: Http2Connector;
 }
@@ -347,6 +350,10 @@ export class GatewayClient {
     let emittedText = '';
     let emittedThought = '';
     let received = false;
+    let emittedToolCallCount = 0;
+    let emittedVisibleTextCount = 0;
+    let truncatedEarly = false;
+    let streamSummary: RobinGrpcStreamSummary | undefined;
     let observedAttribution: string | undefined;
     let observedResolvedMode: number | undefined;
     let observedThinking: number | undefined;
@@ -365,8 +372,11 @@ export class GatewayClient {
       overrideModeCategory,
       temporaryChat: this.options.temporaryChat ?? true,
       signal,
+      ...(this.options.robinTextIdleTimeoutMs !== undefined ? { textIdleTimeoutMs: this.options.robinTextIdleTimeoutMs } : {}),
+      ...(this.options.robinToolIdleTimeoutMs !== undefined ? { toolIdleTimeoutMs: this.options.robinToolIdleTimeoutMs } : {}),
       connectHttp2: this.h2Connector,
       onStatus: (httpStatus, requestId) => onMeta({ status: httpStatus, requestId }),
+      onStreamSummary: summary => { streamSummary = summary; },
     })) {
       signal.throwIfAborted();
       if (frame.conversationId) conversations.add(frame.conversationId);
@@ -391,6 +401,10 @@ export class GatewayClient {
         }
       }
       const parts = filter.feed(rawParts);
+      for (const part of parts) {
+        if (part.functionCall) emittedToolCallCount += 1;
+        else if (!part.thought && typeof part.text === 'string' && part.text) emittedVisibleTextCount += 1;
+      }
       received ||= Boolean(parts.length || frame.completed || emittedText.length > 0);
       if (parts.length) onMeta({ observed: true });
       if (parts.length || frame.responseId || frame.modelVersion) {
@@ -400,7 +414,10 @@ export class GatewayClient {
           modelVersion: frame.modelVersion,
         };
       }
-      if (filter.isTruncated) break;
+      if (filter.isTruncated) {
+        truncatedEarly = true;
+        break;
+      }
     }
 
     if (!received) throw new Error('Gemini gateway stream ended without a complete response');
@@ -422,9 +439,32 @@ export class GatewayClient {
         observedAt: new Date().toISOString(),
       }, accountId);
     }
+    const hadPendingToolMarkup = parser.hasPendingToolMarkup;
     const tail = [...filter.feed(parser.finish()), ...filter.finish()];
+    for (const part of tail) {
+      if (part.functionCall) emittedToolCallCount += 1;
+      else if (!part.thought && typeof part.text === 'string' && part.text) emittedVisibleTextCount += 1;
+    }
+    const confirmedComplete = Boolean(
+      truncatedEarly
+      || streamSummary?.sawCompleted
+      || streamSummary?.sawGrpcStatusOk,
+    );
+    if (!confirmedComplete && emittedVisibleTextCount === 0 && emittedToolCallCount === 0) {
+      throw new GatewayError(504, 'generation', {
+        detail: streamSummary?.endedByIdleTimeout
+          ? 'Robin gRPC stream stalled without completion'
+          : 'Gemini gateway stream ended without completion confirmation',
+      });
+    }
+    // If neither `completed=1` nor `grpc-status=0` arrived:
+    // - Always mark incomplete (`MAX_TOKENS`) when an unclosed `<tool_call>` was cut short or on plain text.
+    // - Preserve `STOP` when all `<tool_call>...</tool_call>` blocks closed cleanly with valid JSON so
+    //   Coopanion pet replies (which are tool calls) still execute instead of getting blocked by Core.
+    const markIncomplete = !confirmedComplete && (hadPendingToolMarkup || emittedToolCallCount === 0);
+    const finishReason = markIncomplete ? 'MAX_TOKENS' : 'STOP';
     onMeta({ completed: true });
-    yield { candidates: [{ ...(tail.length ? { content: { role: 'model', parts: tail } } : {}), finishReason: 'STOP' }] };
+    yield { candidates: [{ ...(tail.length ? { content: { role: 'model', parts: tail } } : {}), finishReason }] };
   }
 
   async *stream(input: GeminiRequest, options: GatewayStreamOptions = {}): AsyncGenerator<GeminiChunk> {

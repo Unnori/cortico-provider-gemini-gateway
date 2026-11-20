@@ -329,6 +329,11 @@ export class ToolCallStream {
   private escaped = false;
   private closing = 0;
 
+  /** True when an opening `<tool_call>` (or partial `<tool_call` prefix) has not yet closed with `</tool_call>`. */
+  get hasPendingToolMarkup(): boolean {
+    return this.tool !== undefined || this.prefix.length > 0;
+  }
+
   feed(text: string): GeminiPart[] {
     const parts: GeminiPart[] = [];
     let offset = 0;

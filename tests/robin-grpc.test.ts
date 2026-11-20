@@ -710,4 +710,159 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });
+
+  it('handles missing completed/grpc-status with idle timeout, preserves mid-stream pauses, and marks incomplete tool tags without executing them', async () => {
+    type Scenario = 'plain-text-stalled' | 'mid-stream-pause' | 'partial-tool-stalled' | 'closed-tool-stalled' | 'eof-without-trailers';
+    let scenario: Scenario = 'plain-text-stalled';
+    const openStreams: http2.ServerHttp2Stream[] = [];
+    const server = http2.createServer();
+
+    server.on('stream', (stream, headers) => {
+      if (headers[':path'] !== ROBIN_GRPC_PROCESS_QUERY) {
+        stream.respond({ ':status': 404 });
+        stream.end();
+        return;
+      }
+      openStreams.push(stream);
+      const chunks: Buffer[] = [];
+      stream.on('data', c => chunks.push(c as Buffer));
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        if (scenario === 'plain-text-stalled') {
+          // Plain text arrives with completed=0, stream never sends completed=1 or END_STREAM.
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: '这是一段正常正文，但末尾完成信号丢了。',
+            responseId: 'rc_idle_plain',
+            attribution: 'Gemini 4 Hydrogen',
+            completed: false,
+          })));
+          return;
+        }
+        if (scenario === 'mid-stream-pause') {
+          // Part 1 arrives, pauses for 120ms (< textIdleTimeoutMs=250ms), then continues and sends completed=1.
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: '第一段正文，',
+            responseId: 'rc_pause',
+            attribution: 'Gemini 4 Hydrogen',
+            completed: false,
+          })));
+          setTimeout(() => {
+            if (stream.closed || stream.destroyed) return;
+            stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+              text: '第一段正文，停顿后继续说完啦！',
+              responseId: 'rc_pause',
+              attribution: 'Gemini 4 Hydrogen',
+              completed: true,
+            })));
+            stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+            stream.end();
+          }, 120);
+          return;
+        }
+        if (scenario === 'partial-tool-stalled') {
+          // Cut off mid-<tool_call> JSON with no completed=1 and no END_STREAM.
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: '准备说话\n<tool_call>{"name":"pet_say","args":{"script":"没说',
+            responseId: 'rc_partial_tool',
+            attribution: 'Gemini 4 Hydrogen',
+            completed: false,
+          })));
+          return;
+        }
+        if (scenario === 'closed-tool-stalled') {
+          // Complete closed <tool_call>...</tool_call> arrives with completed=0, tail frames lost.
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: '<tool_call>{"name":"pet_say","args":{"script":"早安呀！"}}</tool_call>',
+            responseId: 'rc_closed_tool',
+            attribution: 'Gemini 4 Hydrogen',
+            completed: false,
+          })));
+          return;
+        }
+        // eof-without-trailers: HTTP/2 END_STREAM arrives without completed=1 and without grpc-status trailer.
+        stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+          text: '无 trailers 直接断开的正文',
+          responseId: 'rc_eof_notrailers',
+          attribution: 'Gemini 4 Hydrogen',
+          completed: false,
+        })));
+        stream.end();
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const client = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        robinTextIdleTimeoutMs: 250,
+        robinToolIdleTimeoutMs: 120,
+        auth: { accessToken: async () => 'fresh-token' },
+      });
+
+      // 1. Plain text stalled with completed=0 -> exits promptly via text idle timeout, preserves text, marks incomplete (MAX_TOKENS).
+      const t0 = Date.now();
+      const res1 = await consume(client.stream({
+        model: 'gemini-robin-fast',
+        contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+      }));
+      expect(Date.now() - t0).toBeLessThan(1_500);
+      expect(res1.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text).join('')).toBe('这是一段正常正文，但末尾完成信号丢了。');
+      expect(res1.at(-1)?.candidates?.[0]?.finishReason).toBe('MAX_TOKENS');
+
+      // 2. Mid-stream pause shorter than textIdleTimeoutMs -> NOT cut off, completes cleanly with STOP.
+      scenario = 'mid-stream-pause';
+      const res2 = await consume(client.stream({
+        model: 'gemini-robin-fast',
+        contents: [{ role: 'user', parts: [{ text: 'long reply' }] }],
+      }));
+      expect(res2.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text).join('')).toBe('第一段正文，停顿后继续说完啦！');
+      expect(res2.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+
+      // 3. Unclosed <tool_call> stalled -> NEVER emits executable functionCall, preserves text, marks incomplete (MAX_TOKENS).
+      scenario = 'partial-tool-stalled';
+      const res3 = await consume(client.stream({
+        model: 'gemini-robin-fast',
+        tools: [{ functionDeclarations: [{ name: 'pet_say', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'talk' }] }],
+      }));
+      const parts3 = res3.flatMap(c => c.candidates?.[0]?.content?.parts ?? []);
+      expect(parts3.filter(p => p.functionCall)).toEqual([]);
+      expect(parts3.map(p => p.text ?? '').join('')).toContain('准备说话');
+      expect(res3.at(-1)?.candidates?.[0]?.finishReason).toBe('MAX_TOKENS');
+
+      // 4. Cleanly closed <tool_call>...</tool_call> stalled without completed=1 -> exits via shorter tool idle timeout and allows STOP execution.
+      scenario = 'closed-tool-stalled';
+      const t4 = Date.now();
+      const res4 = await consume(client.stream({
+        model: 'gemini-robin-fast',
+        tools: [{ functionDeclarations: [{ name: 'pet_say', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'greet' }] }],
+      }));
+      expect(Date.now() - t4).toBeLessThan(1_000);
+      expect(res4.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { functionCall: { name: 'pet_say', args: { script: '早安呀！' } } },
+      ]);
+      expect(res4.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+
+      // 5. HTTP/2 stream ends cleanly without completed=1 and without grpc-status -> preserves text and marks incomplete.
+      scenario = 'eof-without-trailers';
+      const res5 = await consume(client.stream({
+        model: 'gemini-robin-fast',
+        contents: [{ role: 'user', parts: [{ text: 'eof' }] }],
+      }));
+      expect(res5.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text).join('')).toBe('无 trailers 直接断开的正文');
+      expect(res5.at(-1)?.candidates?.[0]?.finishReason).toBe('MAX_TOKENS');
+    } finally {
+      for (const s of openStreams) {
+        try { s.destroy(); } catch { /* ignore */ }
+      }
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
 });
