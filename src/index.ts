@@ -280,12 +280,15 @@ export const GEMINI_GATEWAY = {
         const cur = current();
         if (configuration(cur).protocol !== 'robin') return undefined;
         const acct = oauth.getCachedAccountInfo();
+        const observed = oauth.getObservedRouting(model);
+        const observedAccount = oauth.describeAccount(observed?.accountId);
         return buildRobinRouteSummary({
           model,
           userStatus: acct.userStatus,
           plan: acct.plan,
           userTier: acct.userTier,
-          observed: oauth.getObservedRouting(model),
+          observed,
+          observedAccount,
           overrideModeCategory: oauth.resolveDiscoveredModeCategory(model),
         });
       },

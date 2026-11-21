@@ -140,11 +140,15 @@ function orderPrimaryFirst(accounts: readonly OAuthAccountSummary[]): OAuthAccou
   return [primary, ...accounts.filter(a => a.id !== primary.id)];
 }
 
+export interface RecordedRobinRouting extends RobinRoutingObservation {
+  accountId?: string;
+}
+
 export class GatewayControl {
   readonly oauthDir: string;
   readonly auth: DesktopOAuth;
   private readonly accountRuntime = new Map<string, AccountRuntimeState>();
-  private readonly observedRouting = new Map<string, RobinRoutingObservation>();
+  private readonly observedRouting = new Map<string, RecordedRobinRouting>();
   private rrCursor = 0;
   private emailsMasked = true;
   private activeProxyUrl?: string;
@@ -408,7 +412,10 @@ export class GatewayControl {
 
   recordRouting(observation: RobinRoutingObservation, accountId?: string): void {
     const key = geminiModelId(observation.requestedModel).toLowerCase();
-    this.observedRouting.set(key, observation);
+    this.observedRouting.set(key, {
+      ...observation,
+      ...(accountId ? { accountId } : {}),
+    });
     if (this.observedRouting.size > 32) {
       const oldest = this.observedRouting.keys().next().value;
       if (oldest !== undefined) this.observedRouting.delete(oldest);
@@ -427,8 +434,15 @@ export class GatewayControl {
     }
   }
 
-  getObservedRouting(model: string): RobinRoutingObservation | undefined {
+  getObservedRouting(model: string): RecordedRobinRouting | undefined {
     return this.observedRouting.get(geminiModelId(model).toLowerCase());
+  }
+
+  describeAccount(accountId: string | undefined): string | undefined {
+    if (!accountId) return undefined;
+    const acct = this.auth.listAccounts({ revealEmail: !this.emailsMasked }).find(a => a.id === accountId);
+    if (acct?.email) return acct.email;
+    return accountId.replace(/^acct_/, '').slice(0, 6);
   }
 
   getCachedAccountInfo(accountId?: string): { plan?: string; userTier?: string; userStatus?: RobinUserStatus } {

@@ -14,6 +14,21 @@ function maskEmail(value) {
 }
 
 // src/webui/model-panel.ts
+function formatObservedTime(iso) {
+  if (!iso) return void 0;
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return void 0;
+  const dt = new Date(ms);
+  const now = /* @__PURE__ */ new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const time = `${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+  const sameDay = dt.getFullYear() === now.getFullYear() && dt.getMonth() === now.getMonth() && dt.getDate() === now.getDate();
+  const date = `${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+  return {
+    short: sameDay ? time : `${date} ${time}`,
+    full: `${dt.getFullYear()}-${date} ${time}`
+  };
+}
 var modelSettingsPanel = {
   mount: async (ctx) => {
     const en = ctx.language !== "zh" && ctx.language !== "zh-Hant";
@@ -108,13 +123,23 @@ var modelSettingsPanel = {
         } else if (r.officialEntitled === false) {
           parts.push(en ? "Not in account official picker (routed by backend tier)" : "\u4E0D\u5728\u8BE5\u8D26\u53F7\u5B98\u65B9\u4E0B\u62C9\u5217\u8868\uFF08\u7531\u540E\u7AEF\u6309\u5957\u9910\u6743\u76CA\u8DEF\u7531\uFF09");
         }
+        let observedTitle = "";
         if (r.lastAttribution) {
-          parts.push(en ? `Last actual model: ${r.lastAttribution}${r.downgraded ? " (downgraded)" : ""}` : `\u6700\u8FD1\u5B9E\u6D4B\u5F52\u5C5E\uFF1A${r.lastAttribution}${r.downgraded ? "\uFF08\u5DF2\u964D\u7EA7/\u56DE\u843D\uFF09" : ""}`);
+          const obsTime = formatObservedTime(r.lastObservedAt);
+          if (obsTime) observedTitle = obsTime.full;
+          const tags = [];
+          if (r.downgraded) tags.push(en ? "downgraded" : zhHant ? "\u5DF2\u964D\u7D1A/\u56DE\u843D" : "\u5DF2\u964D\u7EA7/\u56DE\u843D");
+          if (obsTime) tags.push(obsTime.short);
+          if (r.lastAccount) tags.push(r.lastAccount);
+          const suffix = tags.length ? en ? ` (${tags.join(" \xB7 ")})` : `\uFF08${tags.join(" \xB7 ")}\uFF09` : "";
+          parts.push(en ? `Last actual model: ${r.lastAttribution}${suffix}` : zhHant ? `\u6700\u8FD1\u5BE6\u6E2C\u6B78\u5C6C\uFF1A${r.lastAttribution}${suffix}` : `\u6700\u8FD1\u5B9E\u6D4B\u5F52\u5C5E\uFF1A${r.lastAttribution}${suffix}`);
         }
         routeNote.textContent = parts.join(" \xB7 ");
+        routeNote.title = observedTitle ? en ? `Last routed at ${observedTitle}` : zhHant ? `\u6700\u8FD1\u5BE6\u6E2C\u6642\u9593\uFF1A${observedTitle}` : `\u6700\u8FD1\u5B9E\u6D4B\u65F6\u95F4\uFF1A${observedTitle}` : "";
         routeNote.hidden = !parts.length;
       } else {
         routeNote.textContent = "";
+        routeNote.title = "";
         routeNote.hidden = true;
       }
       inputTypes.textContent = next.input.join(", ") || (en ? 'No format declarations yet. Click "Refresh formats & prices".' : "\u6682\u672A\u83B7\u5F97\u58F0\u660E\uFF0C\u8BF7\u70B9\u51FB\u4E0A\u65B9\u300C\u83B7\u53D6\u58F0\u660E\u683C\u5F0F\u4E0E\u4EF7\u683C\u300D\u6216\u5148\u9009\u62E9\u6A21\u578B\u3002");
@@ -786,7 +811,10 @@ var authPanel = {
           variant: "primary",
           onClick: () => void run(async () => {
             state = await invoke("set-primary", { accountId: acct.id });
-            message.textContent = t(`\u5DF2\u5C06 ${display} \u8BBE\u4E3A\u4E3B\u7528\u8D26\u53F7\u3002`, `Set ${display} as primary account.`);
+            message.textContent = state.saved ? t(`\u5DF2\u5C06 ${display} \u8BBE\u4E3A\u4E3B\u7528\u8D26\u53F7\u3002`, `Set ${display} as primary account.`) : t(
+              `\u5DF2\u5C06 ${display} \u8BBE\u4E3A\u4E3B\u7528\u8D26\u53F7\uFF08\u5982\u521A\u5207\u6362\u8FC7\u8C03\u5EA6\u7B56\u7565\uFF0C\u8BF7\u8BB0\u5F97\u70B9\u51FB\u9875\u9762\u5E95\u90E8\u300C\u4FDD\u5B58\u300D\u751F\u6548\uFF09\u3002`,
+              `Set ${display} as primary account (click Save below if you also changed the routing strategy).`
+            );
             await ctx.refresh();
           })
         });

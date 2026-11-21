@@ -1,6 +1,24 @@
 import type { WebUiPanel, WebUiPanelContext } from 'cortico/web/shared/client-panel.ts';
 import type { InputKind, ModelSettings } from './model-settings.ts';
 
+function formatObservedTime(iso: string | undefined): { short: string; full: string } | undefined {
+  if (!iso) return undefined;
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return undefined;
+  const dt = new Date(ms);
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const time = `${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+  const sameDay = dt.getFullYear() === now.getFullYear()
+    && dt.getMonth() === now.getMonth()
+    && dt.getDate() === now.getDate();
+  const date = `${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+  return {
+    short: sameDay ? time : `${date} ${time}`,
+    full: `${dt.getFullYear()}-${date} ${time}`,
+  };
+}
+
 export const modelSettingsPanel: WebUiPanel = {
   mount: async (ctx: WebUiPanelContext) => {
     const en = ctx.language !== 'zh' && ctx.language !== 'zh-Hant';
@@ -128,15 +146,31 @@ export const modelSettingsPanel: WebUiPanel = {
         } else if (r.officialEntitled === false) {
           parts.push(en ? 'Not in account official picker (routed by backend tier)' : '不在该账号官方下拉列表（由后端按套餐权益路由）');
         }
+        let observedTitle = '';
         if (r.lastAttribution) {
+          const obsTime = formatObservedTime(r.lastObservedAt);
+          if (obsTime) observedTitle = obsTime.full;
+          const tags: string[] = [];
+          if (r.downgraded) tags.push(en ? 'downgraded' : zhHant ? '已降級/回落' : '已降级/回落');
+          if (obsTime) tags.push(obsTime.short);
+          if (r.lastAccount) tags.push(r.lastAccount);
+          const suffix = tags.length
+            ? (en ? ` (${tags.join(' · ')})` : `（${tags.join(' · ')}）`)
+            : '';
           parts.push(en
-            ? `Last actual model: ${r.lastAttribution}${r.downgraded ? ' (downgraded)' : ''}`
-            : `最近实测归属：${r.lastAttribution}${r.downgraded ? '（已降级/回落）' : ''}`);
+            ? `Last actual model: ${r.lastAttribution}${suffix}`
+            : zhHant
+              ? `最近實測歸屬：${r.lastAttribution}${suffix}`
+              : `最近实测归属：${r.lastAttribution}${suffix}`);
         }
         routeNote.textContent = parts.join(' · ');
+        routeNote.title = observedTitle
+          ? (en ? `Last routed at ${observedTitle}` : zhHant ? `最近實測時間：${observedTitle}` : `最近实测时间：${observedTitle}`)
+          : '';
         routeNote.hidden = !parts.length;
       } else {
         routeNote.textContent = '';
+        routeNote.title = '';
         routeNote.hidden = true;
       }
 

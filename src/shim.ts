@@ -56,7 +56,7 @@ const TOOL_CLOSE = '</tool_call>';
 const TOOL_CALL_FORMAT = 'To call a declared function, emit <tool_call>{"name":"function_name","args":{}}</tool_call> with a JSON object for args.';
 const ROBIN_TOOL_PROTOCOL = [
   TOOL_CALL_FORMAT,
-  'Native function calling is unavailable here; express every tool invocation as a <tool_call>{"name":"function_name","args":{}}</tool_call> tag where "args" is a JSON object matching the schema.',
+  'Native function calling is unavailable here; express every tool invocation as a <tool_call>{"name":"function_name","args":{}}</tool_call> tag with valid JSON (escape backslashes as \\\\ inside strings, e.g. LaTeX or hex escapes).',
   'Emit multiple tool calls for the same step back-to-back with no text between </tool_call> and the next <tool_call>.',
   'Never fabricate tool results, follow-up turns, or transcript role labels, and never repeat tool arguments as plain text.',
   'Finish your response right after the last </tool_call> of this single step so the caller can execute it and return the real output.',
@@ -310,14 +310,82 @@ export async function toRobinRequest(request: GeminiRequest, upload?: UploadAtta
   return { query: { text: sections.join('\n\n'), ...(attachments.length ? { attachments } : {}) } };
 }
 
+const HEX4 = /^[0-9a-fA-F]{4}$/;
+const VALID_JSON_ESCAPES = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't']);
+
+/**
+ * Repairs common LLM JSON-string escaping mistakes inside a closed `<tool_call>` payload
+ * when strict `JSON.parse` fails (e.g. single backslashes in LaTeX `\circ`/`\Leftrightarrow`
+ * or hex literals `\x02`/`\xff`, invalid `\u` sequences, or raw control characters in strings).
+ * Never fabricates missing quotes or braces, so genuinely truncated calls still fail safely.
+ */
+function repairToolCallJson(payload: string): string {
+  let out = '';
+  let inString = false;
+  for (let i = 0; i < payload.length; i++) {
+    const ch = payload[i];
+    if (!inString) {
+      if (ch === '"') inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '\\') {
+      const next = payload[i + 1];
+      if (next === undefined) {
+        out += '\\\\';
+        continue;
+      }
+      if (VALID_JSON_ESCAPES.has(next)) {
+        out += ch + next;
+        i += 1;
+        continue;
+      }
+      if (next === 'u') {
+        const hex = payload.slice(i + 2, i + 6);
+        if (HEX4.test(hex)) {
+          out += payload.slice(i, i + 6);
+          i += 5;
+          continue;
+        }
+      }
+      out += '\\\\' + next;
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      inString = false;
+      out += ch;
+      continue;
+    }
+    const code = ch.charCodeAt(0);
+    if (code < 0x20) {
+      if (ch === '\n') out += '\\n';
+      else if (ch === '\r') out += '\\r';
+      else if (ch === '\t') out += '\\t';
+      else out += `\\u${code.toString(16).padStart(4, '0')}`;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 function parseCall(payload: string): FunctionCall | undefined {
-  try {
-    const call = record(JSON.parse(payload));
+  const decode = (raw: string): FunctionCall | undefined => {
+    const call = record(JSON.parse(raw));
     const args = record(call?.args) ?? record(call?.arguments);
     if (typeof call?.name === 'string' && call.name.trim() && args) {
       return { name: call.name, args, ...(typeof call.id === 'string' && call.id ? { id: call.id } : {}) };
     }
-  } catch { /* Invalid tags are returned as text. */ }
+    return undefined;
+  };
+  try {
+    return decode(payload);
+  } catch {
+    try {
+      return decode(repairToolCallJson(payload));
+    } catch { /* Invalid tags are returned as text. */ }
+  }
   return undefined;
 }
 

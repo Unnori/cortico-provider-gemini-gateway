@@ -570,7 +570,12 @@ const authPanel: WebUiPanel = {
           variant: 'primary',
           onClick: () => void run(async () => {
             state = await invoke<AuthPanelStatus>('set-primary', { accountId: acct.id });
-            message.textContent = t(`已将 ${display} 设为主用账号。`, `Set ${display} as primary account.`);
+            message.textContent = state.saved
+              ? t(`已将 ${display} 设为主用账号。`, `Set ${display} as primary account.`)
+              : t(
+                `已将 ${display} 设为主用账号（如刚切换过调度策略，请记得点击页面底部「保存」生效）。`,
+                `Set ${display} as primary account (click Save below if you also changed the routing strategy).`,
+              );
             await ctx.refresh();
           }),
         });

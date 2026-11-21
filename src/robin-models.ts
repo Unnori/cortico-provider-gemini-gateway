@@ -18,6 +18,8 @@ export interface RobinRouteSummary {
   officialEntitled?: boolean;
   officialLabel?: string;
   lastAttribution?: string;
+  lastObservedAt?: string;
+  lastAccount?: string;
   lastResolvedModeCategory?: number;
   lastDowngradeReason?: number;
   lastFallback?: number;
@@ -219,9 +221,10 @@ export function buildRobinRouteSummary(opts: {
   plan?: string;
   userTier?: string;
   observed?: RobinRoutingObservation;
+  observedAccount?: string;
   overrideModeCategory?: number;
 }): RobinRouteSummary {
-  const { model, userStatus, plan, userTier, observed, overrideModeCategory } = opts;
+  const { model, userStatus, plan, userTier, observed, observedAccount, overrideModeCategory } = opts;
   const resolved = resolveRobinMode(model, true, undefined, overrideModeCategory);
   const official = userStatus?.modes.find(m => m.modelId === geminiModelId(model) || m.modeCategory === resolved.modeCategory);
   const downgraded = Boolean(
@@ -241,6 +244,8 @@ export function buildRobinRouteSummary(opts: {
     ...(userStatus ? { officialEntitled: Boolean(official) } : {}),
     ...(official ? { officialLabel: `${official.modelName} (mode ${official.modeCategory})` } : {}),
     ...(observed?.attribution ? { lastAttribution: observed.attribution } : {}),
+    ...(observed?.observedAt ? { lastObservedAt: observed.observedAt } : {}),
+    ...(observedAccount ? { lastAccount: observedAccount } : {}),
     ...(observed?.resolvedModeCategory !== undefined ? { lastResolvedModeCategory: observed.resolvedModeCategory } : {}),
     ...(observed?.downgradeReason !== undefined ? { lastDowngradeReason: observed.downgradeReason } : {}),
     ...(observed?.fallback !== undefined ? { lastFallback: observed.fallback } : {}),

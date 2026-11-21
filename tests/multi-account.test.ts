@@ -208,15 +208,22 @@ describe('multi-account OAuth pool, routing strategies, failover, and WebUI', ()
       ctrl.clearAccountCooldown('acct_a');
       expect(ctrl.pickAccountOrder('failover')).toEqual(['acct_a', 'acct_b', 'acct_c']);
 
-      // Robin quota downgrade puts that account into cooldown when backups exist.
+      // Robin quota downgrade puts that account into cooldown when backups exist and records accountId.
+      const obsAt = '2026-11-21T01:05:40.000Z';
       ctrl.recordRouting({
         requestedModel: 'gemini-robin-pro',
         requestedModeCategory: 3,
         requestedThinkingLevel: 2,
         resolvedModeCategory: 1,
         downgradeReason: 2,
-        observedAt: new Date().toISOString(),
+        observedAt: obsAt,
       }, 'acct_a');
+      expect(ctrl.getObservedRouting('gemini-robin-pro')?.accountId).toBe('acct_a');
+      expect(ctrl.getObservedRouting('gemini-robin-pro')?.observedAt).toBe(obsAt);
+      expect(ctrl.describeAccount('acct_a')).toBe('a***@example.com');
+      ctrl.setEmailsMasked(false);
+      expect(ctrl.describeAccount('acct_a')).toBe('a@example.com');
+      ctrl.setEmailsMasked(true);
       expect(ctrl.getAccountRuntime('acct_a').cooldownUntil).toBeGreaterThan(Date.now());
       expect(ctrl.pickAccountOrder('failover')[0]).toBe('acct_b');
     } finally {

@@ -522,10 +522,20 @@ function round1(value: number): number {
 
 function classifyWindowId(label: string, groupType: number | undefined, index: number): { id: string; poolType: string } {
   const lower = label.toLowerCase();
-  if (lower.includes('5-hour') || lower.includes('5 hour') || lower.includes('five hour') || lower.includes('5 小时') || lower.includes('5小时')) {
+  if (
+    lower.includes('5-hour') || lower.includes('5 hour') || lower.includes('five hour')
+    || lower.includes('5 小时') || lower.includes('5小时')
+    || lower.includes('current usage') || lower.includes('当前用量')
+  ) {
     return { id: 'fiveHour', poolType: 'GXU_FIVE_HOURLY' };
   }
   if (lower.includes('week') || lower.includes('每周') || lower.includes('7 day') || lower.includes('7-day')) {
+    return { id: 'weekly', poolType: 'GXU_WEEKLY' };
+  }
+  if (groupType === 1) {
+    return { id: 'fiveHour', poolType: 'GXU_FIVE_HOURLY' };
+  }
+  if (groupType === 2) {
     return { id: 'weekly', poolType: 'GXU_WEEKLY' };
   }
   return {

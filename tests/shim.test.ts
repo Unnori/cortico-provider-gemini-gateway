@@ -102,10 +102,48 @@ describe('streamed tool calls', () => {
   it('returns invalid or incomplete markup intact without executing it', () => {
     const parser = new ToolCallStream();
     expect(parser.feed('<tool_call>{"name":"x","args":[]}</tool_call>')).toEqual([{ text: '<tool_call>{"name":"x","args":[]}</tool_call>' }]);
+    expect(parser.feed('<tool_call>{"name":"x","args":{"a":1</tool_call>')).toEqual([{ text: '<tool_call>{"name":"x","args":{"a":1</tool_call>' }]);
     expect(parser.feed('keep <tool_')).toEqual([{ text: 'keep ' }]);
     expect(parser.finish()).toEqual([{ text: '<tool_' }]);
     expect(parser.feed('<tool_call>{"name":')).toEqual([]);
     expect(parser.finish()).toEqual([{ text: '<tool_call>{"name":' }]);
+  });
+
+  it('repairs unescaped LaTeX, hex, invalid \\u escapes, and raw newlines inside closed tool_call JSON strings', () => {
+    const parser = new ToolCallStream();
+
+    // Case 1: LaTeX commands with single backslashes (\circ, \Leftrightarrow, \Rightarrow, \sqrt, \usepackage) + valid \n and \u4f60
+    const latexRaw = String.raw`<tool_call>{"name":"wechat_send","args":{"text":"第一行\n1. 5^(\circ)C 和 \Leftrightarrow / \Rightarrow / \sqrt{LC} / \usepackage / \u4f60"}}</tool_call>`;
+    const latexParts = parser.feed(latexRaw);
+    expect(latexParts).toEqual([{
+      functionCall: {
+        name: 'wechat_send',
+        args: {
+          text: '第一行\n1. 5^(\\circ)C 和 \\Leftrightarrow / \\Rightarrow / \\sqrt{LC} / \\usepackage / 你',
+        },
+      },
+    }]);
+
+    // Case 2: Hex byte literals (\x02, \xff\xff) + already-escaped \\x03 preserved without double-escaping
+    const hexRaw = String.raw`<tool_call>{"name":"wechat_send","args":{"text":"缺 \x02 头或多了 \xff\xff 尾，已转义 \\x03 保持不变"}}</tool_call>`;
+    const hexParts = parser.feed(hexRaw);
+    expect(hexParts).toEqual([{
+      functionCall: {
+        name: 'wechat_send',
+        args: {
+          text: '缺 \\x02 头或多了 \\xff\\xff 尾，已转义 \\x03 保持不变',
+        },
+      },
+    }]);
+
+    // Case 3: Raw unescaped newline inside JSON string value
+    const rawNewline = '<tool_call>{"name":"pet_say","args":{"script":"第一行\n第二行"}}</tool_call>';
+    expect(parser.feed(rawNewline)).toEqual([{
+      functionCall: {
+        name: 'pet_say',
+        args: { script: '第一行\n第二行' },
+      },
+    }]);
   });
 
   it('accepts arguments alias in tool_call JSON and truncates Robin hallucinated follow-up turns & echoed stop cues', async () => {

@@ -138,6 +138,27 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
       { id: 'fiveHour', poolType: 'GXU_FIVE_HOURLY', title: '5-hour usage', usedPercent: 25, remainingPercent: 75, resetsAt: '2026-11-19T12:00:00.000Z' },
       { id: 'weekly', poolType: 'GXU_WEEKLY', title: 'Weekly usage', usedPercent: 60, remainingPercent: 40, resetsAt: '2026-11-26T00:00:00.000Z' },
     ]);
+
+    // Recognizes Google's renamed "Current usage" (groupType=1) as fiveHour and sorts it before Weekly limit (groupType=2).
+    const tsCurrent = Buffer.concat([varintField(1, Math.floor(Date.parse('2026-11-20T20:00:00Z') / 1000)), varintField(2, 0)]);
+    const tsWeekly = Buffer.concat([varintField(1, Math.floor(Date.parse('2026-11-25T08:00:00Z') / 1000)), varintField(2, 0)]);
+    const currentGroup = Buffer.concat([
+      varintField(1, 1),
+      lengthDelimited(2, Buffer.concat([lengthDelimited(1, tsCurrent), encodeFloat32Field(2, 0.01), stringField(3, 'Current usage')])),
+    ]);
+    const weeklyGroup = Buffer.concat([
+      varintField(1, 2),
+      lengthDelimited(2, Buffer.concat([lengthDelimited(1, tsWeekly), encodeFloat32Field(2, 0.022), stringField(3, 'Weekly limit')])),
+    ]);
+    const renamedQuota = decodeGrpcUsageInfo(Buffer.concat([
+      varintField(2, 2),
+      lengthDelimited(3, weeklyGroup),
+      lengthDelimited(3, currentGroup),
+    ]));
+    expect(renamedQuota.windows).toEqual([
+      { id: 'fiveHour', poolType: 'GXU_FIVE_HOURLY', title: 'Current usage', usedPercent: 1, remainingPercent: 99, resetsAt: '2026-11-20T20:00:00.000Z' },
+      { id: 'weekly', poolType: 'GXU_WEEKLY', title: 'Weekly limit', usedPercent: 2.2, remainingPercent: 97.8, resetsAt: '2026-11-25T08:00:00.000Z' },
+    ]);
   });
 
   it('streams ProcessQuery over HTTP/2 gRPC, computes monotonic deltas, refreshes 401 once, and maps 403', async () => {
@@ -605,6 +626,7 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
     expect(robinCatalogLookupIds('gemini-robin-pro', 'Free', 'TIER_BASIC', 'Used 3.1 Pro model')[0]).toBe('gemini-3.1-pro');
 
     // Route summary flags downgrade when resolvedModeCategory differs from requestedModeCategory.
+    const observedAt = '2026-11-21T01:05:40.000Z';
     const summary = buildRobinRouteSummary({
       model: 'gemini-robin-pro',
       userStatus: decoded,
@@ -617,12 +639,15 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
         resolvedModeCategory: 6,
         attribution: 'Used auto model selection',
         downgradeReason: 2,
-        observedAt: new Date().toISOString(),
+        observedAt,
       },
+      observedAccount: 'y***3@gmail.com',
     });
     expect(summary.officialEntitled).toBe(false);
     expect(summary.downgraded).toBe(true);
     expect(summary.lastAttribution).toBe('Used auto model selection');
+    expect(summary.lastObservedAt).toBe(observedAt);
+    expect(summary.lastAccount).toBe('y***3@gmail.com');
   });
 
   it('closes cleanly after completed grace period when HTTP/2 END_STREAM stalls, and cancels immediately on tool-call truncation', async () => {
