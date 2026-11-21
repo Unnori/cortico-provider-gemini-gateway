@@ -17,7 +17,7 @@
    ```text
    cortico-provider-gemini-gateway
    ```
-   > 小提示：刚发新版未满 24 小时想抢鲜体验，记得把版本号带上，比如 `cortico-provider-gemini-gateway@0.1.8`。
+   > 小提示：刚发新版未满 24 小时想抢鲜体验，记得把版本号带上，比如 `cortico-provider-gemini-gateway@0.1.9`。
 3. 点 **「安装」**，装完 **重启 Coopanion**，去 **模型供应商 → 新建** 选它就能开喂啦！
 
 **装不上？先看这两条避坑小纸条：**
