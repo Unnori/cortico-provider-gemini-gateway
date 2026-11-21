@@ -17,9 +17,9 @@ import {
   stringField,
   varintField,
 } from '../src/robin-grpc.ts';
-import type { AuthPanelStatus, CustomRoutesState, GatewayPanelState, GatewayTestResult } from '../src/webui/server.ts';
+import type { AuthPanelStatus, CustomRoutesState, GatewayPanelState, GatewayTestResult, QuotaAccountLabels } from '../src/webui/server.ts';
 import { resolveHeaders } from '../src/options.ts';
-import { resolveOAuthDir } from '../src/control.ts';
+import { GatewayControl, resolveOAuthDir } from '../src/control.ts';
 
 function encodeFloat32Field(fieldNumber: number, value: number): Buffer {
   const key = Buffer.from([(fieldNumber << 3) | 5]);
@@ -199,6 +199,7 @@ describe('gateway WebUI browser OAuth, persistence, direct call, and quota panel
         expect(authStatus.signedIn).toBe(true);
       });
       expect(authStatus.emailsMasked).toBe(true);
+      expect(authStatus.quotaBarMode).toBe('remaining');
       expect(authStatus.email).toBe('r***r@example.com');
 
       // 3. Query quota right in the panel via native HTTP/2 gRPC.
@@ -206,7 +207,19 @@ describe('gateway WebUI browser OAuth, persistence, direct call, and quota panel
       expect(quota.supported).toBe(true);
       expect(quota.authRequired).toBeUndefined();
       expect(quota.plan).toBe('Pro');
+      expect(quota.quotaBarMode).toBe('remaining');
       expect(quota.windows.map(w => w.usedPercent)).toEqual([25, 10]);
+
+      // 3a. Quota bar display mode defaults to remaining, toggles cleanly, and persists to disk.
+      const usedLabels = await ui.invoke!('quota', 'set-bar-mode', [{ name: 'draft', mode: 'used' }]) as QuotaAccountLabels;
+      expect(usedLabels.quotaBarMode).toBe('used');
+      const statusAfterToggle = await ui.invoke!('auth', 'status', [{ name: 'draft' }]) as AuthPanelStatus;
+      expect(statusAfterToggle.quotaBarMode).toBe('used');
+      const reloadedControl = new GatewayControl(resolveOAuthDir(join(root, 'draft'), currentEntry));
+      expect(reloadedControl.getQuotaBarMode()).toBe('used');
+      const remainingLabels = await ui.invoke!('quota', 'set-bar-mode', [{ name: 'draft', mode: 'remaining' }]) as QuotaAccountLabels;
+      expect(remainingLabels.quotaBarMode).toBe('remaining');
+      await expect(ui.invoke!('quota', 'set-bar-mode', [{ name: 'draft', mode: 'invalid' }])).rejects.toThrow();
 
       // 3b. Test connection in gateway panel succeeds via live gRPC quota check.
       const testRes = await ui.invoke!('gateway', 'test', [{ name: 'draft' }]) as GatewayTestResult;

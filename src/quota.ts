@@ -7,6 +7,8 @@ import { httpUrl, record } from './state.ts';
 export const DEFAULT_ROBIN_QUOTA_ENDPOINT = '/$rpc/assistant.mobile.robin.RobinService/GetUsageInfo?$alt=json';
 export const DEFAULT_ROBIN_GRPC_QUOTA_ENDPOINT = ROBIN_GRPC_GET_USAGE_INFO;
 
+export type QuotaBarMode = 'remaining' | 'used';
+
 export interface QuotaWindow {
   id: string;
   poolType: string;
@@ -51,6 +53,7 @@ export interface QuotaSnapshot {
   selectedAccountId?: string;
   totalAccounts?: number;
   emailsMasked?: boolean;
+  quotaBarMode?: QuotaBarMode;
   accountRouting?: AccountRoutingMode;
   accountOptions?: AccountQuotaOption[];
   accounts?: AccountQuotaSnapshot[];

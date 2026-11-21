@@ -15,7 +15,7 @@ import {
   type AuthMode,
   type GatewayPresetId,
 } from '../options.ts';
-import type { AccountQuotaOption, QuotaSnapshot } from '../quota.ts';
+import type { AccountQuotaOption, QuotaBarMode, QuotaSnapshot } from '../quota.ts';
 import type { GatewayProtocol } from '../shim.ts';
 import { httpUrl, record } from '../state.ts';
 import {
@@ -52,6 +52,7 @@ export interface AuthPanelStatus {
   authMode: AuthMode;
   accountRouting: AccountRoutingMode;
   emailsMasked: boolean;
+  quotaBarMode: QuotaBarMode;
   configured: boolean;
   customConfig: boolean;
   signedIn: boolean;
@@ -76,6 +77,7 @@ export interface AuthPanelStatus {
 
 export interface QuotaAccountLabels {
   emailsMasked: boolean;
+  quotaBarMode: QuotaBarMode;
   accountRouting: AccountRoutingMode;
   accountOptions: AccountQuotaOption[];
 }
@@ -186,6 +188,7 @@ function asAuthStatus(control: GatewayInstanceControl, entry: LLMProviderEntry, 
     authMode: cfg.authMode,
     accountRouting: cfg.accountRouting,
     emailsMasked: status.emailsMasked,
+    quotaBarMode: status.quotaBarMode,
     configured: status.configured,
     customConfig: status.customConfig,
     signedIn: status.signedIn,
@@ -542,6 +545,7 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
         if (method === 'account-labels') {
           return {
             emailsMasked: control.oauth.isEmailsMasked(),
+            quotaBarMode: control.oauth.getQuotaBarMode(),
             accountRouting: configuration(entry).accountRouting,
             accountOptions: control.oauth.listAccountOptions(),
           };
@@ -553,6 +557,19 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
           const emailsMasked = control.oauth.setEmailsMasked(raw.masked);
           return {
             emailsMasked,
+            quotaBarMode: control.oauth.getQuotaBarMode(),
+            accountRouting: configuration(entry).accountRouting,
+            accountOptions: control.oauth.listAccountOptions(),
+          };
+        }
+        if (method === 'set-bar-mode') {
+          if (raw.mode !== 'remaining' && raw.mode !== 'used') {
+            throw new Error(en ? 'Invalid quota bar display mode.' : '无效的额度显示模式参数。');
+          }
+          const quotaBarMode = control.oauth.setQuotaBarMode(raw.mode);
+          return {
+            emailsMasked: control.oauth.isEmailsMasked(),
+            quotaBarMode,
             accountRouting: configuration(entry).accountRouting,
             accountOptions: control.oauth.listAccountOptions(),
           };

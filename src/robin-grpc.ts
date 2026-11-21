@@ -15,6 +15,8 @@ export const ROBIN_UPLOAD_PATH = '/upload/';
 export const ROBIN_CLIENT_VERSION = '1.135.1.1291';
 export const ROBIN_MAX_IMAGES_PER_REQUEST = 4;
 export const ROBIN_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+export const ROBIN_MAX_ATTACHMENTS_PER_REQUEST = 4;
+export const ROBIN_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 export type RobinImageMime = 'image/png' | 'image/jpeg' | 'image/webp';
 export const ROBIN_NATIVE_IMAGE_MIMES: ReadonlySet<string> = new Set<RobinImageMime>([
   'image/png',
@@ -22,17 +24,71 @@ export const ROBIN_NATIVE_IMAGE_MIMES: ReadonlySet<string> = new Set<RobinImageM
   'image/webp',
 ]);
 
+export const ROBIN_ATTACHMENT_EXT: Readonly<Record<string, string>> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/heic': 'heic',
+  'image/heif': 'heif',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'audio/ogg': 'ogg',
+  'audio/mp4': 'm4a',
+  'audio/flac': 'flac',
+  'audio/aac': 'aac',
+  'audio/webm': 'weba',
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov',
+  'video/mpeg': 'mpeg',
+  'video/x-msvideo': 'avi',
+  'video/x-ms-wmv': 'wmv',
+  'video/x-flv': 'flv',
+  'video/3gpp': '3gp',
+  'application/pdf': 'pdf',
+  'text/plain': 'txt',
+  'text/markdown': 'md',
+  'text/csv': 'csv',
+  'application/json': 'json',
+};
+
+export const ROBIN_NATIVE_ATTACHMENT_MIMES: ReadonlySet<string> = new Set(Object.keys(ROBIN_ATTACHMENT_EXT));
+
+const ROBIN_MIME_ALIASES: Readonly<Record<string, string>> = {
+  'image/jpg': 'image/jpeg',
+  'audio/mp3': 'audio/mpeg',
+  'audio/x-wav': 'audio/wav',
+  'audio/wave': 'audio/wav',
+  'audio/m4a': 'audio/mp4',
+  'audio/x-m4a': 'audio/mp4',
+  'audio/opus': 'audio/ogg',
+  'video/mov': 'video/quicktime',
+  'video/avi': 'video/x-msvideo',
+};
+
+const STRICT_MAGIC_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf']);
+
 export interface RobinUploadedImage {
   blobId: string;
   mimeType: RobinImageMime;
 }
 
+export interface RobinUploadedAttachment {
+  blobId: string;
+  mimeType: string;
+  name?: string;
+}
+
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const ROBIN_IMAGE_EXT: Record<RobinImageMime, string> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpg',
-  'image/webp': 'webp',
-};
+const EBML_SIGNATURE = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]);
+
+function normalizeRobinMime(mime?: string): string | undefined {
+  if (!mime) return undefined;
+  const cleaned = mime.split(';', 1)[0].trim().toLowerCase();
+  if (!cleaned) return undefined;
+  return ROBIN_MIME_ALIASES[cleaned] ?? cleaned;
+}
 
 /** Inspects actual magic bytes so mislabeled/corrupted images cannot poison a Robin turn. */
 export function detectRobinImageMime(bytes: Buffer): RobinImageMime | null {
@@ -42,29 +98,104 @@ export function detectRobinImageMime(bytes: Buffer): RobinImageMime | null {
   return null;
 }
 
-export function encodeRobinImageAttachments(images: readonly RobinUploadedImage[] = []): Buffer[] {
-  if (images.length > ROBIN_MAX_IMAGES_PER_REQUEST) {
-    throw new RangeError(`Robin ProcessQuery supports at most ${ROBIN_MAX_IMAGES_PER_REQUEST} images per request`);
+/**
+ * Resolves a Robin-supported native attachment MIME type (images, audio, video, PDF, text)
+ * from magic bytes with safe fallback to declared MIME for container/text formats.
+ */
+export function resolveRobinAttachmentMime(bytes: Buffer, declaredMime?: string): string | null {
+  if (!Buffer.isBuffer(bytes) || bytes.length === 0) return null;
+  const declared = normalizeRobinMime(declaredMime);
+  const coreImage = detectRobinImageMime(bytes);
+  if (coreImage) return coreImage;
+
+  if (bytes.length >= 6) {
+    const head6 = bytes.toString('latin1', 0, 6);
+    if (head6 === 'GIF87a' || head6 === 'GIF89a') return 'image/gif';
   }
-  return images.map((image, index) => {
-    const ext = ROBIN_IMAGE_EXT[image.mimeType];
-    if (!ext) throw new TypeError(`Unsupported Robin image MIME type: ${String(image.mimeType)}`);
-    if (!image.blobId || Buffer.byteLength(image.blobId) > 4096 || /\s|[\x00-\x1f\x7f]/u.test(image.blobId)) {
-      throw new TypeError('Invalid Robin image blob ID');
+  if (bytes.length >= 5 && bytes.toString('latin1', 0, 5) === '%PDF-') return 'application/pdf';
+  if (bytes.length >= 12 && bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WAVE') {
+    return 'audio/wav';
+  }
+  if (bytes.length >= 4 && bytes.toString('latin1', 0, 4) === 'OggS') return 'audio/ogg';
+  if (bytes.length >= 4 && bytes.toString('latin1', 0, 4) === 'fLaC') return 'audio/flac';
+  if (bytes.length >= 4 && bytes.subarray(0, 4).equals(EBML_SIGNATURE)) {
+    return declared === 'audio/webm' ? 'audio/webm' : 'video/webm';
+  }
+  if (bytes.length >= 12 && bytes.toString('latin1', 4, 8) === 'ftyp') {
+    if (declared && ['audio/mp4', 'video/mp4', 'video/quicktime', 'video/3gpp', 'image/heic', 'image/heif'].includes(declared)) {
+      return declared;
+    }
+    const brand = bytes.toString('latin1', 8, 12);
+    if (brand === 'M4A ' || brand === 'M4B ') return 'audio/mp4';
+    if (brand === 'qt  ') return 'video/quicktime';
+    if (brand === 'heic' || brand === 'heix' || brand === 'mif1') return 'image/heic';
+    if (brand === 'heif') return 'image/heif';
+    if (brand.startsWith('3gp')) return 'video/3gpp';
+    return 'video/mp4';
+  }
+  if (bytes.length >= 3 && bytes.toString('latin1', 0, 3) === 'ID3') return 'audio/mpeg';
+  if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) {
+    return declared === 'audio/aac' ? 'audio/aac' : 'audio/mpeg';
+  }
+
+  if (declared && ROBIN_NATIVE_ATTACHMENT_MIMES.has(declared) && !STRICT_MAGIC_MIMES.has(declared)) {
+    return declared;
+  }
+  return null;
+}
+
+function defaultAttachmentName(mimeType: string, counters: Record<'image' | 'audio' | 'video' | 'file', number>): string {
+  const ext = ROBIN_ATTACHMENT_EXT[mimeType] ?? 'bin';
+  const kind: 'image' | 'audio' | 'video' | 'file' = mimeType.startsWith('image/')
+    ? 'image'
+    : mimeType.startsWith('audio/')
+      ? 'audio'
+      : mimeType.startsWith('video/')
+        ? 'video'
+        : 'file';
+  counters[kind] += 1;
+  return `${kind}-${counters[kind]}.${ext}`;
+}
+
+export function encodeRobinAttachments(attachments: readonly RobinUploadedAttachment[] = []): Buffer[] {
+  if (attachments.length > ROBIN_MAX_ATTACHMENTS_PER_REQUEST) {
+    throw new RangeError(`Robin ProcessQuery supports at most ${ROBIN_MAX_ATTACHMENTS_PER_REQUEST} attachments per request`);
+  }
+  const counters: Record<'image' | 'audio' | 'video' | 'file', number> = { image: 0, audio: 0, video: 0, file: 0 };
+  return attachments.map(attachment => {
+    const mimeType = normalizeRobinMime(attachment.mimeType);
+    if (!mimeType || !ROBIN_NATIVE_ATTACHMENT_MIMES.has(mimeType)) {
+      throw new TypeError(`Unsupported Robin attachment MIME type: ${String(attachment.mimeType)}`);
+    }
+    if (!attachment.blobId || Buffer.byteLength(attachment.blobId) > 4096 || /\s|[\x00-\x1f\x7f]/u.test(attachment.blobId)) {
+      throw new TypeError('Invalid Robin attachment blob ID');
     }
     // UserQuery.attachments (field 3) -> Attachment.blob (field 1), name (field 2).
     // Blob fields: blobId (1), type (2 = 1), mimeType (3), source (4 = 1).
     const blob = Buffer.concat([
-      stringField(1, image.blobId),
+      stringField(1, attachment.blobId),
       varintField(2, 1),
-      stringField(3, image.mimeType),
+      stringField(3, mimeType),
       varintField(4, 1),
     ]);
+    const fileName = attachment.name?.trim() || defaultAttachmentName(mimeType, counters);
     return lengthDelimited(3, Buffer.concat([
       lengthDelimited(1, blob),
-      stringField(2, `image-${index + 1}.${ext}`),
+      stringField(2, fileName),
     ]));
   });
+}
+
+export function encodeRobinImageAttachments(images: readonly RobinUploadedImage[] = []): Buffer[] {
+  if (images.length > ROBIN_MAX_IMAGES_PER_REQUEST) {
+    throw new RangeError(`Robin ProcessQuery supports at most ${ROBIN_MAX_IMAGES_PER_REQUEST} images per request`);
+  }
+  for (const image of images) {
+    if (!ROBIN_NATIVE_IMAGE_MIMES.has(image.mimeType)) {
+      throw new TypeError(`Unsupported Robin image MIME type: ${String(image.mimeType)}`);
+    }
+  }
+  return encodeRobinAttachments(images);
 }
 
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
@@ -388,6 +519,7 @@ function buildRequestMetadata(instanceId: string): Buffer {
 export interface BuildProcessQueryOptions {
   userText: string;
   images?: readonly RobinUploadedImage[];
+  attachments?: readonly RobinUploadedAttachment[];
   model: string;
   thinking?: boolean;
   reasoningEffort?: string;
@@ -401,6 +533,7 @@ export function buildProcessQueryWire(options: BuildProcessQueryOptions): Buffer
   const {
     userText,
     images = [],
+    attachments,
     model,
     thinking,
     reasoningEffort,
@@ -410,9 +543,10 @@ export function buildProcessQueryWire(options: BuildProcessQueryOptions): Buffer
   } = options;
   const mode = resolveRobinMode(model, thinking, reasoningEffort, overrideModeCategory);
   const metadata = buildRequestMetadata(clientInstanceId);
+  const encodedAttachments = attachments ? encodeRobinAttachments(attachments) : encodeRobinImageAttachments(images);
   const userQuery = Buffer.concat([
     stringField(1, userText),
-    ...encodeRobinImageAttachments(images),
+    ...encodedAttachments,
   ]);
 
   const clientGenerateFields: Buffer[] = [
@@ -675,6 +809,7 @@ export interface StreamRobinGrpcOptions {
   headers: Headers;
   userText: string;
   images?: readonly RobinUploadedImage[];
+  attachments?: readonly RobinUploadedAttachment[];
   model: string;
   thinking?: boolean;
   reasoningEffort?: string;
@@ -726,6 +861,7 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
   const wire = buildProcessQueryWire({
     userText: options.userText,
     images: options.images,
+    attachments: options.attachments,
     model: options.model,
     thinking: options.thinking,
     reasoningEffort: options.reasoningEffort,
@@ -1425,14 +1561,14 @@ function sendHttp2UploadRequest(
     const onAbort = () => finish(signal?.reason ?? new Error('Aborted'));
     const remaining = Math.max(1, deadlineMs - Date.now());
     const timer = setTimeout(() => {
-      finish(new GatewayError(504, 'attachment upload', { detail: 'Robin image upload timed out' }));
+      finish(new GatewayError(504, 'attachment upload', { detail: 'Robin attachment upload timed out' }));
     }, remaining);
     timer.unref();
     signal?.addEventListener('abort', onAbort, { once: true });
 
     if (signal?.aborted) { onAbort(); return; }
     if (session.destroyed || session.closed) {
-      finish(new GatewayError(502, 'attachment upload', { detail: 'Robin image upload HTTP/2 session closed' }));
+      finish(new GatewayError(502, 'attachment upload', { detail: 'Robin attachment upload HTTP/2 session closed' }));
       return;
     }
 
@@ -1440,7 +1576,7 @@ function sendHttp2UploadRequest(
       req = session.request(headers);
     } catch (err) {
       finish(new GatewayError(502, 'attachment upload', {
-        detail: `Robin image upload request failed: ${sanitizeUpstreamText(err instanceof Error ? err.message : String(err), 160)}`,
+        detail: `Robin attachment upload request failed: ${sanitizeUpstreamText(err instanceof Error ? err.message : String(err), 160)}`,
         cause: err,
       }));
       return;
@@ -1452,7 +1588,7 @@ function sendHttp2UploadRequest(
       for (const [k, v] of Object.entries(hdrs)) {
         headerBytes += Buffer.byteLength(k) + Buffer.byteLength(Array.isArray(v) ? v.join('') : String(v ?? ''));
         if (headerBytes > 8192) {
-          finish(new GatewayError(502, 'attachment upload', { detail: 'Robin image upload response headers exceeded limit' }));
+          finish(new GatewayError(502, 'attachment upload', { detail: 'Robin attachment upload response headers exceeded limit' }));
           return;
         }
       }
@@ -1461,25 +1597,25 @@ function sendHttp2UploadRequest(
       if (settled) return;
       received += chunk.length;
       if (received > maxBody) {
-        finish(new GatewayError(502, 'attachment upload', { detail: 'Robin image upload response body exceeded limit' }));
+        finish(new GatewayError(502, 'attachment upload', { detail: 'Robin attachment upload response body exceeded limit' }));
         return;
       }
       chunks.push(Buffer.from(chunk));
     });
     req.on('error', err => {
       finish(new GatewayError(502, 'attachment upload', {
-        detail: `Robin image upload stream error: ${sanitizeUpstreamText(err.message, 160)}`,
+        detail: `Robin attachment upload stream error: ${sanitizeUpstreamText(err.message, 160)}`,
         cause: err,
       }));
     });
     req.on('aborted', () => {
-      finish(new GatewayError(502, 'attachment upload', { detail: 'Robin image upload stream aborted' }));
+      finish(new GatewayError(502, 'attachment upload', { detail: 'Robin attachment upload stream aborted' }));
     });
     req.on('end', () => { ended = true; });
     req.on('close', () => {
       if (settled) return;
       if (!ended || req?.rstCode || !responseHeaders) {
-        finish(new GatewayError(502, 'attachment upload', { detail: 'Robin image upload stream ended unexpectedly' }));
+        finish(new GatewayError(502, 'attachment upload', { detail: 'Robin attachment upload stream ended unexpectedly' }));
         return;
       }
       const status = Number(responseHeaders[':status']);
@@ -1487,7 +1623,7 @@ function sendHttp2UploadRequest(
         const mapped = status === 401 ? 401 : status === 403 ? 403 : status === 429 ? 429 : 502;
         const bodyText = sanitizeUpstreamText(Buffer.concat(chunks).toString('utf8'), 200);
         finish(new GatewayError(mapped, 'attachment upload', {
-          detail: bodyText || `Robin image upload returned HTTP ${status}`,
+          detail: bodyText || `Robin attachment upload returned HTTP ${status}`,
           body: bodyText,
         }));
         return;
@@ -1500,42 +1636,52 @@ function sendHttp2UploadRequest(
   });
 }
 
+export interface UploadRobinAttachmentsOptions {
+  attachments: readonly { data: Buffer; mimeType?: string; name?: string }[];
+  headers: Headers;
+  origin?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  connectHttp2?: Http2Connector;
+}
+
 /**
- * Uploads static images (PNG / JPEG / WebP) to Google's default Robin Scotty resumable upload
- * endpoint (`https://push.clients6.google.com/upload/`) using the account's existing OAuth token.
+ * Uploads multimodal attachments (images, audio, video, PDF/text) to Google's default Robin
+ * Scotty resumable upload endpoint (`https://push.clients6.google.com/upload/`) using the
+ * account's existing OAuth token.
  */
-export async function uploadRobinImages(options: UploadRobinImagesOptions): Promise<RobinUploadedImage[]> {
-  if (!options.images.length) return [];
-  if (options.images.length > ROBIN_MAX_IMAGES_PER_REQUEST) {
+export async function uploadRobinAttachments(options: UploadRobinAttachmentsOptions): Promise<RobinUploadedAttachment[]> {
+  if (!options.attachments.length) return [];
+  if (options.attachments.length > ROBIN_MAX_ATTACHMENTS_PER_REQUEST) {
     throw new GatewayError(400, 'attachment upload', {
-      detail: `Robin supports at most ${ROBIN_MAX_IMAGES_PER_REQUEST} images per request`,
+      detail: `Robin supports at most ${ROBIN_MAX_ATTACHMENTS_PER_REQUEST} attachments per request`,
     });
   }
 
-  const normalized: { data: Buffer; mimeType: RobinImageMime }[] = [];
+  const normalized: { data: Buffer; mimeType: string; name?: string }[] = [];
   let totalBytes = 0;
-  for (const item of options.images) {
+  for (const item of options.attachments) {
     if (!Buffer.isBuffer(item.data) || !item.data.length) {
-      throw new GatewayError(400, 'attachment upload', { detail: 'Robin image upload requires non-empty image bytes' });
+      throw new GatewayError(400, 'attachment upload', { detail: 'Robin attachment upload requires non-empty bytes' });
     }
-    const detected = detectRobinImageMime(item.data);
+    const detected = resolveRobinAttachmentMime(item.data, item.mimeType);
     if (!detected) {
       throw new GatewayError(400, 'attachment upload', {
-        detail: `Robin native upload only supports PNG, JPEG, and WebP images (got ${item.mimeType ?? 'unknown'})`,
+        detail: `Robin native upload does not support attachment type ${item.mimeType ?? 'unknown'}`,
       });
     }
     totalBytes += item.data.length;
-    if (totalBytes > ROBIN_MAX_IMAGE_BYTES) {
+    if (totalBytes > ROBIN_MAX_ATTACHMENT_BYTES) {
       throw new GatewayError(400, 'attachment upload', {
-        detail: `Robin image attachments exceed the ${Math.round(ROBIN_MAX_IMAGE_BYTES / (1024 * 1024))} MiB request limit`,
+        detail: `Robin attachments exceed the ${Math.round(ROBIN_MAX_ATTACHMENT_BYTES / (1024 * 1024))} MiB request limit`,
       });
     }
-    normalized.push({ data: item.data, mimeType: detected });
+    normalized.push({ data: item.data, mimeType: detected, ...(item.name ? { name: item.name } : {}) });
   }
 
   const authorization = options.headers.get('authorization')?.trim();
   if (!authorization || /[\r\n\x00-\x1f\x7f]/.test(authorization)) {
-    throw new GatewayError(401, 'attachment upload', { detail: 'Robin image upload requires an OAuth Authorization header' });
+    throw new GatewayError(401, 'attachment upload', { detail: 'Robin attachment upload requires an OAuth Authorization header' });
   }
 
   const expectedOrigin = new URL(options.origin ?? ROBIN_UPLOAD_ORIGIN);
@@ -1550,8 +1696,8 @@ export async function uploadRobinImages(options: UploadRobinImagesOptions): Prom
   session.on('error', err => { sessionError = err; });
 
   try {
-    const results: RobinUploadedImage[] = [];
-    for (const image of normalized) {
+    const results: RobinUploadedAttachment[] = [];
+    for (const attachment of normalized) {
       options.signal?.throwIfAborted();
       if (sessionError) {
         throw new GatewayError(502, 'attachment upload', {
@@ -1571,8 +1717,8 @@ export async function uploadRobinImages(options: UploadRobinImagesOptions): Prom
           'x-tenant-id': 'bard-storage',
           'x-goog-upload-protocol': 'resumable',
           'x-goog-upload-command': 'start',
-          'x-goog-upload-content-type': image.mimeType,
-          'x-goog-upload-content-length': String(image.data.length),
+          'x-goog-upload-content-type': attachment.mimeType,
+          'x-goog-upload-content-length': String(attachment.data.length),
           'user-agent': userAgent,
         },
         null,
@@ -1590,13 +1736,13 @@ export async function uploadRobinImages(options: UploadRobinImagesOptions): Prom
         {
           ':method': 'PUT',
           ':path': `${location.pathname}${location.search}`,
-          'content-length': String(image.data.length),
+          'content-length': String(attachment.data.length),
           'x-goog-upload-protocol': 'resumable',
           'x-goog-upload-command': 'upload, finalize',
           'x-goog-upload-offset': '0',
           'user-agent': userAgent,
         },
-        image.data,
+        attachment.data,
         4096,
         deadlineMs,
         options.signal,
@@ -1613,10 +1759,52 @@ export async function uploadRobinImages(options: UploadRobinImagesOptions): Prom
       if (!blobId || Buffer.byteLength(blobId) > 4096 || /\s|[\x00-\x1f\x7f]/u.test(blobId)) {
         throw new GatewayError(502, 'attachment upload', { detail: 'Robin upload returned an invalid blob ID' });
       }
-      results.push({ blobId, mimeType: image.mimeType });
+      results.push({ blobId, mimeType: attachment.mimeType, ...(attachment.name ? { name: attachment.name } : {}) });
     }
     return results;
   } finally {
     closeSessionGracefully(session);
   }
+}
+
+/**
+ * Uploads static images (PNG / JPEG / WebP) to Google's default Robin Scotty resumable upload
+ * endpoint (`https://push.clients6.google.com/upload/`) using the account's existing OAuth token.
+ */
+export async function uploadRobinImages(options: UploadRobinImagesOptions): Promise<RobinUploadedImage[]> {
+  if (!options.images.length) return [];
+  if (options.images.length > ROBIN_MAX_IMAGES_PER_REQUEST) {
+    throw new GatewayError(400, 'attachment upload', {
+      detail: `Robin supports at most ${ROBIN_MAX_IMAGES_PER_REQUEST} images per request`,
+    });
+  }
+  let totalBytes = 0;
+  const validated: { data: Buffer; mimeType: RobinImageMime }[] = [];
+  for (const item of options.images) {
+    if (!Buffer.isBuffer(item.data) || !item.data.length) {
+      throw new GatewayError(400, 'attachment upload', { detail: 'Robin image upload requires non-empty image bytes' });
+    }
+    const detected = detectRobinImageMime(item.data);
+    if (!detected) {
+      throw new GatewayError(400, 'attachment upload', {
+        detail: `Robin native upload only supports PNG, JPEG, and WebP images (got ${item.mimeType ?? 'unknown'})`,
+      });
+    }
+    totalBytes += item.data.length;
+    if (totalBytes > ROBIN_MAX_IMAGE_BYTES) {
+      throw new GatewayError(400, 'attachment upload', {
+        detail: `Robin image attachments exceed the ${Math.round(ROBIN_MAX_IMAGE_BYTES / (1024 * 1024))} MiB request limit`,
+      });
+    }
+    validated.push({ data: item.data, mimeType: detected });
+  }
+  const uploaded = await uploadRobinAttachments({
+    attachments: validated,
+    headers: options.headers,
+    origin: options.origin,
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    connectHttp2: options.connectHttp2,
+  });
+  return uploaded.map(item => ({ blobId: item.blobId, mimeType: item.mimeType as RobinImageMime }));
 }

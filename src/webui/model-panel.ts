@@ -194,16 +194,16 @@ export const modelSettingsPanel: WebUiPanel = {
           : !setting.available
             ? (next.protocol === 'robin' && !next.hasUploadEndpoint
               ? (en
-                ? 'Robin native upload supports PNG/JPEG/WebP images; audio/video/PDF require native Gemini REST or a custom uploadEndpoint'
-                : 'Robin 原生上传通道目前支持图片（PNG/JPEG/WebP）；音频/视频/PDF 请切换至原生 Gemini REST 协议或配置自定义 uploadEndpoint')
+                ? 'This format is outside Robin native upload MIME support; use native Gemini REST or a custom uploadEndpoint'
+                : '该格式暂不在 Robin 原生上传支持列表中，可切换至原生 Gemini REST 协议或配置自定义 uploadEndpoint')
               : (en
                 ? `Requires native Gemini REST protocol or uploadEndpoint (current: ${next.protocol})`
                 : `当前 ${next.protocol} 协议需配置 uploadEndpoint 或切换至原生 Gemini REST 协议才可发送此类附件`))
             : next.attachmentsEnabled
-              ? (next.protocol === 'robin' && setting.kind === 'image' && !next.hasUploadEndpoint
+              ? (next.protocol === 'robin' && !next.hasUploadEndpoint
                 ? (en
-                  ? 'Uploaded automatically via Robin native Scotty upload using your signed-in OAuth account; can be disabled manually'
-                  : '已通过 Robin 默认上传通道自动启用（复用当前登录账号 OAuth 鉴权），可手动关闭')
+                  ? 'Uploaded automatically via Robin native Scotty upload (images, audio, video, PDF/files) using your signed-in OAuth account; can be disabled manually'
+                  : '已通过 Robin 默认上传通道自动启用（支持图片/音频/视频/PDF 等，复用当前登录账号 OAuth 鉴权），可按类别手动关闭')
                 : (en ? 'Follows the model declaration; can be disabled manually' : '按模型声明自动启用，可手动关闭'))
               : (en ? 'All attachments are disabled; enabling this restores automatic attachments' : '全部附件已关闭；开启此项将恢复自动附件');
 

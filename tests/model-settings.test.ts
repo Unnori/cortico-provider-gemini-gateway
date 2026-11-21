@@ -153,7 +153,7 @@ describe('model declared formats and automatic pricing (opencode style)', () => 
     }
   });
 
-  it('automatically declares PNG/JPEG/WebP image support for Robin mode without a manual uploadEndpoint', () => {
+  it('automatically declares full multimodal support (image/audio/video/PDF) for Robin mode without a manual uploadEndpoint', () => {
     const robinEntry: LLMProviderEntry = {
       kind: provider.id,
       baseUrl: 'https://robinfrontend-pa.googleapis.com',
@@ -165,31 +165,51 @@ describe('model declared formats and automatic pricing (opencode style)', () => 
     expect(provider.accepts(robinEntry, robinEntry.spec!, 'image/jpeg')).toBe(true);
     expect(provider.accepts(robinEntry, robinEntry.spec!, 'image/png')).toBe(true);
     expect(provider.accepts(robinEntry, robinEntry.spec!, 'image/webp')).toBe(true);
-    expect(provider.accepts(robinEntry, robinEntry.spec!, 'image/gif')).toBe(false);
-    expect(provider.accepts(robinEntry, robinEntry.spec!, 'audio/wav')).toBe(false);
-    expect(provider.accepts(robinEntry, robinEntry.spec!, 'video/mp4')).toBe(false);
-    expect(provider.accepts(robinEntry, robinEntry.spec!, 'application/pdf')).toBe(false);
+    expect(provider.accepts(robinEntry, robinEntry.spec!, 'image/gif')).toBe(true);
+    expect(provider.accepts(robinEntry, robinEntry.spec!, 'audio/wav')).toBe(true);
+    expect(provider.accepts(robinEntry, robinEntry.spec!, 'audio/mp3')).toBe(true);
+    expect(provider.accepts(robinEntry, robinEntry.spec!, 'audio/ogg')).toBe(true);
+    expect(provider.accepts(robinEntry, robinEntry.spec!, 'audio/x-m4a')).toBe(true);
+    expect(provider.accepts(robinEntry, robinEntry.spec!, 'video/mp4')).toBe(true);
+    expect(provider.accepts(robinEntry, robinEntry.spec!, 'video/webm')).toBe(true);
+    expect(provider.accepts(robinEntry, robinEntry.spec!, 'application/pdf')).toBe(true);
+    expect(provider.accepts(robinEntry, robinEntry.spec!, 'application/octet-stream')).toBe(false);
 
     const baseline = geminiBaseline('gemini-4-neon');
-    const caps = inputCapabilities(robinEntry, baseline, ['image/jpeg', 'image/png', 'image/webp', 'video/mp4']);
+    const caps = inputCapabilities(robinEntry, baseline, [
+      'image/jpeg',
+      'image/gif',
+      'audio/wav',
+      'video/mp4',
+      'application/pdf',
+      'application/octet-stream',
+    ]);
     expect(caps.accepts).toEqual({
       'image/jpeg': true,
-      'image/png': true,
-      'image/webp': true,
-      'video/mp4': false,
+      'image/gif': true,
+      'audio/wav': true,
+      'video/mp4': true,
+      'application/pdf': true,
+      'application/octet-stream': false,
     });
     const settings = modelSettings(robinEntry, baseline);
-    expect(settings.inputs.find(i => i.kind === 'image')).toEqual({
-      kind: 'image',
-      declared: true,
-      available: true,
-      enabled: true,
-    });
-    expect(settings.inputs.find(i => i.kind === 'video')).toEqual({
-      kind: 'video',
-      declared: true,
-      available: false,
-      enabled: false,
-    });
+    for (const kind of ['image', 'audio', 'video', 'file'] as const) {
+      expect(settings.inputs.find(i => i.kind === kind)).toEqual({
+        kind,
+        declared: true,
+        available: true,
+        enabled: true,
+      });
+    }
+
+    // Individual input switches still disable each modality independently in Robin mode.
+    const restricted: LLMProviderEntry = {
+      ...robinEntry,
+      options: { ...robinEntry.options, inputAudio: false, inputVideo: false, inputFiles: false },
+    };
+    expect(provider.accepts(restricted, restricted.spec!, 'image/png')).toBe(true);
+    expect(provider.accepts(restricted, restricted.spec!, 'audio/wav')).toBe(false);
+    expect(provider.accepts(restricted, restricted.spec!, 'video/mp4')).toBe(false);
+    expect(provider.accepts(restricted, restricted.spec!, 'application/pdf')).toBe(false);
   });
 });

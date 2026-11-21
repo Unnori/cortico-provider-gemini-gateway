@@ -9,12 +9,14 @@ import {
   decodeProcessQueryFrame,
   decodeRobinUserStatus,
   detectRobinImageMime,
+  encodeRobinAttachments,
   encodeRobinImageAttachments,
   frameGrpcMessage,
   GrpcMessageReader,
   isRobinGrpcRoute,
   lengthDelimited,
   parseProtobuf,
+  resolveRobinAttachmentMime,
   resolveRobinMode,
   ROBIN_GRPC_ACCEPT_TERMS,
   ROBIN_GRPC_GET_TERMS_VERSION,
@@ -23,6 +25,7 @@ import {
   ROBIN_GRPC_PROCESS_QUERY,
   slugifyRobinModelId,
   stringField,
+  uploadRobinAttachments,
   uploadRobinImages,
   varintField,
 } from '../src/robin-grpc.ts';
@@ -981,6 +984,175 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
       for (const s of openStreams) {
         try { s.destroy(); } catch { /* ignore */ }
       }
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it('supports multimodal attachments (audio, video, PDF, GIF, text) via Robin Scotty upload with per-account caching and earlier-turn pruning', async () => {
+    const pdfBytes = Buffer.from('%PDF-1.4\n1 0 obj <<>> endobj\n%%EOF\n', 'latin1');
+    const mp3Bytes = Buffer.concat([Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1'), Buffer.from([0xff, 0xfb, 0x90, 0x00])]);
+    const wavBytes = Buffer.from('RIFF\x24\x00\x00\x00WAVEfmt ', 'latin1');
+    const oggBytes = Buffer.from('OggS\x00\x02\x00\x00', 'latin1');
+    const flacBytes = Buffer.from('fLaC\x00\x00\x00\x22', 'latin1');
+    const mp4Bytes = Buffer.from('\x00\x00\x00\x18ftypisom\x00\x00\x02\x00', 'latin1');
+    const m4aBytes = Buffer.from('\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00', 'latin1');
+    const webmBytes = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x86, 0x81]);
+    const gifBytes = Buffer.from('GIF89a\x01\x00\x01\x00', 'latin1');
+    const txtBytes = Buffer.from('Hello Robin text attachment', 'utf8');
+
+    expect(resolveRobinAttachmentMime(pdfBytes, 'application/pdf')).toBe('application/pdf');
+    expect(resolveRobinAttachmentMime(Buffer.from('not-a-pdf'), 'application/pdf')).toBeNull();
+    expect(resolveRobinAttachmentMime(Buffer.from('not-a-png'), 'image/png')).toBeNull();
+    expect(resolveRobinAttachmentMime(gifBytes)).toBe('image/gif');
+    expect(resolveRobinAttachmentMime(wavBytes)).toBe('audio/wav');
+    expect(resolveRobinAttachmentMime(oggBytes)).toBe('audio/ogg');
+    expect(resolveRobinAttachmentMime(flacBytes)).toBe('audio/flac');
+    expect(resolveRobinAttachmentMime(mp3Bytes, 'audio/mp3')).toBe('audio/mpeg');
+    expect(resolveRobinAttachmentMime(mp4Bytes)).toBe('video/mp4');
+    expect(resolveRobinAttachmentMime(m4aBytes)).toBe('audio/mp4');
+    expect(resolveRobinAttachmentMime(mp4Bytes, 'audio/x-m4a')).toBe('audio/mp4');
+    expect(resolveRobinAttachmentMime(webmBytes)).toBe('video/webm');
+    expect(resolveRobinAttachmentMime(webmBytes, 'audio/webm')).toBe('audio/webm');
+    expect(resolveRobinAttachmentMime(txtBytes, 'text/plain; charset=utf-8')).toBe('text/plain');
+    expect(resolveRobinAttachmentMime(Buffer.from([0x01, 0x02]), 'application/octet-stream')).toBeNull();
+
+    const encodedMixed = encodeRobinAttachments([
+      { blobId: '/contrib_service/ttl_1d/a1', mimeType: 'audio/mpeg' },
+      { blobId: '/contrib_service/ttl_1d/v1', mimeType: 'video/mp4' },
+      { blobId: '/contrib_service/ttl_1d/f1', mimeType: 'application/pdf' },
+    ]);
+    expect(encodedMixed.map(buf => parseProtobuf(parseProtobuf(buf)[0].payload).find(f => f.number === 2)?.payload.toString('utf8'))).toEqual([
+      'audio-1.mp3',
+      'video-1.mp4',
+      'file-1.pdf',
+    ]);
+
+    const uploadedContentTypes: string[] = [];
+    const receivedAttachmentsPerTurn: Array<Array<{ blobId: string; mimeType: string; name: string }>> = [];
+    const receivedTextsPerTurn: string[] = [];
+    let uploadCounter = 0;
+
+    const server = http2.createServer();
+    let baseUrl = '';
+    server.on('stream', (stream, headers) => {
+      const path = String(headers[':path'] ?? '');
+      const method = String(headers[':method'] ?? '');
+      const chunks: Buffer[] = [];
+      stream.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      stream.on('end', () => {
+        if (method === 'POST' && path === '/upload/') {
+          uploadCounter += 1;
+          uploadedContentTypes.push(String(headers['x-goog-upload-content-type'] ?? ''));
+          stream.respond({
+            ':status': 200,
+            'x-goog-upload-status': 'active',
+            'x-goog-upload-url': `${baseUrl}/upload/media-${uploadCounter}`,
+          });
+          stream.end();
+          return;
+        }
+        if (method === 'PUT' && path.startsWith('/upload/media-')) {
+          const idx = path.slice('/upload/media-'.length);
+          stream.respond({ ':status': 200, 'x-goog-upload-status': 'final' });
+          stream.end(`/contrib_service/ttl_1d/media-${idx}`);
+          return;
+        }
+        if (path === ROBIN_GRPC_PROCESS_QUERY) {
+          const reqFrames = new GrpcMessageReader().push(Buffer.concat(chunks));
+          const reqF1 = parseProtobuf(reqFrames[0]);
+          const reqInit = parseProtobuf(reqF1.find(f => f.number === 1000)!.payload);
+          const req1001 = parseProtobuf(reqInit.find(f => f.number === 1001)!.payload);
+          const reqTpl = parseProtobuf(req1001.find(f => f.number === 1)!.payload);
+          const reqQuery = parseProtobuf(reqTpl.find(f => f.number === 1)!.payload);
+          receivedTextsPerTurn.push(reqQuery.find(f => f.number === 1)?.payload.toString('utf8') ?? '');
+          const atts = reqQuery.filter(f => f.number === 3).map(f => {
+            const attFields = parseProtobuf(f.payload);
+            const blobFields = parseProtobuf(attFields.find(a => a.number === 1)!.payload);
+            return {
+              blobId: blobFields.find(b => b.number === 1)!.payload.toString('utf8'),
+              mimeType: blobFields.find(b => b.number === 3)!.payload.toString('utf8'),
+              name: attFields.find(a => a.number === 2)!.payload.toString('utf8'),
+            };
+          });
+          receivedAttachmentsPerTurn.push(atts);
+
+          stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({ text: `Saw ${atts.length} attachment(s)`, completed: true })));
+          stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+          stream.end();
+          return;
+        }
+        stream.respond({ ':status': 404 });
+        stream.end();
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const direct = await uploadRobinAttachments({
+        attachments: [{ data: pdfBytes, mimeType: 'application/pdf' }],
+        headers: new Headers({ Authorization: 'Bearer fresh-token' }),
+        origin: baseUrl,
+      });
+      expect(direct).toEqual([{ blobId: '/contrib_service/ttl_1d/media-1', mimeType: 'application/pdf' }]);
+
+      const client = new GatewayClient({
+        baseUrl,
+        robinUploadOrigin: baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        auth: { accessToken: async () => 'fresh-token' },
+      });
+
+      const multimodalReq: GeminiRequest = {
+        model: 'gemini-4-neon',
+        contents: [{
+          role: 'user',
+          parts: [
+            { text: 'Analyze audio, video, and PDF' },
+            { inlineData: { mimeType: 'audio/mp3', data: mp3Bytes.toString('base64') } },
+            { inlineData: { mimeType: 'video/mp4', data: mp4Bytes.toString('base64') } },
+            { inlineData: { mimeType: 'application/pdf', data: pdfBytes.toString('base64') } },
+          ],
+        }],
+      };
+
+      const turn1 = await consume(client.stream(multimodalReq));
+      const turn2 = await consume(client.stream(multimodalReq));
+      expect(turn1.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'Saw 3 attachment(s)' }]);
+      expect(turn2.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'Saw 3 attachment(s)' }]);
+      // Direct helper (1) + Turn 1 (3) = 4 total; Turn 2 hits SHA-256 cache cleanly.
+      expect(uploadedContentTypes).toEqual(['application/pdf', 'audio/mpeg', 'video/mp4', 'application/pdf']);
+      expect(receivedAttachmentsPerTurn[0]).toEqual([
+        { blobId: '/contrib_service/ttl_1d/media-2', mimeType: 'audio/mpeg', name: 'audio-1.mp3' },
+        { blobId: '/contrib_service/ttl_1d/media-3', mimeType: 'video/mp4', name: 'video-1.mp4' },
+        { blobId: '/contrib_service/ttl_1d/media-4', mimeType: 'application/pdf', name: 'file-1.pdf' },
+      ]);
+      expect(receivedTextsPerTurn[0]).toContain('[Attached audio: audio-1.mp3 (audio/mpeg)]');
+      expect(receivedTextsPerTurn[0]).toContain('[Attached video: video-1.mp4 (video/mp4)]');
+      expect(receivedTextsPerTurn[0]).toContain('[Attached file: file-1.pdf (application/pdf)]');
+
+      // Follow-up text-only turn prunes earlier audio/PDF into compact placeholders without re-uploading.
+      const followUp: GeminiRequest = {
+        model: 'gemini-4-neon',
+        contents: [
+          multimodalReq.contents[0],
+          { role: 'model', parts: [{ text: 'Done analyzing.' }] },
+          { role: 'user', parts: [{ text: 'Summarize briefly.' }] },
+        ],
+      };
+      const turn3 = await consume(client.stream(followUp));
+      expect(turn3.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'Saw 0 attachment(s)' }]);
+      expect(uploadedContentTypes).toHaveLength(4);
+      expect(receivedAttachmentsPerTurn[2]).toEqual([]);
+      expect(receivedTextsPerTurn[2]).toContain('[Earlier attachment omitted]');
+      expect(receivedTextsPerTurn[2]).not.toContain('[Attached audio:');
+      expect(receivedTextsPerTurn[2]).not.toContain('[Attached file:');
+    } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });

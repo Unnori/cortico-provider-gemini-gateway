@@ -1,6 +1,6 @@
 import type { WebUiClientBundle, WebUiPanel, WebUiPanelContext } from 'cortico/web/shared/client-panel.ts';
 import type { AccountRoutingMode, AuthMode } from '../options.ts';
-import type { AccountQuotaSnapshot, QuotaSnapshot, QuotaWindow } from '../quota.ts';
+import type { AccountQuotaSnapshot, QuotaBarMode, QuotaSnapshot, QuotaWindow } from '../quota.ts';
 import { maskEmail } from '../redact.ts';
 import type { GatewayProtocol } from '../shim.ts';
 import { modelSettingsPanel } from './model-panel.ts';
@@ -18,6 +18,7 @@ const isZh = (ctx: WebUiPanelContext) => ctx.language === 'zh' || ctx.language =
 
 type PanelSyncEvent =
   | { kind: 'mask'; instanceName: string; source: 'auth' | 'quota' }
+  | { kind: 'quota-bar-mode'; instanceName: string; mode: QuotaBarMode }
   | { kind: 'routing'; instanceName: string; routing: AccountRoutingMode }
   | { kind: 'quota'; instanceName: string; source: 'auth' | 'quota' }
   | { kind: 'gateway'; instanceName: string; protocol: GatewayProtocol; authMode: AuthMode; authEnabled: boolean };
@@ -444,7 +445,7 @@ const authPanel: WebUiPanel = {
       });
     }
 
-    function renderInlineWeeklyQuota(acct: AuthAccountItem, routing: AccountRoutingMode): HTMLElement {
+    function renderInlineWeeklyQuota(acct: AuthAccountItem, routing: AccountRoutingMode, barMode: QuotaBarMode): HTMLElement {
       const box = ui.h('div', 'ggw-acct-quota');
       const head = ui.h('div', 'ggw-acct-quota-head');
       const lbl = ui.h(
@@ -460,19 +461,31 @@ const authPanel: WebUiPanel = {
       }
       const remaining = Math.min(Math.max(acct.weeklyRemaining, 0), 100);
       const used = Math.round((100 - remaining) * 10) / 10;
+      const showRemaining = barMode !== 'used';
       const tone = remaining <= 10 ? 'bad' : remaining <= 25 ? 'warn' : '';
-      const val = ui.h('span', tone ? `ggw-acct-quota-main ${tone}` : 'ggw-acct-quota-main', t(`周剩余 ${remaining}%`, `${remaining}% left`));
+      const val = ui.h(
+        'span',
+        tone ? `ggw-acct-quota-main ${tone}` : 'ggw-acct-quota-main',
+        showRemaining ? t(`周剩余 ${remaining}%`, `${remaining}% left`) : t(`周已用 ${used}%`, `${used}% used`),
+      );
       head.append(lbl, val);
 
       const track = ui.h('div', 'ggw-qbar-track');
       const fill = ui.h('div', tone ? `ggw-qbar-fill ${tone}` : 'ggw-qbar-fill');
-      // In least-used / round-robin weekly bar, show used bar consistent with Step 3 (or remaining? Keep consistent used fill + clear text!).
-      fill.style.width = `${used}%`;
+      fill.style.width = `${showRemaining ? remaining : used}%`;
       track.append(fill);
 
-      const subParts: string[] = [t(`已用 ${used}%`, `${used}% used`)];
+      const subParts: string[] = [
+        showRemaining ? t(`已用 ${used}%`, `${used}% used`) : t(`剩余 ${remaining}%`, `${remaining}% left`),
+      ];
       if (acct.fiveHourRemaining !== undefined) {
-        subParts.push(t(`5h 剩余 ${acct.fiveHourRemaining}%`, `5h left ${acct.fiveHourRemaining}%`));
+        const fiveRemaining = Math.min(Math.max(acct.fiveHourRemaining, 0), 100);
+        const fiveUsed = Math.round((100 - fiveRemaining) * 10) / 10;
+        subParts.push(
+          showRemaining
+            ? t(`5h 剩余 ${fiveRemaining}%`, `5h left ${fiveRemaining}%`)
+            : t(`5h 已用 ${fiveUsed}%`, `5h used ${fiveUsed}%`),
+        );
       }
       if (acct.weeklyResetsAt) {
         const resetMs = Date.parse(acct.weeklyResetsAt) - Date.now();
@@ -488,9 +501,11 @@ const authPanel: WebUiPanel = {
       protocol: AuthPanelStatus['protocol'],
       masked: boolean,
       routing: AccountRoutingMode,
+      barMode: QuotaBarMode,
       index: number,
       isTopPriority: boolean,
     ): HTMLElement {
+      const showRemaining = barMode !== 'used';
       const highlight = routing === 'failover' ? acct.isPrimary : (routing === 'least-used' && isTopPriority);
       const card = ui.h('div', highlight ? 'ggw-account-card is-primary' : 'ggw-account-card');
 
@@ -522,8 +537,14 @@ const authPanel: WebUiPanel = {
 
       const rightTags = ui.h('span', 'ggw-tags');
       if (routing === 'least-used' && acct.weeklyRemaining !== undefined) {
-        const tone = acct.weeklyRemaining <= 10 ? 'bad' : acct.weeklyRemaining <= 25 ? 'warn' : 'primary';
-        rightTags.append(ui.h('span', `ggw-tag ${tone}`, t(`周余 ${acct.weeklyRemaining}%`, `${acct.weeklyRemaining}% wk`)));
+        const weeklyRem = Math.min(Math.max(acct.weeklyRemaining, 0), 100);
+        const weeklyUsed = Math.round((100 - weeklyRem) * 10) / 10;
+        const tone = weeklyRem <= 10 ? 'bad' : weeklyRem <= 25 ? 'warn' : 'primary';
+        rightTags.append(ui.h(
+          'span',
+          `ggw-tag ${tone}`,
+          showRemaining ? t(`周余 ${weeklyRem}%`, `${weeklyRem}% wk`) : t(`周用 ${weeklyUsed}%`, `${weeklyUsed}% used`),
+        ));
       }
       if (protocol === 'robin') {
         if (acct.termsStatus === 'required') {
@@ -556,10 +577,22 @@ const authPanel: WebUiPanel = {
       meta.append(ui.h('span', '', formatShortExpiry(acct.expiresAt, zh)));
       if (routing === 'failover') {
         if (acct.weeklyRemaining !== undefined) {
-          meta.append(ui.h('span', 'mono', t(`周剩余 ${acct.weeklyRemaining}%`, `Weekly left ${acct.weeklyRemaining}%`)));
+          const weeklyRem = Math.min(Math.max(acct.weeklyRemaining, 0), 100);
+          const weeklyUsed = Math.round((100 - weeklyRem) * 10) / 10;
+          meta.append(ui.h(
+            'span',
+            'mono',
+            showRemaining ? t(`周剩余 ${weeklyRem}%`, `Weekly left ${weeklyRem}%`) : t(`周已用 ${weeklyUsed}%`, `Weekly used ${weeklyUsed}%`),
+          ));
         }
         if (acct.fiveHourRemaining !== undefined) {
-          meta.append(ui.h('span', 'mono', t(`5h 剩余 ${acct.fiveHourRemaining}%`, `5h left ${acct.fiveHourRemaining}%`)));
+          const fiveRem = Math.min(Math.max(acct.fiveHourRemaining, 0), 100);
+          const fiveUsed = Math.round((100 - fiveRem) * 10) / 10;
+          meta.append(ui.h(
+            'span',
+            'mono',
+            showRemaining ? t(`5h 剩余 ${fiveRem}%`, `5h left ${fiveRem}%`) : t(`5h 已用 ${fiveUsed}%`, `5h used ${fiveUsed}%`),
+          ));
         }
       }
 
@@ -621,7 +654,7 @@ const authPanel: WebUiPanel = {
 
       card.append(head);
       if (routing !== 'failover') {
-        card.append(renderInlineWeeklyQuota(acct, routing));
+        card.append(renderInlineWeeklyQuota(acct, routing, barMode));
       }
       card.append(meta);
       if (acct.cooldownReason || acct.lastError) {
@@ -798,6 +831,7 @@ const authPanel: WebUiPanel = {
       }
 
       // Avoid rebuilding account cards on identical 2s polling frames so button hover/focus stays steady.
+      const barMode: QuotaBarMode = state.quotaBarMode === 'used' ? 'used' : 'remaining';
       const minuteBucket = Math.floor(Date.now() / 30_000);
       const nextFp = JSON.stringify({
         working,
@@ -805,6 +839,7 @@ const authPanel: WebUiPanel = {
         protocol: state.protocol,
         routing,
         masked,
+        barMode,
         accounts: state.accounts,
         cdBucket: state.accounts.some(a => a.cooldownUntil && a.cooldownUntil > Date.now()) ? minuteBucket : 0,
       });
@@ -829,6 +864,7 @@ const authPanel: WebUiPanel = {
               state!.protocol,
               masked,
               routing,
+              barMode,
               index,
               Boolean(topId && acct.id === topId && !(acct.cooldownUntil && acct.cooldownUntil > now)),
             )),
@@ -900,6 +936,13 @@ const authPanel: WebUiPanel = {
       if (ev.kind === 'gateway') {
         lastApiKeyFormKey = '';
         void refresh();
+      } else if (ev.kind === 'quota-bar-mode') {
+        if (state) {
+          state = { ...state, quotaBarMode: ev.mode };
+          paint();
+        } else {
+          void refresh();
+        }
       } else if ((ev.kind === 'mask' || ev.kind === 'quota') && ev.source !== 'auth') {
         void refresh();
       }
@@ -923,6 +966,7 @@ const quotaPanel: WebUiPanel = {
     root.classList.add('ggw-panel');
     let selectedAccountId = 'all';
     let emailsMasked = true;
+    let quotaBarMode: QuotaBarMode = 'remaining';
     let accountRouting: AccountRoutingMode = 'failover';
     let currentProtocol: GatewayProtocol = 'robin';
     let currentQuotaEndpoint = '';
@@ -981,13 +1025,17 @@ const quotaPanel: WebUiPanel = {
       variant: 'primary',
       onClick: () => void fetchQuota(true),
     });
+    const toggleBarModeBtn = ui.button(t('显示：剩余额度', 'Bars: Remaining'), {
+      size: 'sm',
+      onClick: () => void toggleQuotaBarMode(),
+    });
     const toggleMaskBtn = ui.button(t('显示账号名', 'Show account names'), {
       size: 'sm',
       onClick: () => void toggleQuotaMask(),
     });
     toggleMaskBtn.hidden = true;
     const planPill = ui.pill(t('未查询', 'Idle'), 'plain');
-    topBar.append(accountSelect, queryBtn, toggleMaskBtn, planPill);
+    topBar.append(accountSelect, queryBtn, toggleBarModeBtn, toggleMaskBtn, planPill);
 
     const cardsBox = ui.h('div', 'ggw-quota-cards');
     const footnote = ui.h('div', 'sh-desc');
@@ -1079,6 +1127,18 @@ const quotaPanel: WebUiPanel = {
     let waitingForAuth = false;
     let autoQueryDone = false;
 
+    function updateBarModeButton() {
+      toggleBarModeBtn.hidden = lastSnapshot?.supported === false;
+      toggleBarModeBtn.disabled = loading;
+      const showRemaining = quotaBarMode !== 'used';
+      toggleBarModeBtn.textContent = showRemaining
+        ? t('显示：剩余额度', 'Bars: Remaining')
+        : t('显示：已用用量', 'Bars: Used');
+      toggleBarModeBtn.title = showRemaining
+        ? t('当前进度条按剩余额度显示（满格表示余量充足），点击切换为按已用用量显示', 'Showing remaining quota (full bar = plenty left). Click to switch to used quota.')
+        : t('当前进度条按已用用量显示（随消耗递增），点击切回按剩余额度显示', 'Showing used quota (grows with usage). Click to switch back to remaining quota.');
+    }
+
     function updateMaskButton() {
       const hasAccounts = Boolean(lastSnapshot?.accountOptions?.length);
       toggleMaskBtn.hidden = !hasAccounts;
@@ -1093,8 +1153,10 @@ const quotaPanel: WebUiPanel = {
 
     function applyLabelsToSnapshot(labels: QuotaAccountLabels) {
       emailsMasked = labels.emailsMasked;
+      quotaBarMode = labels.quotaBarMode === 'used' ? 'used' : 'remaining';
       accountRouting = labels.accountRouting;
       if (!lastSnapshot) {
+        updateBarModeButton();
         updateMaskButton();
         return;
       }
@@ -1102,6 +1164,7 @@ const quotaPanel: WebUiPanel = {
       const next: QuotaSnapshot = {
         ...lastSnapshot,
         emailsMasked: labels.emailsMasked,
+        quotaBarMode: labels.quotaBarMode,
         accountRouting: labels.accountRouting,
         accountOptions: labels.accountOptions,
         ...(lastSnapshot.accounts ? {
@@ -1115,6 +1178,25 @@ const quotaPanel: WebUiPanel = {
         } : {}),
       };
       renderSnapshot(next);
+    }
+
+    async function toggleQuotaBarMode() {
+      if (loading || signal.aborted) return;
+      toggleBarModeBtn.disabled = true;
+      try {
+        const nextMode: QuotaBarMode = quotaBarMode === 'used' ? 'remaining' : 'used';
+        const res = await ctx.invoke<QuotaAccountLabels>('set-bar-mode', [{ name, mode: nextMode }]);
+        if (signal.aborted) return;
+        applyLabelsToSnapshot(res);
+        broadcastPanelSync({ kind: 'quota-bar-mode', instanceName: name, mode: res.quotaBarMode });
+      } catch (err) {
+        if (!signal.aborted) {
+          message.textContent = err instanceof Error ? err.message : String(err);
+          message.classList.add('bad');
+        }
+      } finally {
+        if (!signal.aborted) updateBarModeButton();
+      }
     }
 
     async function toggleQuotaMask() {
@@ -1191,14 +1273,24 @@ const quotaPanel: WebUiPanel = {
       const head = ui.h('div', 'ggw-qbar-head');
       const lbl = ui.h('span', 'ggw-qbar-lbl', windowTitle(win.id, win.title));
       const val = ui.h('span', 'ggw-qbar-val');
-      const remStrong = ui.h('b', '', t(`剩余 ${win.remainingPercent}%`, `${win.remainingPercent}% left`));
-      val.append(remStrong, t(` · 已用 ${win.usedPercent}%`, ` · ${win.usedPercent}% used`));
+      const showRemaining = quotaBarMode !== 'used';
+      const remaining = Math.min(Math.max(win.remainingPercent, 0), 100);
+      const used = Math.min(Math.max(win.usedPercent, 0), 100);
+      const mainStrong = ui.h(
+        'b',
+        '',
+        showRemaining ? t(`剩余 ${win.remainingPercent}%`, `${win.remainingPercent}% left`) : t(`已用 ${win.usedPercent}%`, `${win.usedPercent}% used`),
+      );
+      const subText = showRemaining
+        ? t(` · 已用 ${win.usedPercent}%`, ` · ${win.usedPercent}% used`)
+        : t(` · 剩余 ${win.remainingPercent}%`, ` · ${win.remainingPercent}% left`);
+      val.append(mainStrong, subText);
       head.append(lbl, val);
 
       const track = ui.h('div', 'ggw-qbar-track');
       const fillTone = win.usedPercent >= 90 ? 'ggw-qbar-fill bad' : win.usedPercent >= 75 ? 'ggw-qbar-fill warn' : 'ggw-qbar-fill';
       const fill = ui.h('div', fillTone);
-      fill.style.width = `${Math.min(Math.max(win.usedPercent, 0), 100)}%`;
+      fill.style.width = `${showRemaining ? remaining : used}%`;
       track.append(fill);
 
       bar.append(head, track);
@@ -1279,11 +1371,15 @@ const quotaPanel: WebUiPanel = {
       if (typeof snap.emailsMasked === 'boolean') {
         emailsMasked = snap.emailsMasked;
       }
+      if (snap.quotaBarMode === 'used' || snap.quotaBarMode === 'remaining') {
+        quotaBarMode = snap.quotaBarMode;
+      }
       if (snap.accountRouting) {
         accountRouting = snap.accountRouting;
       }
       cardsBox.replaceChildren();
       syncAccountSelect(snap);
+      updateBarModeButton();
       updateMaskButton();
 
       if (snap.authRequired) {
@@ -1365,6 +1461,7 @@ const quotaPanel: WebUiPanel = {
       loading = true;
       queryBtn.disabled = true;
       accountSelect.disabled = true;
+      toggleBarModeBtn.disabled = true;
       toggleMaskBtn.disabled = true;
       if (userInitiated) {
         message.textContent = t('正在查询额度…', 'Querying quota…');
@@ -1399,6 +1496,7 @@ const quotaPanel: WebUiPanel = {
         loading = false;
         queryBtn.disabled = false;
         accountSelect.disabled = false;
+        updateBarModeButton();
         updateMaskButton();
       }
     }

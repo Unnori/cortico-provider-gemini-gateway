@@ -1,3 +1,5 @@
+import { canonicalMime } from './catalog.ts';
+import { ROBIN_ATTACHMENT_EXT } from './robin-grpc.ts';
 import { record } from './state.ts';
 
 type JsonObject = Record<string, unknown>;
@@ -153,18 +155,26 @@ function cleanHistoricalAssistantText(text: string): string {
   return lines.join('\n').trim();
 }
 
-function imageExtForMime(mimeType: string): string | undefined {
-  const norm = mimeType.trim().toLowerCase();
-  if (norm === 'image/png') return 'png';
-  if (norm === 'image/jpeg' || norm === 'image/jpg') return 'jpg';
-  if (norm === 'image/webp') return 'webp';
-  return undefined;
+type RobinAttachmentKind = 'image' | 'audio' | 'video' | 'file';
+
+function attachmentKindAndExt(mimeType: string): { kind: RobinAttachmentKind; ext: string } | undefined {
+  const norm = canonicalMime(mimeType);
+  const ext = ROBIN_ATTACHMENT_EXT[norm];
+  if (!ext) return undefined;
+  const kind: RobinAttachmentKind = norm.startsWith('image/')
+    ? 'image'
+    : norm.startsWith('audio/')
+      ? 'audio'
+      : norm.startsWith('video/')
+        ? 'video'
+        : 'file';
+  return { kind, ext };
 }
 
 function formatRobinPart(
   part: ScriptPart,
   role?: 'user' | 'model',
-  imageLabels?: Map<ScriptPart, string>,
+  attachmentLabels?: Map<ScriptPart, { kind: RobinAttachmentKind; name: string }>,
 ): string {
   if (part.type === 'text') {
     // Robin replays history as plain text without native thought signatures;
@@ -174,8 +184,8 @@ function formatRobinPart(
   }
   if (part.type === 'function_call') return `${TOOL_OPEN}${JSON.stringify(part.call)}${TOOL_CLOSE}`;
   if (part.type === 'function_response') return `<tool_response name="${part.result.name}"${part.result.id ? ` id="${part.result.id}"` : ''}>${JSON.stringify(part.result.response)}</tool_response>`;
-  const imageLabel = imageLabels?.get(part);
-  if (imageLabel) return `[Attached image: ${imageLabel} (${part.mimeType})]`;
+  const label = attachmentLabels?.get(part);
+  if (label) return `[Attached ${label.kind}: ${label.name} (${part.mimeType})]`;
   return `[Attachment: ${part.id} (${part.mimeType})]`;
 }
 
@@ -254,14 +264,17 @@ export async function toRobinRequest(request: GeminiRequest, upload?: UploadAtta
   const rpc = await toRpcRequest(request, upload, _temporaryChat);
   const sections: string[] = [];
   const attachments: { id: string; mimeType: string }[] = [];
-  const imageLabels = new Map<ScriptPart, string>();
-  let imageIndex = 0;
+  const attachmentLabels = new Map<ScriptPart, { kind: RobinAttachmentKind; name: string }>();
+  const kindCounts: Record<RobinAttachmentKind, number> = { image: 0, audio: 0, video: 0, file: 0 };
 
   const trackAttachment = (part: ScriptPart) => {
     if (part.type !== 'attachment') return;
     attachments.push({ id: part.id, mimeType: part.mimeType });
-    const ext = imageExtForMime(part.mimeType);
-    if (ext) imageLabels.set(part, `image-${++imageIndex}.${ext}`);
+    const info = attachmentKindAndExt(part.mimeType);
+    if (info) {
+      kindCounts[info.kind] += 1;
+      attachmentLabels.set(part, { kind: info.kind, name: `${info.kind}-${kindCounts[info.kind]}.${info.ext}` });
+    }
   };
 
   for (const part of rpc.script.system) trackAttachment(part);
@@ -269,7 +282,7 @@ export async function toRobinRequest(request: GeminiRequest, upload?: UploadAtta
     for (const part of turn.parts) trackAttachment(part);
   }
 
-  const systemText = rpc.script.system.map(part => formatRobinPart(part, undefined, imageLabels)).filter(Boolean).join('\n').trim();
+  const systemText = rpc.script.system.map(part => formatRobinPart(part, undefined, attachmentLabels)).filter(Boolean).join('\n').trim();
   if (systemText) sections.push(`<system_instruction>\n${systemText}\n</system_instruction>`);
 
   if (rpc.script.tools.length) {
@@ -277,14 +290,14 @@ export async function toRobinRequest(request: GeminiRequest, upload?: UploadAtta
   }
 
   if (rpc.script.turns.length === 1 && rpc.script.turns[0].role === 'user' && !systemText && !rpc.script.tools.length) {
-    const text = rpc.script.turns[0].parts.map(part => formatRobinPart(part, 'user', imageLabels)).join('\n');
+    const text = rpc.script.turns[0].parts.map(part => formatRobinPart(part, 'user', attachmentLabels)).join('\n');
     return { query: { text, ...(attachments.length ? { attachments } : {}) } };
   }
 
   const historyBlocks: string[] = [];
   for (const turn of rpc.script.turns) {
     if (turn.role === 'model') {
-      const formatted = turn.parts.map(part => formatRobinPart(part, 'model', imageLabels)).filter(Boolean).join('\n');
+      const formatted = turn.parts.map(part => formatRobinPart(part, 'model', attachmentLabels)).filter(Boolean).join('\n');
       if (formatted) historyBlocks.push(`[Assistant]\n${formatted}`);
       continue;
     }
@@ -294,11 +307,11 @@ export async function toRobinRequest(request: GeminiRequest, upload?: UploadAtta
     if (toolResults.length) {
       const toolOnlyAttachments = userParts.length > 0 && userParts.every(part => part.type === 'attachment');
       const resultParts = toolOnlyAttachments ? [...toolResults, ...userParts] : toolResults;
-      historyBlocks.push(`[Caller Tool Result]\n${resultParts.map(part => formatRobinPart(part, 'user', imageLabels)).filter(Boolean).join('\n')}`);
+      historyBlocks.push(`[Caller Tool Result]\n${resultParts.map(part => formatRobinPart(part, 'user', attachmentLabels)).filter(Boolean).join('\n')}`);
       if (toolOnlyAttachments) continue;
     }
     if (userParts.length) {
-      const formatted = userParts.map(part => formatRobinPart(part, 'user', imageLabels)).filter(Boolean).join('\n');
+      const formatted = userParts.map(part => formatRobinPart(part, 'user', attachmentLabels)).filter(Boolean).join('\n');
       if (formatted) historyBlocks.push(`[User]\n${formatted}`);
     }
   }

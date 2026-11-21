@@ -52,10 +52,13 @@ export function geminiModelId(model: string): string {
 }
 
 const MIME_ALIASES: Record<string, string> = {
+  'image/jpg': 'image/jpeg',
   'audio/mp3': 'audio/mpeg',
   'audio/x-wav': 'audio/wav',
   'audio/wave': 'audio/wav',
   'audio/m4a': 'audio/mp4',
+  'audio/x-m4a': 'audio/mp4',
+  'audio/opus': 'audio/ogg',
   'video/mov': 'video/quicktime',
   'video/avi': 'video/x-msvideo',
 };

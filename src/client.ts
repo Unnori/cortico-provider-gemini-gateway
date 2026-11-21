@@ -1,22 +1,22 @@
 import { createHash } from 'node:crypto';
 import { requestJson } from 'cortico/providers/transport/response-http.ts';
+import { canonicalMime } from './catalog.ts';
 import { gatewayFrames } from './frames.ts';
 import { createHttp2Connector, createProxyFetchFor, type Http2Connector } from './http.ts';
 import { GatewayError, inspectHttpError, SerialQueue } from './queue.ts';
 import {
-  detectRobinImageMime,
   isRobinGrpcRoute,
+  resolveRobinAttachmentMime,
   resolveRobinMode,
   ROBIN_GRPC_PROCESS_QUERY,
-  ROBIN_MAX_IMAGE_BYTES,
-  ROBIN_MAX_IMAGES_PER_REQUEST,
-  ROBIN_NATIVE_IMAGE_MIMES,
+  ROBIN_MAX_ATTACHMENT_BYTES,
+  ROBIN_MAX_ATTACHMENTS_PER_REQUEST,
+  ROBIN_NATIVE_ATTACHMENT_MIMES,
   streamRobinGrpc,
-  uploadRobinImages,
+  uploadRobinAttachments,
   type RobinGrpcStreamSummary,
-  type RobinImageMime,
   type RobinRoutingObservation,
-  type RobinUploadedImage,
+  type RobinUploadedAttachment,
 } from './robin-grpc.ts';
 import {
   decodeGatewayEvent, RobinPartFilter, toGeminiRequest, toRobinRequest, toRpcRequest, ToolCallStream,
@@ -98,7 +98,7 @@ export class GatewayClient {
   private readonly protocol: GatewayProtocol;
   private readonly base: string;
   private readonly options: GatewayClientOptions;
-  private readonly robinImageCache = new Map<string, { blobId: string; mimeType: RobinImageMime; expiresAt: number }>();
+  private readonly robinAttachmentCache = new Map<string, { blobId: string; mimeType: string; expiresAt: number }>();
 
   constructor(options: GatewayClientOptions) {
     this.options = options;
@@ -181,21 +181,21 @@ export class GatewayClient {
     return 'generate?$alt=json';
   }
 
-  private pruneRobinImageCache(now = Date.now()): void {
-    for (const [key, entry] of this.robinImageCache) {
-      if (entry.expiresAt <= now) this.robinImageCache.delete(key);
+  private pruneRobinAttachmentCache(now = Date.now()): void {
+    for (const [key, entry] of this.robinAttachmentCache) {
+      if (entry.expiresAt <= now) this.robinAttachmentCache.delete(key);
     }
-    while (this.robinImageCache.size > ROBIN_UPLOAD_CACHE_MAX) {
-      const oldest = this.robinImageCache.keys().next().value;
+    while (this.robinAttachmentCache.size > ROBIN_UPLOAD_CACHE_MAX) {
+      const oldest = this.robinAttachmentCache.keys().next().value;
       if (oldest === undefined) break;
-      this.robinImageCache.delete(oldest);
+      this.robinAttachmentCache.delete(oldest);
     }
   }
 
-  private clearRobinImageCacheFor(accountId?: string): void {
+  private clearRobinAttachmentCacheFor(accountId?: string): void {
     const prefix = `${accountId ?? 'default'}:`;
-    for (const key of this.robinImageCache.keys()) {
-      if (key.startsWith(prefix)) this.robinImageCache.delete(key);
+    for (const key of this.robinAttachmentCache.keys()) {
+      if (key.startsWith(prefix)) this.robinAttachmentCache.delete(key);
     }
   }
 
@@ -214,7 +214,7 @@ export class GatewayClient {
       turnIndex: number;
       partIndex: number;
       bytes: Buffer;
-      mimeType: RobinImageMime | null;
+      mimeType: string | null;
       cacheKey: string;
     };
 
@@ -224,7 +224,7 @@ export class GatewayClient {
         const inline = parts[partIndex].inlineData;
         if (!inline) continue;
         const bytes = Buffer.from(inline.data, 'base64');
-        const detected = bytes.length ? detectRobinImageMime(bytes) : null;
+        const detected = bytes.length ? resolveRobinAttachmentMime(bytes, inline.mimeType) : null;
         const hash = detected ? createHash('sha256').update(detected).update(':').update(bytes).digest('hex') : '';
         candidates.push({
           section,
@@ -240,8 +240,8 @@ export class GatewayClient {
     input.contents.forEach((turn, turnIndex) => collect('turn', turnIndex, turn.parts));
     if (!candidates.length) return { request: input, uploader: undefined };
 
-    // Keep only supported images from the latest turn, within Robin's per-request count & byte budgets.
-    // Earlier-turn images are never re-uploaded or re-inferred; they become compact text placeholders.
+    // Keep only supported multimodal attachments from the latest turn, within Robin's per-request budgets.
+    // Earlier-turn attachments are never re-uploaded or re-inferred; they become compact text placeholders.
     const lastTurnIndex = input.contents.length - 1;
     const keptKeys = new Set<string>();
     const keptList: InlineCandidate[] = [];
@@ -250,27 +250,27 @@ export class GatewayClient {
       const candidate = candidates[i];
       if (!candidate.mimeType) continue;
       if (candidate.section !== 'turn' || candidate.turnIndex !== lastTurnIndex) continue;
-      if (keptList.length >= ROBIN_MAX_IMAGES_PER_REQUEST) continue;
-      if (totalBytes + candidate.bytes.length > ROBIN_MAX_IMAGE_BYTES) continue;
+      if (keptList.length >= ROBIN_MAX_ATTACHMENTS_PER_REQUEST) continue;
+      if (totalBytes + candidate.bytes.length > ROBIN_MAX_ATTACHMENT_BYTES) continue;
       totalBytes += candidate.bytes.length;
       keptList.push(candidate);
       keptKeys.add(`${candidate.section}:${candidate.turnIndex}:${candidate.partIndex}`);
     }
     keptList.reverse();
 
-    // Batch-upload only uncached unique images for this account over a single HTTP/2 upload session.
+    // Batch-upload only uncached unique attachments for this account over a single HTTP/2 upload session.
     const now = Date.now();
-    this.pruneRobinImageCache(now);
-    const toUpload: { cacheKey: string; data: Buffer; mimeType: RobinImageMime }[] = [];
+    this.pruneRobinAttachmentCache(now);
+    const toUpload: { cacheKey: string; data: Buffer; mimeType: string }[] = [];
     const seenUploadKeys = new Set<string>();
     for (const candidate of keptList) {
-      if (this.robinImageCache.has(candidate.cacheKey) || seenUploadKeys.has(candidate.cacheKey)) continue;
+      if (this.robinAttachmentCache.has(candidate.cacheKey) || seenUploadKeys.has(candidate.cacheKey)) continue;
       seenUploadKeys.add(candidate.cacheKey);
       toUpload.push({ cacheKey: candidate.cacheKey, data: candidate.bytes, mimeType: candidate.mimeType! });
     }
     if (toUpload.length) {
-      const uploaded = await uploadRobinImages({
-        images: toUpload.map(item => ({ data: item.data, mimeType: item.mimeType })),
+      const uploaded = await uploadRobinAttachments({
+        attachments: toUpload.map(item => ({ data: item.data, mimeType: item.mimeType })),
         headers,
         origin: this.options.robinUploadOrigin,
         signal,
@@ -278,13 +278,13 @@ export class GatewayClient {
       });
       const expiresAt = Date.now() + ROBIN_UPLOAD_CACHE_TTL_MS;
       for (let i = 0; i < toUpload.length; i++) {
-        this.robinImageCache.set(toUpload[i].cacheKey, {
+        this.robinAttachmentCache.set(toUpload[i].cacheKey, {
           blobId: uploaded[i].blobId,
           mimeType: uploaded[i].mimeType,
           expiresAt,
         });
       }
-      this.pruneRobinImageCache();
+      this.pruneRobinAttachmentCache();
     }
 
     const byKey = new Map<string, InlineCandidate>();
@@ -298,14 +298,14 @@ export class GatewayClient {
         const candidate = byKey.get(key);
         if (!candidate || !keptKeys.has(key)) {
           if (candidate?.mimeType && (candidate.section !== 'turn' || candidate.turnIndex !== lastTurnIndex)) {
-            return { text: '[Earlier image omitted]' };
+            return { text: candidate.mimeType.startsWith('image/') ? '[Earlier image omitted]' : '[Earlier attachment omitted]' };
           }
           const reason = !candidate?.mimeType
             ? `unsupported Robin attachment (${part.inlineData.mimeType})`
-            : 'oversized or excess image omitted';
+            : (candidate.mimeType.startsWith('image/') ? 'oversized or excess image omitted' : 'oversized or excess attachment omitted');
           return { text: `[Attachment omitted: ${reason}]` };
         }
-        const cached = this.robinImageCache.get(candidate.cacheKey)!;
+        const cached = this.robinAttachmentCache.get(candidate.cacheKey)!;
         return { fileData: { fileUri: cached.blobId, mimeType: cached.mimeType } };
       });
 
@@ -337,10 +337,10 @@ export class GatewayClient {
     const prepared = await this.prepareRobinGrpcAttachments(input, headers, signal, accountId);
     const prompt = await toRobinRequest(prepared.request, prepared.uploader, this.options.temporaryChat ?? true);
     signal.throwIfAborted();
-    const images: RobinUploadedImage[] = (prompt.query.attachments ?? [])
-      .filter((att): att is { id: string; mimeType: RobinImageMime } => ROBIN_NATIVE_IMAGE_MIMES.has(att.mimeType))
-      .slice(-ROBIN_MAX_IMAGES_PER_REQUEST)
-      .map(att => ({ blobId: att.id, mimeType: att.mimeType }));
+    const attachments: RobinUploadedAttachment[] = (prompt.query.attachments ?? [])
+      .map(att => ({ blobId: att.id, mimeType: canonicalMime(att.mimeType) }))
+      .filter(att => ROBIN_NATIVE_ATTACHMENT_MIMES.has(att.mimeType))
+      .slice(-ROBIN_MAX_ATTACHMENTS_PER_REQUEST);
     const thinkingCfg = record(input.generationConfig?.thinkingConfig);
     const includeThoughts = typeof thinkingCfg?.includeThoughts === 'boolean' ? thinkingCfg.includeThoughts : true;
     const reasoningEffort = typeof thinkingCfg?.thinkingLevel === 'string' ? thinkingCfg.thinkingLevel : undefined;
@@ -366,7 +366,7 @@ export class GatewayClient {
       path: route,
       headers,
       userText: prompt.query.text,
-      images,
+      attachments,
       model: input.model,
       thinking: includeThoughts,
       reasoningEffort,
@@ -586,7 +586,7 @@ export class GatewayClient {
           } catch (error) {
             if (error instanceof GatewayError) status = error.status;
             if (error instanceof GatewayError && error.status === 401) {
-              this.clearRobinImageCacheFor(accountId);
+              this.clearRobinAttachmentCacheFor(accountId);
             }
             if (!signal.aborted && error instanceof GatewayError && error.status === 401
                 && attempt === 0 && authActive && !observed) {

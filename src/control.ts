@@ -30,6 +30,7 @@ import { geminiModelId } from './catalog.ts';
 import {
   type AccountQuotaOption,
   type AccountQuotaSnapshot,
+  type QuotaBarMode,
   type QuotaSnapshot,
   queryGatewayQuota,
 } from './quota.ts';
@@ -40,7 +41,9 @@ import {
   type RobinTermsResult,
   type RobinUserStatus,
 } from './robin-grpc.ts';
+import { readState, record, writeState } from './state.ts';
 
+export const UI_PREFS_FILE = 'ui-prefs.json';
 const controls = new Map<string, GatewayControl>();
 
 export function resolveOAuthDir(hostStateDir: string, entry: LLMProviderEntry): string {
@@ -66,6 +69,9 @@ export function resolveOAuthDir(hostStateDir: string, entry: LLMProviderEntry): 
       if (!existsSync(join(profileDir, API_KEY_FILE)) && existsSync(join(hostStateDir, API_KEY_FILE))) {
         copyFileSync(join(hostStateDir, API_KEY_FILE), join(profileDir, API_KEY_FILE));
       }
+      if (!existsSync(join(profileDir, UI_PREFS_FILE)) && existsSync(join(hostStateDir, UI_PREFS_FILE))) {
+        copyFileSync(join(hostStateDir, UI_PREFS_FILE), join(profileDir, UI_PREFS_FILE));
+      }
     }
     return profileDir;
   }
@@ -89,6 +95,7 @@ export interface GatewayOAuthStatus extends OAuthStatus {
   authEnabled: boolean;
   oauthDir: string;
   emailsMasked: boolean;
+  quotaBarMode: QuotaBarMode;
 }
 
 export interface AccountRuntimeInfo {
@@ -151,6 +158,7 @@ export class GatewayControl {
   private readonly observedRouting = new Map<string, RecordedRobinRouting>();
   private rrCursor = 0;
   private emailsMasked = true;
+  private quotaBarMode: QuotaBarMode = 'remaining';
   private activeProxyUrl?: string;
   private cachedProxyFetch?: { proxyUrl?: string; fn: typeof fetch };
 
@@ -165,6 +173,14 @@ export class GatewayControl {
 
   constructor(oauthDir: string, request?: typeof fetch) {
     this.oauthDir = oauthDir;
+    try {
+      const prefs = record(readState(join(oauthDir, UI_PREFS_FILE)));
+      if (prefs?.quotaBarMode === 'used' || prefs?.quotaBarMode === 'remaining') {
+        this.quotaBarMode = prefs.quotaBarMode;
+      }
+    } catch {
+      // Ignore malformed UI preferences and keep the default remaining-quota display.
+    }
     const custom = readOAuthConfig(oauthDir);
     const bundled = custom ? undefined : readBundledOAuthConfig();
     const config = custom ?? bundled ?? GatewayControl.emptyOAuthConfig();
@@ -218,6 +234,16 @@ export class GatewayControl {
     return this.emailsMasked;
   }
 
+  getQuotaBarMode(): QuotaBarMode {
+    return this.quotaBarMode;
+  }
+
+  setQuotaBarMode(mode: QuotaBarMode): QuotaBarMode {
+    this.quotaBarMode = mode === 'used' ? 'used' : 'remaining';
+    writeState(join(this.oauthDir, UI_PREFS_FILE), { quotaBarMode: this.quotaBarMode });
+    return this.quotaBarMode;
+  }
+
   listAccountOptions(): AccountQuotaOption[] {
     const ordered = orderPrimaryFirst(this.auth.listAccounts({ revealEmail: !this.emailsMasked }));
     return ordered.map(acct => ({
@@ -240,6 +266,7 @@ export class GatewayControl {
       authEnabled: this.authEnabled(entry),
       oauthDir: this.oauthDir,
       emailsMasked: this.emailsMasked,
+      quotaBarMode: this.quotaBarMode,
     };
   }
 
@@ -551,7 +578,7 @@ export class GatewayControl {
           expiresAt: Date.now() + ROBIN_STATUS_TTL_MS,
         };
       }
-      return snapshot;
+      return { ...snapshot, quotaBarMode: this.quotaBarMode };
     }
 
     const orderedAccounts = config.accountRouting === 'failover'
@@ -565,6 +592,7 @@ export class GatewayControl {
         fetchedAt: new Date().toISOString(),
         totalAccounts: 0,
         emailsMasked: this.emailsMasked,
+        quotaBarMode: this.quotaBarMode,
         accountRouting: config.accountRouting,
         accountOptions: [],
         accounts: [],
@@ -659,6 +687,7 @@ export class GatewayControl {
       selectedAccountId: wantsSingle ? targetAccountId : 'all',
       totalAccounts: orderedAccounts.length,
       emailsMasked: this.emailsMasked,
+      quotaBarMode: this.quotaBarMode,
       accountRouting: config.accountRouting,
       accountOptions,
       accounts: results,

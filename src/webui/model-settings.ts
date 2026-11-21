@@ -3,7 +3,7 @@ import type { PriceDefinition } from 'cortico/providers/pricebook.ts';
 import { acceptsMime, canonicalMime, type ModelMetadata } from '../catalog.ts';
 import { configuration } from '../options.ts';
 import { automaticPriceForModel, priceBasisForEntry } from '../pricing.ts';
-import { ROBIN_NATIVE_IMAGE_MIMES } from '../robin-grpc.ts';
+import { ROBIN_NATIVE_ATTACHMENT_MIMES } from '../robin-grpc.ts';
 import type { RobinRouteSummary } from '../robin-models.ts';
 
 export const MODEL_SETTINGS_PANEL = 'model-settings';
@@ -46,7 +46,7 @@ export function protocolSupportsMime(entry: LLMProviderEntry, mime: string): boo
   if (cfg.protocol === 'gemini') return true;
   if (cfg.protocol === 'robin') {
     if (cfg.uploadEndpoint) return true;
-    return ROBIN_NATIVE_IMAGE_MIMES.has(type);
+    return ROBIN_NATIVE_ATTACHMENT_MIMES.has(type);
   }
   return Boolean(cfg.uploadEndpoint);
 }

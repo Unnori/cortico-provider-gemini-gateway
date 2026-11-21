@@ -152,7 +152,7 @@ var modelSettingsPanel = {
         toggle.checked = setting.enabled;
         toggle.disabled = !setting.available;
         toggle.setAttribute("aria-label", inputLabels[setting.kind]);
-        const title = !setting.declared ? en ? "Not declared by this model" : "\u8BE5\u6A21\u578B\u672A\u58F0\u660E\u652F\u6301\u6B64\u7C7B\u8F93\u5165" : !setting.available ? next.protocol === "robin" && !next.hasUploadEndpoint ? en ? "Robin native upload supports PNG/JPEG/WebP images; audio/video/PDF require native Gemini REST or a custom uploadEndpoint" : "Robin \u539F\u751F\u4E0A\u4F20\u901A\u9053\u76EE\u524D\u652F\u6301\u56FE\u7247\uFF08PNG/JPEG/WebP\uFF09\uFF1B\u97F3\u9891/\u89C6\u9891/PDF \u8BF7\u5207\u6362\u81F3\u539F\u751F Gemini REST \u534F\u8BAE\u6216\u914D\u7F6E\u81EA\u5B9A\u4E49 uploadEndpoint" : en ? `Requires native Gemini REST protocol or uploadEndpoint (current: ${next.protocol})` : `\u5F53\u524D ${next.protocol} \u534F\u8BAE\u9700\u914D\u7F6E uploadEndpoint \u6216\u5207\u6362\u81F3\u539F\u751F Gemini REST \u534F\u8BAE\u624D\u53EF\u53D1\u9001\u6B64\u7C7B\u9644\u4EF6` : next.attachmentsEnabled ? next.protocol === "robin" && setting.kind === "image" && !next.hasUploadEndpoint ? en ? "Uploaded automatically via Robin native Scotty upload using your signed-in OAuth account; can be disabled manually" : "\u5DF2\u901A\u8FC7 Robin \u9ED8\u8BA4\u4E0A\u4F20\u901A\u9053\u81EA\u52A8\u542F\u7528\uFF08\u590D\u7528\u5F53\u524D\u767B\u5F55\u8D26\u53F7 OAuth \u9274\u6743\uFF09\uFF0C\u53EF\u624B\u52A8\u5173\u95ED" : en ? "Follows the model declaration; can be disabled manually" : "\u6309\u6A21\u578B\u58F0\u660E\u81EA\u52A8\u542F\u7528\uFF0C\u53EF\u624B\u52A8\u5173\u95ED" : en ? "All attachments are disabled; enabling this restores automatic attachments" : "\u5168\u90E8\u9644\u4EF6\u5DF2\u5173\u95ED\uFF1B\u5F00\u542F\u6B64\u9879\u5C06\u6062\u590D\u81EA\u52A8\u9644\u4EF6";
+        const title = !setting.declared ? en ? "Not declared by this model" : "\u8BE5\u6A21\u578B\u672A\u58F0\u660E\u652F\u6301\u6B64\u7C7B\u8F93\u5165" : !setting.available ? next.protocol === "robin" && !next.hasUploadEndpoint ? en ? "This format is outside Robin native upload MIME support; use native Gemini REST or a custom uploadEndpoint" : "\u8BE5\u683C\u5F0F\u6682\u4E0D\u5728 Robin \u539F\u751F\u4E0A\u4F20\u652F\u6301\u5217\u8868\u4E2D\uFF0C\u53EF\u5207\u6362\u81F3\u539F\u751F Gemini REST \u534F\u8BAE\u6216\u914D\u7F6E\u81EA\u5B9A\u4E49 uploadEndpoint" : en ? `Requires native Gemini REST protocol or uploadEndpoint (current: ${next.protocol})` : `\u5F53\u524D ${next.protocol} \u534F\u8BAE\u9700\u914D\u7F6E uploadEndpoint \u6216\u5207\u6362\u81F3\u539F\u751F Gemini REST \u534F\u8BAE\u624D\u53EF\u53D1\u9001\u6B64\u7C7B\u9644\u4EF6` : next.attachmentsEnabled ? next.protocol === "robin" && !next.hasUploadEndpoint ? en ? "Uploaded automatically via Robin native Scotty upload (images, audio, video, PDF/files) using your signed-in OAuth account; can be disabled manually" : "\u5DF2\u901A\u8FC7 Robin \u9ED8\u8BA4\u4E0A\u4F20\u901A\u9053\u81EA\u52A8\u542F\u7528\uFF08\u652F\u6301\u56FE\u7247/\u97F3\u9891/\u89C6\u9891/PDF \u7B49\uFF0C\u590D\u7528\u5F53\u524D\u767B\u5F55\u8D26\u53F7 OAuth \u9274\u6743\uFF09\uFF0C\u53EF\u6309\u7C7B\u522B\u624B\u52A8\u5173\u95ED" : en ? "Follows the model declaration; can be disabled manually" : "\u6309\u6A21\u578B\u58F0\u660E\u81EA\u52A8\u542F\u7528\uFF0C\u53EF\u624B\u52A8\u5173\u95ED" : en ? "All attachments are disabled; enabling this restores automatic attachments" : "\u5168\u90E8\u9644\u4EF6\u5DF2\u5173\u95ED\uFF1B\u5F00\u542F\u6B64\u9879\u5C06\u6062\u590D\u81EA\u52A8\u9644\u4EF6";
         const wrapper = ui.field(inputLabels[setting.kind], toggle);
         wrapper.classList.add("connection-toggle");
         wrapper.title = title;
@@ -703,7 +703,7 @@ var authPanel = {
         }
       });
     }
-    function renderInlineWeeklyQuota(acct, routing) {
+    function renderInlineWeeklyQuota(acct, routing, barMode) {
       const box = ui.h("div", "ggw-acct-quota");
       const head = ui.h("div", "ggw-acct-quota-head");
       const lbl = ui.h(
@@ -719,16 +719,27 @@ var authPanel = {
       }
       const remaining = Math.min(Math.max(acct.weeklyRemaining, 0), 100);
       const used = Math.round((100 - remaining) * 10) / 10;
+      const showRemaining = barMode !== "used";
       const tone = remaining <= 10 ? "bad" : remaining <= 25 ? "warn" : "";
-      const val = ui.h("span", tone ? `ggw-acct-quota-main ${tone}` : "ggw-acct-quota-main", t(`\u5468\u5269\u4F59 ${remaining}%`, `${remaining}% left`));
+      const val = ui.h(
+        "span",
+        tone ? `ggw-acct-quota-main ${tone}` : "ggw-acct-quota-main",
+        showRemaining ? t(`\u5468\u5269\u4F59 ${remaining}%`, `${remaining}% left`) : t(`\u5468\u5DF2\u7528 ${used}%`, `${used}% used`)
+      );
       head.append(lbl, val);
       const track = ui.h("div", "ggw-qbar-track");
       const fill = ui.h("div", tone ? `ggw-qbar-fill ${tone}` : "ggw-qbar-fill");
-      fill.style.width = `${used}%`;
+      fill.style.width = `${showRemaining ? remaining : used}%`;
       track.append(fill);
-      const subParts = [t(`\u5DF2\u7528 ${used}%`, `${used}% used`)];
+      const subParts = [
+        showRemaining ? t(`\u5DF2\u7528 ${used}%`, `${used}% used`) : t(`\u5269\u4F59 ${remaining}%`, `${remaining}% left`)
+      ];
       if (acct.fiveHourRemaining !== void 0) {
-        subParts.push(t(`5h \u5269\u4F59 ${acct.fiveHourRemaining}%`, `5h left ${acct.fiveHourRemaining}%`));
+        const fiveRemaining = Math.min(Math.max(acct.fiveHourRemaining, 0), 100);
+        const fiveUsed = Math.round((100 - fiveRemaining) * 10) / 10;
+        subParts.push(
+          showRemaining ? t(`5h \u5269\u4F59 ${fiveRemaining}%`, `5h left ${fiveRemaining}%`) : t(`5h \u5DF2\u7528 ${fiveUsed}%`, `5h used ${fiveUsed}%`)
+        );
       }
       if (acct.weeklyResetsAt) {
         const resetMs = Date.parse(acct.weeklyResetsAt) - Date.now();
@@ -738,7 +749,8 @@ var authPanel = {
       box.append(head, track, sub);
       return box;
     }
-    function renderAccountCard(acct, protocol, masked, routing, index, isTopPriority) {
+    function renderAccountCard(acct, protocol, masked, routing, barMode, index, isTopPriority) {
+      const showRemaining = barMode !== "used";
       const highlight = routing === "failover" ? acct.isPrimary : routing === "least-used" && isTopPriority;
       const card = ui.h("div", highlight ? "ggw-account-card is-primary" : "ggw-account-card");
       const head = ui.h("div", "ggw-account-head");
@@ -765,8 +777,14 @@ var authPanel = {
       ident.append(leftTags);
       const rightTags = ui.h("span", "ggw-tags");
       if (routing === "least-used" && acct.weeklyRemaining !== void 0) {
-        const tone = acct.weeklyRemaining <= 10 ? "bad" : acct.weeklyRemaining <= 25 ? "warn" : "primary";
-        rightTags.append(ui.h("span", `ggw-tag ${tone}`, t(`\u5468\u4F59 ${acct.weeklyRemaining}%`, `${acct.weeklyRemaining}% wk`)));
+        const weeklyRem = Math.min(Math.max(acct.weeklyRemaining, 0), 100);
+        const weeklyUsed = Math.round((100 - weeklyRem) * 10) / 10;
+        const tone = weeklyRem <= 10 ? "bad" : weeklyRem <= 25 ? "warn" : "primary";
+        rightTags.append(ui.h(
+          "span",
+          `ggw-tag ${tone}`,
+          showRemaining ? t(`\u5468\u4F59 ${weeklyRem}%`, `${weeklyRem}% wk`) : t(`\u5468\u7528 ${weeklyUsed}%`, `${weeklyUsed}% used`)
+        ));
       }
       if (protocol === "robin") {
         if (acct.termsStatus === "required") {
@@ -798,10 +816,22 @@ var authPanel = {
       meta.append(ui.h("span", "", formatShortExpiry(acct.expiresAt, zh)));
       if (routing === "failover") {
         if (acct.weeklyRemaining !== void 0) {
-          meta.append(ui.h("span", "mono", t(`\u5468\u5269\u4F59 ${acct.weeklyRemaining}%`, `Weekly left ${acct.weeklyRemaining}%`)));
+          const weeklyRem = Math.min(Math.max(acct.weeklyRemaining, 0), 100);
+          const weeklyUsed = Math.round((100 - weeklyRem) * 10) / 10;
+          meta.append(ui.h(
+            "span",
+            "mono",
+            showRemaining ? t(`\u5468\u5269\u4F59 ${weeklyRem}%`, `Weekly left ${weeklyRem}%`) : t(`\u5468\u5DF2\u7528 ${weeklyUsed}%`, `Weekly used ${weeklyUsed}%`)
+          ));
         }
         if (acct.fiveHourRemaining !== void 0) {
-          meta.append(ui.h("span", "mono", t(`5h \u5269\u4F59 ${acct.fiveHourRemaining}%`, `5h left ${acct.fiveHourRemaining}%`)));
+          const fiveRem = Math.min(Math.max(acct.fiveHourRemaining, 0), 100);
+          const fiveUsed = Math.round((100 - fiveRem) * 10) / 10;
+          meta.append(ui.h(
+            "span",
+            "mono",
+            showRemaining ? t(`5h \u5269\u4F59 ${fiveRem}%`, `5h left ${fiveRem}%`) : t(`5h \u5DF2\u7528 ${fiveUsed}%`, `5h used ${fiveUsed}%`)
+          ));
         }
       }
       const cardActions = ui.h("div", "ggw-account-actions");
@@ -859,7 +889,7 @@ var authPanel = {
       cardActions.append(reauthBtn, removeBtn);
       card.append(head);
       if (routing !== "failover") {
-        card.append(renderInlineWeeklyQuota(acct, routing));
+        card.append(renderInlineWeeklyQuota(acct, routing, barMode));
       }
       card.append(meta);
       if (acct.cooldownReason || acct.lastError) {
@@ -998,6 +1028,7 @@ var authPanel = {
         authLink.hidden = true;
         copyRow.hidden = true;
       }
+      const barMode = state.quotaBarMode === "used" ? "used" : "remaining";
       const minuteBucket = Math.floor(Date.now() / 3e4);
       const nextFp = JSON.stringify({
         working,
@@ -1005,6 +1036,7 @@ var authPanel = {
         protocol: state.protocol,
         routing,
         masked,
+        barMode,
         accounts: state.accounts,
         cdBucket: state.accounts.some((a) => a.cooldownUntil && a.cooldownUntil > Date.now()) ? minuteBucket : 0
       });
@@ -1027,6 +1059,7 @@ var authPanel = {
               state.protocol,
               masked,
               routing,
+              barMode,
               index,
               Boolean(topId && acct.id === topId && !(acct.cooldownUntil && acct.cooldownUntil > now))
             ))
@@ -1091,6 +1124,13 @@ var authPanel = {
       if (ev.kind === "gateway") {
         lastApiKeyFormKey = "";
         void refresh();
+      } else if (ev.kind === "quota-bar-mode") {
+        if (state) {
+          state = { ...state, quotaBarMode: ev.mode };
+          paint();
+        } else {
+          void refresh();
+        }
       } else if ((ev.kind === "mask" || ev.kind === "quota") && ev.source !== "auth") {
         void refresh();
       }
@@ -1113,6 +1153,7 @@ var quotaPanel = {
     root.classList.add("ggw-panel");
     let selectedAccountId = "all";
     let emailsMasked = true;
+    let quotaBarMode = "remaining";
     let accountRouting = "failover";
     let currentProtocol = "robin";
     let currentQuotaEndpoint = "";
@@ -1165,13 +1206,17 @@ var quotaPanel = {
       variant: "primary",
       onClick: () => void fetchQuota(true)
     });
+    const toggleBarModeBtn = ui.button(t("\u663E\u793A\uFF1A\u5269\u4F59\u989D\u5EA6", "Bars: Remaining"), {
+      size: "sm",
+      onClick: () => void toggleQuotaBarMode()
+    });
     const toggleMaskBtn = ui.button(t("\u663E\u793A\u8D26\u53F7\u540D", "Show account names"), {
       size: "sm",
       onClick: () => void toggleQuotaMask()
     });
     toggleMaskBtn.hidden = true;
     const planPill = ui.pill(t("\u672A\u67E5\u8BE2", "Idle"), "plain");
-    topBar.append(accountSelect, queryBtn, toggleMaskBtn, planPill);
+    topBar.append(accountSelect, queryBtn, toggleBarModeBtn, toggleMaskBtn, planPill);
     const cardsBox = ui.h("div", "ggw-quota-cards");
     const footnote = ui.h("div", "sh-desc");
     const message = ui.msgline();
@@ -1244,6 +1289,13 @@ var quotaPanel = {
     let loading = false;
     let waitingForAuth = false;
     let autoQueryDone = false;
+    function updateBarModeButton() {
+      toggleBarModeBtn.hidden = lastSnapshot?.supported === false;
+      toggleBarModeBtn.disabled = loading;
+      const showRemaining = quotaBarMode !== "used";
+      toggleBarModeBtn.textContent = showRemaining ? t("\u663E\u793A\uFF1A\u5269\u4F59\u989D\u5EA6", "Bars: Remaining") : t("\u663E\u793A\uFF1A\u5DF2\u7528\u7528\u91CF", "Bars: Used");
+      toggleBarModeBtn.title = showRemaining ? t("\u5F53\u524D\u8FDB\u5EA6\u6761\u6309\u5269\u4F59\u989D\u5EA6\u663E\u793A\uFF08\u6EE1\u683C\u8868\u793A\u4F59\u91CF\u5145\u8DB3\uFF09\uFF0C\u70B9\u51FB\u5207\u6362\u4E3A\u6309\u5DF2\u7528\u7528\u91CF\u663E\u793A", "Showing remaining quota (full bar = plenty left). Click to switch to used quota.") : t("\u5F53\u524D\u8FDB\u5EA6\u6761\u6309\u5DF2\u7528\u7528\u91CF\u663E\u793A\uFF08\u968F\u6D88\u8017\u9012\u589E\uFF09\uFF0C\u70B9\u51FB\u5207\u56DE\u6309\u5269\u4F59\u989D\u5EA6\u663E\u793A", "Showing used quota (grows with usage). Click to switch back to remaining quota.");
+    }
     function updateMaskButton() {
       const hasAccounts = Boolean(lastSnapshot?.accountOptions?.length);
       toggleMaskBtn.hidden = !hasAccounts;
@@ -1253,8 +1305,10 @@ var quotaPanel = {
     }
     function applyLabelsToSnapshot(labels) {
       emailsMasked = labels.emailsMasked;
+      quotaBarMode = labels.quotaBarMode === "used" ? "used" : "remaining";
       accountRouting = labels.accountRouting;
       if (!lastSnapshot) {
+        updateBarModeButton();
         updateMaskButton();
         return;
       }
@@ -1262,6 +1316,7 @@ var quotaPanel = {
       const next = {
         ...lastSnapshot,
         emailsMasked: labels.emailsMasked,
+        quotaBarMode: labels.quotaBarMode,
         accountRouting: labels.accountRouting,
         accountOptions: labels.accountOptions,
         ...lastSnapshot.accounts ? {
@@ -1275,6 +1330,24 @@ var quotaPanel = {
         } : {}
       };
       renderSnapshot(next);
+    }
+    async function toggleQuotaBarMode() {
+      if (loading || signal.aborted) return;
+      toggleBarModeBtn.disabled = true;
+      try {
+        const nextMode = quotaBarMode === "used" ? "remaining" : "used";
+        const res = await ctx.invoke("set-bar-mode", [{ name, mode: nextMode }]);
+        if (signal.aborted) return;
+        applyLabelsToSnapshot(res);
+        broadcastPanelSync({ kind: "quota-bar-mode", instanceName: name, mode: res.quotaBarMode });
+      } catch (err) {
+        if (!signal.aborted) {
+          message.textContent = err instanceof Error ? err.message : String(err);
+          message.classList.add("bad");
+        }
+      } finally {
+        if (!signal.aborted) updateBarModeButton();
+      }
     }
     async function toggleQuotaMask() {
       if (loading || signal.aborted) return;
@@ -1345,13 +1418,21 @@ var quotaPanel = {
       const head = ui.h("div", "ggw-qbar-head");
       const lbl = ui.h("span", "ggw-qbar-lbl", windowTitle(win.id, win.title));
       const val = ui.h("span", "ggw-qbar-val");
-      const remStrong = ui.h("b", "", t(`\u5269\u4F59 ${win.remainingPercent}%`, `${win.remainingPercent}% left`));
-      val.append(remStrong, t(` \xB7 \u5DF2\u7528 ${win.usedPercent}%`, ` \xB7 ${win.usedPercent}% used`));
+      const showRemaining = quotaBarMode !== "used";
+      const remaining = Math.min(Math.max(win.remainingPercent, 0), 100);
+      const used = Math.min(Math.max(win.usedPercent, 0), 100);
+      const mainStrong = ui.h(
+        "b",
+        "",
+        showRemaining ? t(`\u5269\u4F59 ${win.remainingPercent}%`, `${win.remainingPercent}% left`) : t(`\u5DF2\u7528 ${win.usedPercent}%`, `${win.usedPercent}% used`)
+      );
+      const subText = showRemaining ? t(` \xB7 \u5DF2\u7528 ${win.usedPercent}%`, ` \xB7 ${win.usedPercent}% used`) : t(` \xB7 \u5269\u4F59 ${win.remainingPercent}%`, ` \xB7 ${win.remainingPercent}% left`);
+      val.append(mainStrong, subText);
       head.append(lbl, val);
       const track = ui.h("div", "ggw-qbar-track");
       const fillTone = win.usedPercent >= 90 ? "ggw-qbar-fill bad" : win.usedPercent >= 75 ? "ggw-qbar-fill warn" : "ggw-qbar-fill";
       const fill = ui.h("div", fillTone);
-      fill.style.width = `${Math.min(Math.max(win.usedPercent, 0), 100)}%`;
+      fill.style.width = `${showRemaining ? remaining : used}%`;
       track.append(fill);
       bar.append(head, track);
       if (win.resetsAt) {
@@ -1416,11 +1497,15 @@ var quotaPanel = {
       if (typeof snap.emailsMasked === "boolean") {
         emailsMasked = snap.emailsMasked;
       }
+      if (snap.quotaBarMode === "used" || snap.quotaBarMode === "remaining") {
+        quotaBarMode = snap.quotaBarMode;
+      }
       if (snap.accountRouting) {
         accountRouting = snap.accountRouting;
       }
       cardsBox.replaceChildren();
       syncAccountSelect(snap);
+      updateBarModeButton();
       updateMaskButton();
       if (snap.authRequired) {
         waitingForAuth = true;
@@ -1485,6 +1570,7 @@ var quotaPanel = {
       loading = true;
       queryBtn.disabled = true;
       accountSelect.disabled = true;
+      toggleBarModeBtn.disabled = true;
       toggleMaskBtn.disabled = true;
       if (userInitiated) {
         message.textContent = t("\u6B63\u5728\u67E5\u8BE2\u989D\u5EA6\u2026", "Querying quota\u2026");
@@ -1518,6 +1604,7 @@ var quotaPanel = {
         loading = false;
         queryBtn.disabled = false;
         accountSelect.disabled = false;
+        updateBarModeButton();
         updateMaskButton();
       }
     }
