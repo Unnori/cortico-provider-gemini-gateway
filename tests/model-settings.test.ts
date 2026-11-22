@@ -193,6 +193,9 @@ describe('model declared formats and automatic pricing (opencode style)', () => 
       'application/octet-stream': false,
     });
     const settings = modelSettings(robinEntry, baseline);
+    expect(settings.estimateRobinTokens).toBe(true);
+    expect(modelSettings({ ...robinEntry, options: { ...robinEntry.options, estimateRobinTokens: false } }, baseline).estimateRobinTokens).toBe(false);
+    expect(modelSettings({ ...robinEntry, options: { protocol: 'gemini', authMode: 'api-key' } }, baseline).estimateRobinTokens).toBeNull();
     for (const kind of ['image', 'audio', 'video', 'file'] as const) {
       expect(settings.inputs.find(i => i.kind === kind)).toEqual({
         kind,

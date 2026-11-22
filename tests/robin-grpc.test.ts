@@ -632,15 +632,19 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
     const observedAt = '2026-11-21T01:05:40.000Z';
     const summary = buildRobinRouteSummary({
       model: 'gemini-robin-pro',
+      thinking: true,
+      reasoningEffort: 'low',
       userStatus: decoded,
       plan: 'Free',
       userTier: 'TIER_BASIC',
       observed: {
         requestedModel: 'gemini-robin-pro',
         requestedModeCategory: 3,
-        requestedThinkingLevel: 2,
+        requestedThinkingLevel: 1,
         resolvedModeCategory: 6,
+        resolvedThinkingLevel: 1,
         attribution: 'Used auto model selection',
+        thoughtChars: 0,
         downgradeReason: 2,
         observedAt,
       },
@@ -648,6 +652,9 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
     });
     expect(summary.officialEntitled).toBe(false);
     expect(summary.downgraded).toBe(true);
+    expect(summary.requestedThinkingLevel).toBe(1);
+    expect(summary.lastResolvedThinkingLevel).toBe(1);
+    expect(summary.lastThoughtChars).toBe(0);
     expect(summary.lastAttribution).toBe('Used auto model selection');
     expect(summary.lastObservedAt).toBe(observedAt);
     expect(summary.lastAccount).toBe('y***3@gmail.com');
@@ -740,7 +747,7 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
   });
 
   it('handles missing completed/grpc-status with idle timeout, preserves mid-stream pauses, and marks incomplete tool tags without executing them', async () => {
-    type Scenario = 'plain-text-stalled' | 'mid-stream-pause' | 'partial-tool-stalled' | 'closed-tool-stalled' | 'eof-without-trailers';
+    type Scenario = 'plain-text-stalled' | 'mid-stream-pause' | 'partial-tool-stalled' | 'closed-tool-stalled' | 'odd-quote-tool-stalled' | 'eof-without-trailers';
     let scenario: Scenario = 'plain-text-stalled';
     const openStreams: http2.ServerHttp2Stream[] = [];
     const server = http2.createServer();
@@ -807,6 +814,16 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
           })));
           return;
         }
+        if (scenario === 'odd-quote-tool-stalled') {
+          // Closed <tool_call> with an odd unescaped double quote inside string, stalled tail without completed=1.
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: '<tool_call>{"name":"wechat_send","args":{"text":"买了个 15" 屏幕"}}</tool_call>',
+            responseId: 'rc_odd_quote_tool',
+            attribution: 'Gemini 4 Neon',
+            completed: false,
+          })));
+          return;
+        }
         // eof-without-trailers: HTTP/2 END_STREAM arrives without completed=1 and without grpc-status trailer.
         stream.write(frameGrpcMessage(encodeProcessQueryResponse({
           text: '无 trailers 直接断开的正文',
@@ -824,12 +841,14 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
     const baseUrl = `http://127.0.0.1:${addr.port}`;
 
     try {
+      const repairedCalls: { name: string; strategy: string }[] = [];
       const client = new GatewayClient({
         baseUrl,
         protocol: 'robin',
         generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
         robinTextIdleTimeoutMs: 250,
         robinToolIdleTimeoutMs: 120,
+        onToolCallRepair: info => repairedCalls.push(info),
         auth: { accessToken: async () => 'fresh-token' },
       });
 
@@ -877,6 +896,19 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
         { functionCall: { name: 'pet_say', args: { script: '早安呀！' } } },
       ]);
       expect(res4.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+
+      // 4b. Closed <tool_call> with an odd unescaped quote stalled without completed=1 -> recovers cleanly at finish() with STOP.
+      scenario = 'odd-quote-tool-stalled';
+      const res4b = await consume(client.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'wechat_send', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'send screen size' }] }],
+      }));
+      expect(res4b.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { functionCall: { name: 'wechat_send', args: { text: '买了个 15" 屏幕' } } },
+      ]);
+      expect(res4b.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+      expect(repairedCalls).toEqual([{ name: 'wechat_send', strategy: 'lenient-json' }]);
 
       // 5. HTTP/2 stream ends cleanly without completed=1 and without grpc-status -> preserves text and marks incomplete.
       scenario = 'eof-without-trailers';

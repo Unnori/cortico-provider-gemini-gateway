@@ -326,6 +326,16 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
           host.save(name, next);
           return settingsFor(next);
         }
+        if (method === 'pricing-estimate') {
+          const enabled = raw.enabled;
+          if (configuration(entry).protocol !== 'robin' || typeof enabled !== 'boolean') {
+            throw new Error(en ? 'Invalid Robin token estimation setting' : '无效的 Robin 本地 Token 估算设置');
+          }
+          const next: LLMProviderEntry = { ...entry, options: { ...entry.options, estimateRobinTokens: enabled } };
+          configuration(next);
+          host.save(name, next);
+          return settingsFor(next);
+        }
         if (raw.model !== model) {
           throw new Error(en ? 'Model changed; refresh pricing before applying' : '模型已变更，请刷新后再应用计价');
         }

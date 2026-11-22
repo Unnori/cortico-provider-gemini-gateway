@@ -34,6 +34,7 @@ export interface InputCapabilities extends ModelInputs {
 export interface ModelSettings extends ModelInputs {
   automatic: boolean;
   mirrorSubscriptionSpend: boolean | null;
+  estimateRobinTokens: boolean | null;
   robinRoute?: RobinRouteSummary;
   definitions: PriceDefinition[];
   overrides: PriceDefinition[];
@@ -125,10 +126,12 @@ export function modelSettings(
   for (const def of matching) byBasis.set(def.basis, def);
   const { accepts: _accepts, ...inputs } = inputCapabilities(entry, meta);
   const mirrorSubscriptionSpend = cfg.protocol === 'robin' ? cfg.mirrorSubscriptionSpend === true : null;
+  const estimateRobinTokens = cfg.protocol === 'robin' ? cfg.estimateRobinTokens !== false : null;
   return {
     ...inputs,
     automatic: !matching.length,
     mirrorSubscriptionSpend,
+    estimateRobinTokens,
     ...(robinRoute ? { robinRoute } : {}),
     definitions: [...byBasis.values()],
     overrides,

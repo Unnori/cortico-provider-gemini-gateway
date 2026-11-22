@@ -31,6 +31,7 @@ export interface GatewayConfiguration extends GatewayClientOptions {
   inputVideo?: boolean;
   inputFiles?: boolean;
   mirrorSubscriptionSpend?: boolean;
+  estimateRobinTokens?: boolean;
 }
 
 export function option(entry: LLMProviderEntry, key: string): string | undefined {
@@ -94,6 +95,7 @@ export function configuration(entry: LLMProviderEntry): GatewayConfiguration {
   const inputVideo = boolOpt('inputVideo');
   const inputFiles = boolOpt('inputFiles');
   const mirrorSubscriptionSpend = boolOpt('mirrorSubscriptionSpend');
+  const estimateRobinTokens = boolOpt('estimateRobinTokens');
   const apiKeyConfigured = boolOpt('apiKeyConfigured');
   const headers = stringMap(entry.options?.headers, 'Gateway headers');
   const secretHeaders = stringMap(entry.options?.secretHeaders, 'Gateway secretHeaders');
@@ -124,6 +126,7 @@ export function configuration(entry: LLMProviderEntry): GatewayConfiguration {
     inputVideo,
     inputFiles,
     mirrorSubscriptionSpend,
+    estimateRobinTokens,
   };
 }
 

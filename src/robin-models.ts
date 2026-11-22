@@ -15,12 +15,15 @@ export interface RobinRouteSummary {
   userTier?: string;
   policy?: string;
   requestedModeCategory?: number;
+  requestedThinkingLevel?: number;
   officialEntitled?: boolean;
   officialLabel?: string;
   lastAttribution?: string;
   lastObservedAt?: string;
   lastAccount?: string;
   lastResolvedModeCategory?: number;
+  lastResolvedThinkingLevel?: number;
+  lastThoughtChars?: number;
   lastDowngradeReason?: number;
   lastFallback?: number;
   downgraded?: boolean;
@@ -217,6 +220,8 @@ export function robinCatalogLookupIds(
 
 export function buildRobinRouteSummary(opts: {
   model: string;
+  thinking?: boolean;
+  reasoningEffort?: string;
   userStatus?: RobinUserStatus | null;
   plan?: string;
   userTier?: string;
@@ -224,8 +229,8 @@ export function buildRobinRouteSummary(opts: {
   observedAccount?: string;
   overrideModeCategory?: number;
 }): RobinRouteSummary {
-  const { model, userStatus, plan, userTier, observed, observedAccount, overrideModeCategory } = opts;
-  const resolved = resolveRobinMode(model, true, undefined, overrideModeCategory);
+  const { model, thinking, reasoningEffort, userStatus, plan, userTier, observed, observedAccount, overrideModeCategory } = opts;
+  const resolved = resolveRobinMode(model, thinking ?? true, reasoningEffort, overrideModeCategory);
   const official = userStatus?.modes.find(m => m.modelId === geminiModelId(model) || m.modeCategory === resolved.modeCategory);
   const downgraded = Boolean(
     observed && (
@@ -236,17 +241,21 @@ export function buildRobinRouteSummary(opts: {
         && observed.resolvedModeCategory !== observed.requestedModeCategory)
     ),
   );
+  const requestedThinkingLevel = observed?.requestedThinkingLevel ?? resolved.thinkingLevel;
   return {
     ...(plan ? { plan } : {}),
     ...(userTier ? { userTier } : {}),
     ...(userStatus?.policy ? { policy: userStatus.policy } : {}),
     ...(resolved.modeCategory !== undefined ? { requestedModeCategory: resolved.modeCategory } : {}),
+    ...(requestedThinkingLevel !== undefined ? { requestedThinkingLevel } : {}),
     ...(userStatus ? { officialEntitled: Boolean(official) } : {}),
     ...(official ? { officialLabel: `${official.modelName} (mode ${official.modeCategory})` } : {}),
     ...(observed?.attribution ? { lastAttribution: observed.attribution } : {}),
     ...(observed?.observedAt ? { lastObservedAt: observed.observedAt } : {}),
     ...(observedAccount ? { lastAccount: observedAccount } : {}),
     ...(observed?.resolvedModeCategory !== undefined ? { lastResolvedModeCategory: observed.resolvedModeCategory } : {}),
+    ...(observed?.resolvedThinkingLevel !== undefined ? { lastResolvedThinkingLevel: observed.resolvedThinkingLevel } : {}),
+    ...(observed?.thoughtChars !== undefined ? { lastThoughtChars: observed.thoughtChars } : {}),
     ...(observed?.downgradeReason !== undefined ? { lastDowngradeReason: observed.downgradeReason } : {}),
     ...(observed?.fallback !== undefined ? { lastFallback: observed.fallback } : {}),
     ...(observed ? { downgraded } : {}),

@@ -58,7 +58,7 @@ const TOOL_CLOSE = '</tool_call>';
 const TOOL_CALL_FORMAT = 'To call a declared function, emit <tool_call>{"name":"function_name","args":{}}</tool_call> with a JSON object for args.';
 const ROBIN_TOOL_PROTOCOL = [
   TOOL_CALL_FORMAT,
-  'Native function calling is unavailable here; express every tool invocation as a <tool_call>{"name":"function_name","args":{}}</tool_call> tag with valid JSON (escape backslashes as \\\\ inside strings, e.g. LaTeX or hex escapes).',
+  'Native function calling is unavailable here; express every tool invocation as a <tool_call>{"name":"function_name","args":{}}</tool_call> tag with valid JSON (escape double quotes as \\" and backslashes as \\\\ inside strings).',
   'Emit multiple tool calls for the same step back-to-back with no text between </tool_call> and the next <tool_call>.',
   'Never fabricate tool results, follow-up turns, or transcript role labels, and never repeat tool arguments as plain text.',
   'Finish your response right after the last </tool_call> of this single step so the caller can execute it and return the real output.',
@@ -325,6 +325,15 @@ export async function toRobinRequest(request: GeminiRequest, upload?: UploadAtta
 
 const HEX4 = /^[0-9a-fA-F]{4}$/;
 const VALID_JSON_ESCAPES = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't']);
+const JSON_NUMBER_STICKY = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+
+export type ToolCallRepairStrategy = 'strict' | 'escape-repair' | 'lenient-json';
+
+function stripJsonCodeFence(raw: string): string {
+  const trimmed = raw.trim();
+  const match = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(trimmed);
+  return match ? match[1].trim() : trimmed;
+}
 
 /**
  * Repairs common LLM JSON-string escaping mistakes inside a closed `<tool_call>` payload
@@ -383,23 +392,331 @@ function repairToolCallJson(payload: string): string {
   return out;
 }
 
-function parseCall(payload: string): FunctionCall | undefined {
-  const decode = (raw: string): FunctionCall | undefined => {
-    const call = record(JSON.parse(raw));
-    const args = record(call?.args) ?? record(call?.arguments);
-    if (typeof call?.name === 'string' && call.name.trim() && args) {
-      return { name: call.name, args, ...(typeof call.id === 'string' && call.id ? { id: call.id } : {}) };
-    }
-    return undefined;
-  };
-  try {
-    return decode(payload);
-  } catch {
-    try {
-      return decode(repairToolCallJson(payload));
-    } catch { /* Invalid tags are returned as text. */ }
+type StringContext = 'key' | 'object_value' | 'array_item';
+
+interface LenientParseResult {
+  value: unknown;
+  pos: number;
+  oddQuoteStrings: number;
+}
+
+function skipJsonWs(src: string, pos: number): number {
+  while (pos < src.length) {
+    const code = src.charCodeAt(pos);
+    if (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d) pos += 1;
+    else break;
   }
+  return pos;
+}
+
+function isJsonValueStart(ch: string | undefined): boolean {
+  if (!ch) return false;
+  return ch === '"' || ch === '{' || ch === '[' || ch === '-' || ch === 't' || ch === 'f' || ch === 'n'
+    || (ch >= '0' && ch <= '9');
+}
+
+function buildPlainObject(entries: [string, unknown][]): Record<string, unknown> {
+  const obj: Record<string, unknown> = {};
+  for (const [k, v] of entries) {
+    Object.defineProperty(obj, k, { value: v, enumerable: true, writable: true, configurable: true });
+  }
+  return obj;
+}
+
+function* parseLenientString(
+  src: string,
+  pos: number,
+  context: StringContext,
+  budget: { steps: number; maxSteps: number },
+): Generator<LenientParseResult> {
+  if (src[pos] !== '"') return;
+  let i = pos + 1;
+  let buf = '';
+  let unescapedInteriorQuotes = 0;
+
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === '\\') {
+      const next = src[i + 1];
+      if (next === undefined) return;
+      if (next === '"') { buf += '"'; i += 2; continue; }
+      if (next === '\\') { buf += '\\'; i += 2; continue; }
+      if (next === '/') { buf += '/'; i += 2; continue; }
+      if (next === 'b') { buf += '\b'; i += 2; continue; }
+      if (next === 'f') { buf += '\f'; i += 2; continue; }
+      if (next === 'n') { buf += '\n'; i += 2; continue; }
+      if (next === 'r') { buf += '\r'; i += 2; continue; }
+      if (next === 't') { buf += '\t'; i += 2; continue; }
+      if (next === 'u') {
+        const hex = src.slice(i + 2, i + 6);
+        if (HEX4.test(hex)) {
+          buf += String.fromCharCode(Number.parseInt(hex, 16));
+          i += 6;
+          continue;
+        }
+      }
+      buf += '\\' + next;
+      i += 2;
+      continue;
+    }
+
+    if (ch === '"') {
+      const afterWs = skipJsonWs(src, i + 1);
+      const nextCh = src[afterWs];
+      let canClose = false;
+      if (context === 'key') {
+        canClose = nextCh === ':';
+      } else if (context === 'object_value') {
+        if (nextCh === '}') {
+          canClose = true;
+        } else if (nextCh === ',') {
+          const afterComma = skipJsonWs(src, afterWs + 1);
+          canClose = src[afterComma] === '"' || src[afterComma] === '}';
+        }
+      } else if (nextCh === ']') {
+        canClose = true;
+      } else if (nextCh === ',') {
+        const afterComma = skipJsonWs(src, afterWs + 1);
+        canClose = isJsonValueStart(src[afterComma]) || src[afterComma] === ']';
+      }
+
+      if (canClose) {
+        if (++budget.steps > budget.maxSteps) return;
+        yield {
+          value: buf,
+          pos: i + 1,
+          oddQuoteStrings: unescapedInteriorQuotes % 2,
+        };
+      }
+
+      buf += '"';
+      unescapedInteriorQuotes += 1;
+      i += 1;
+      continue;
+    }
+
+    buf += ch;
+    i += 1;
+  }
+}
+
+function* parseLenientObject(
+  src: string,
+  pos: number,
+  depth: number,
+  budget: { steps: number; maxSteps: number },
+): Generator<LenientParseResult> {
+  if (depth > 32 || src[pos] !== '{') return;
+  const firstPos = skipJsonWs(src, pos + 1);
+  if (src[firstPos] === '}') {
+    yield { value: {}, pos: firstPos + 1, oddQuoteStrings: 0 };
+    return;
+  }
+
+  function* parseEntries(
+    curPos: number,
+    entries: [string, unknown][],
+    oddSum: number,
+  ): Generator<LenientParseResult> {
+    curPos = skipJsonWs(src, curPos);
+    if (++budget.steps > budget.maxSteps) return;
+    if (src[curPos] === '}') {
+      yield { value: buildPlainObject(entries), pos: curPos + 1, oddQuoteStrings: oddSum };
+      return;
+    }
+    if (src[curPos] !== '"') return;
+    for (const keyRes of parseLenientString(src, curPos, 'key', budget)) {
+      const colonPos = skipJsonWs(src, keyRes.pos);
+      if (src[colonPos] !== ':') continue;
+      for (const valRes of parseLenientValue(src, colonPos + 1, 'object_value', depth + 1, budget)) {
+        const nextPos = skipJsonWs(src, valRes.pos);
+        const nextEntries: [string, unknown][] = [...entries, [keyRes.value as string, valRes.value]];
+        const nextOdd = oddSum + keyRes.oddQuoteStrings + valRes.oddQuoteStrings;
+        if (src[nextPos] === '}') {
+          yield { value: buildPlainObject(nextEntries), pos: nextPos + 1, oddQuoteStrings: nextOdd };
+        } else if (src[nextPos] === ',') {
+          yield* parseEntries(nextPos + 1, nextEntries, nextOdd);
+        }
+      }
+    }
+  }
+
+  yield* parseEntries(firstPos, [], 0);
+}
+
+function* parseLenientArray(
+  src: string,
+  pos: number,
+  depth: number,
+  budget: { steps: number; maxSteps: number },
+): Generator<LenientParseResult> {
+  if (depth > 32 || src[pos] !== '[') return;
+  const firstPos = skipJsonWs(src, pos + 1);
+  if (src[firstPos] === ']') {
+    yield { value: [], pos: firstPos + 1, oddQuoteStrings: 0 };
+    return;
+  }
+
+  function* parseItems(
+    curPos: number,
+    items: unknown[],
+    oddSum: number,
+  ): Generator<LenientParseResult> {
+    curPos = skipJsonWs(src, curPos);
+    if (++budget.steps > budget.maxSteps) return;
+    if (src[curPos] === ']') {
+      yield { value: items, pos: curPos + 1, oddQuoteStrings: oddSum };
+      return;
+    }
+    for (const valRes of parseLenientValue(src, curPos, 'array_item', depth + 1, budget)) {
+      const nextPos = skipJsonWs(src, valRes.pos);
+      const nextItems = [...items, valRes.value];
+      const nextOdd = oddSum + valRes.oddQuoteStrings;
+      if (src[nextPos] === ']') {
+        yield { value: nextItems, pos: nextPos + 1, oddQuoteStrings: nextOdd };
+      } else if (src[nextPos] === ',') {
+        yield* parseItems(nextPos + 1, nextItems, nextOdd);
+      }
+    }
+  }
+
+  yield* parseItems(firstPos, [], 0);
+}
+
+function* parseLenientValue(
+  src: string,
+  pos: number,
+  context: StringContext,
+  depth: number,
+  budget: { steps: number; maxSteps: number },
+): Generator<LenientParseResult> {
+  pos = skipJsonWs(src, pos);
+  if (depth > 32 || ++budget.steps > budget.maxSteps || pos >= src.length) return;
+  const ch = src[pos];
+  if (ch === '"') {
+    yield* parseLenientString(src, pos, context, budget);
+    return;
+  }
+  if (ch === '{') {
+    yield* parseLenientObject(src, pos, depth, budget);
+    return;
+  }
+  if (ch === '[') {
+    yield* parseLenientArray(src, pos, depth, budget);
+    return;
+  }
+  if (ch === 't' && src.startsWith('true', pos)) {
+    yield { value: true, pos: pos + 4, oddQuoteStrings: 0 };
+    return;
+  }
+  if (ch === 'f' && src.startsWith('false', pos)) {
+    yield { value: false, pos: pos + 5, oddQuoteStrings: 0 };
+    return;
+  }
+  if (ch === 'n' && src.startsWith('null', pos)) {
+    yield { value: null, pos: pos + 4, oddQuoteStrings: 0 };
+    return;
+  }
+  if (ch === '-' || (ch >= '0' && ch <= '9')) {
+    JSON_NUMBER_STICKY.lastIndex = pos;
+    const match = JSON_NUMBER_STICKY.exec(src);
+    if (match) {
+      const num = Number(match[0]);
+      if (Number.isFinite(num)) {
+        yield { value: num, pos: pos + match[0].length, oddQuoteStrings: 0 };
+      }
+    }
+  }
+}
+
+/**
+ * Structural fallback JSON object parser for closed `<tool_call>` payloads when strict `JSON.parse`
+ * and escape repair both fail — primarily rescuing unescaped ASCII double quotes inside string
+ * values (e.g. `` `inputSupport.model: "gemini-4-neon"` `` or embedded JSON snippets) as well as
+ * trailing commas and invalid escapes. Still rejects truncated/unbalanced payloads safely.
+ */
+function parseLenientJsonObject(raw: string): Record<string, unknown> | undefined {
+  const start = skipJsonWs(raw, 0);
+  if (raw[start] !== '{') return undefined;
+  const budget = { steps: 0, maxSteps: 8192 };
+  let best: LenientParseResult | undefined;
+  let validMatches = 0;
+  for (const res of parseLenientObject(raw, start, 0, budget)) {
+    if (skipJsonWs(raw, res.pos) !== raw.length) continue;
+    validMatches += 1;
+    if (!best || res.oddQuoteStrings < best.oddQuoteStrings) {
+      best = res;
+      if (best.oddQuoteStrings === 0) break;
+    }
+    if (validMatches >= 8) break;
+  }
+  return record(best?.value);
+}
+
+function parseJsonObjectWithRepair(raw: string): { object: Record<string, unknown>; strategy: ToolCallRepairStrategy } | undefined {
+  try {
+    const parsed = record(JSON.parse(raw));
+    if (parsed) return { object: parsed, strategy: 'strict' };
+  } catch { /* fall through */ }
+
+  const cleaned = stripJsonCodeFence(raw);
+  if (cleaned !== raw) {
+    try {
+      const parsed = record(JSON.parse(cleaned));
+      if (parsed) return { object: parsed, strategy: 'escape-repair' };
+    } catch { /* fall through */ }
+  }
+
+  try {
+    const parsed = record(JSON.parse(repairToolCallJson(cleaned)));
+    if (parsed) return { object: parsed, strategy: 'escape-repair' };
+  } catch { /* fall through */ }
+
+  const lenient = parseLenientJsonObject(cleaned);
+  if (lenient) return { object: lenient, strategy: 'lenient-json' };
   return undefined;
+}
+
+function extractCall(call: Record<string, unknown> | undefined): FunctionCall | undefined {
+  if (!call || typeof call.name !== 'string' || !call.name.trim()) return undefined;
+  const hasArgs = 'args' in call;
+  const hasArguments = 'arguments' in call;
+  let args = record(call.args) ?? record(call.arguments);
+  if (!args) {
+    const rawArgsStr = typeof call.args === 'string'
+      ? call.args
+      : typeof call.arguments === 'string'
+        ? call.arguments
+        : undefined;
+    if (rawArgsStr !== undefined) {
+      args = parseJsonObjectWithRepair(rawArgsStr)?.object;
+    }
+  }
+  if (!args && !hasArgs && !hasArguments) {
+    const extraKeys = Object.keys(call).filter(key => key !== 'name' && key !== 'id');
+    if (extraKeys.length === 0) args = {};
+  }
+  if (!args) return undefined;
+  return {
+    name: call.name.trim(),
+    args,
+    ...(typeof call.id === 'string' && call.id ? { id: call.id } : {}),
+  };
+}
+
+function parseCallDetailed(payload: string): { call: FunctionCall; strategy: ToolCallRepairStrategy } | undefined {
+  const parsed = parseJsonObjectWithRepair(payload);
+  if (!parsed) return undefined;
+  const call = extractCall(parsed.object);
+  if (!call) return undefined;
+  return { call, strategy: parsed.strategy };
+}
+
+function hasOrphanCloseBeforeOpen(text: string): boolean {
+  const nextClose = text.indexOf(TOOL_CLOSE);
+  if (nextClose < 0) return false;
+  const nextOpen = text.indexOf(TOOL_OPEN);
+  return nextOpen < 0 || nextClose < nextOpen;
 }
 
 /** Retains only a possible opening tag prefix or the current tool block across text deltas. */
@@ -409,10 +726,21 @@ export class ToolCallStream {
   private quoted = false;
   private escaped = false;
   private closing = 0;
+  private unrecoveredMarkup = false;
+  private readonly onRepair?: (info: { name: string; strategy: ToolCallRepairStrategy }) => void;
+
+  constructor(options?: { onRepair?: (info: { name: string; strategy: ToolCallRepairStrategy }) => void }) {
+    this.onRepair = options?.onRepair;
+  }
 
   /** True when an opening `<tool_call>` (or partial `<tool_call` prefix) has not yet closed with `</tool_call>`. */
   get hasPendingToolMarkup(): boolean {
     return this.tool !== undefined || this.prefix.length > 0;
+  }
+
+  /** True after `finish()` if any unclosed `<tool_call` markup remained unrecovered. */
+  get hadUnrecoveredToolMarkup(): boolean {
+    return this.unrecoveredMarkup;
   }
 
   feed(text: string): GeminiPart[] {
@@ -451,8 +779,15 @@ export class ToolCallStream {
         } else {
           this.closing = char === TOOL_CLOSE[this.closing] ? this.closing + 1 : Number(char === '<');
           if (this.closing === TOOL_CLOSE.length) {
-            const functionCall = parseCall(this.tool.slice(0, -TOOL_CLOSE.length));
-            parts.push(functionCall ? { functionCall } : { text: TOOL_OPEN + this.tool });
+            const parsed = parseCallDetailed(this.tool.slice(0, -TOOL_CLOSE.length));
+            if (parsed) {
+              if (parsed.strategy !== 'strict') {
+                this.onRepair?.({ name: parsed.call.name, strategy: parsed.strategy });
+              }
+              parts.push({ functionCall: parsed.call });
+            } else {
+              parts.push({ text: TOOL_OPEN + this.tool });
+            }
             this.tool = undefined;
             this.closing = 0;
           }
@@ -463,12 +798,47 @@ export class ToolCallStream {
   }
 
   finish(): GeminiPart[] {
-    const text = this.tool === undefined ? this.prefix : TOOL_OPEN + this.tool;
+    const pendingTool = this.tool;
+    const pendingPrefix = this.prefix;
     this.prefix = '';
     this.tool = undefined;
     this.quoted = this.escaped = false;
     this.closing = 0;
-    return text ? [{ text }] : [];
+    this.unrecoveredMarkup = false;
+
+    if (pendingTool === undefined) {
+      if (pendingPrefix) {
+        this.unrecoveredMarkup = true;
+        return [{ text: pendingPrefix }];
+      }
+      return [];
+    }
+
+    // If an odd unescaped quote inside a string inverted `this.quoted`, `feed()` skipped past
+    // the real `</tool_call>` tag. Recover closed `<tool_call>` blocks cleanly at end-of-stream.
+    let searchFrom = 0;
+    while (searchFrom < pendingTool.length) {
+      const closeIdx = pendingTool.indexOf(TOOL_CLOSE, searchFrom);
+      if (closeIdx < 0) break;
+      searchFrom = closeIdx + TOOL_CLOSE.length;
+      const remainder = pendingTool.slice(searchFrom);
+      if (hasOrphanCloseBeforeOpen(remainder)) continue;
+      const parsed = parseCallDetailed(pendingTool.slice(0, closeIdx));
+      if (!parsed) continue;
+      if (parsed.strategy !== 'strict') {
+        this.onRepair?.({ name: parsed.call.name, strategy: parsed.strategy });
+      }
+      const parts: GeminiPart[] = [{ functionCall: parsed.call }];
+      if (remainder) {
+        const sub = new ToolCallStream(this.onRepair ? { onRepair: this.onRepair } : undefined);
+        parts.push(...sub.feed(remainder), ...sub.finish());
+        this.unrecoveredMarkup = sub.hadUnrecoveredToolMarkup;
+      }
+      return parts;
+    }
+
+    this.unrecoveredMarkup = true;
+    return [{ text: TOOL_OPEN + pendingTool }];
   }
 }
 

@@ -235,12 +235,46 @@ describe('gateway WebUI browser OAuth, persistence, direct call, and quota panel
       // 4. Save under a real endpoint name and invoke directly (no re-login or restart needed).
       currentName = 'my-robin';
       const savedInstance = makeInstance('my-robin', currentEntry);
-      const generation = await savedInstance.client.respond({
+      const quoteDefs = provider.prices!(currentEntry, { model: 'gemini-4-hydrogen' });
+      const generation = await savedInstance.client.respond(
+        { model: 'gemini-4-hydrogen', input: '9 * 7 = ?' },
+        {
+          quote: ({ startedAt }) => quoteDefs.map((def, idx) => ({
+            id: `q_${idx}`,
+            currency: def.currency,
+            basis: def.basis,
+            rules: def.rules,
+            source: def.source ?? 'test',
+            capturedAt: startedAt,
+          })),
+        },
+      );
+      expect(generation.response.status).toBe('completed');
+      expect(JSON.stringify(generation.response.output)).toContain('63');
+      // Robin local token estimation is enabled by default so input/output tokens and spend estimates count cleanly (cache hits = 0).
+      const estMeters = generation.attempts[0].meters;
+      expect(estMeters.input).toBeGreaterThan(0);
+      expect(estMeters.output).toBeGreaterThan(0);
+      expect(estMeters.cachedInput).toBe(0);
+      expect(estMeters.uncachedInput).toBe(estMeters.input);
+      expect(estMeters.native).toMatchObject({ estimated: true, source: 'robin-local-estimate' });
+      expect(generation.attempts[0].charges[0]?.amount).toBeGreaterThan(0);
+      expect(generation.attempts[0].charges[0]?.missing).toEqual([]);
+
+      // Disabling the pricing-estimate checkbox restores null meters on subsequent calls.
+      const disabledEst = await ui.invoke!('model-settings', 'pricing-estimate', [{
+        name: 'my-robin',
+        enabled: false,
+      }]) as { estimateRobinTokens: boolean | null };
+      expect(disabledEst.estimateRobinTokens).toBe(false);
+      const savedWithoutEst = makeInstance('my-robin', currentEntry);
+      const genNoEst = await savedWithoutEst.client.respond({
         model: 'gemini-4-hydrogen',
         input: '9 * 7 = ?',
       });
-      expect(generation.response.status).toBe('completed');
-      expect(JSON.stringify(generation.response.output)).toContain('63');
+      expect(genNoEst.attempts[0].meters.input).toBeNull();
+      expect(genNoEst.attempts[0].meters.output).toBeNull();
+      expect(genNoEst.attempts[0].meters.cachedInput).toBeNull();
 
       // 5. Switch presets & options cleanly — baseUrl switches automatically with protocol!
       const geminiState = await ui.invoke!('gateway', 'apply-preset', [{ name: 'my-robin', preset: 'gemini' }]) as GatewayPanelState;

@@ -446,6 +446,7 @@ export interface RobinRoutingObservation {
   resolvedModeCategory?: number;
   resolvedThinkingLevel?: number;
   attribution?: string;
+  thoughtChars?: number;
   fallback?: number;
   downgradeReason?: number;
   observedAt: string;

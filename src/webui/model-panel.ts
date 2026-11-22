@@ -19,6 +19,15 @@ function formatObservedTime(iso: string | undefined): { short: string; full: str
   };
 }
 
+function formatThinkingLevel(level: number | undefined, en: boolean, zhHant: boolean): string | undefined {
+  if (level === undefined || !Number.isFinite(level)) return undefined;
+  if (level === 0) return en ? 'Off (0)' : zhHant ? '關 (0)' : '关 (0)';
+  if (level === 1) return en ? 'Low (1)' : 'Low / 快 (1)';
+  if (level === 4) return en ? 'Medium (4)' : zhHant ? 'Medium / 標準 (4)' : 'Medium / 标准 (4)';
+  if (level === 2) return en ? 'High (2)' : 'High / 深入 (2)';
+  return `level ${level}`;
+}
+
 export const modelSettingsPanel: WebUiPanel = {
   mount: async (ctx: WebUiPanelContext) => {
     const en = ctx.language !== 'zh' && ctx.language !== 'zh-Hant';
@@ -71,6 +80,17 @@ export const modelSettingsPanel: WebUiPanel = {
       : zhHant
         ? '對新呼叫生效。金額為訂閱估算，手動設定的實際支出費率優先。'
         : '对新调用生效。金额为订阅估算，手动设置的实际支出费率优先。';
+    const estimateTitle = en
+      ? 'Local Robin token estimate (estimated, not measured)'
+      : zhHant
+        ? '啟用本地 Token 估算兜底（估測值，非實測）'
+        : '启用本地 Token 估算兜底（估测值，非实测）';
+    const estimateBadgeText = en ? 'Estimated' : zhHant ? '估測值' : '估测值';
+    const estimateHint = en
+      ? 'Approximate estimate only, not upstream measurements: Robin protocol does not report token counts or cache hits. Estimates input/output tokens from prompt and visible reply text locally (cache hits are not counted; hidden reasoning tokens are excluded) so cumulative token stats and spend estimates work.'
+      : zhHant
+        ? '⚠️ 此項為本機近似估測值，並非 Google 上游實測數據：Robin 協議本身不下發 Token 與快取命中；開啟後按實際收發文本估算輸入輸出 Token（快取命中不計數，不含隱藏思考 Token），以使累計用量與折算金額正常累計。'
+        : '⚠️ 此项为本机近似估测值，并非 Google 上游实测数据：Robin 协议本身不下发 Token 与缓存命中；开启后按实际收发文本估算输入输出 Token（缓存命中不计数，不含隐藏思考 Token），以使累计用量与折算金额正常累计。';
 
     const advanced = ui.h('details', 'ggw-details pricing-rules');
     const raw = ui.textarea({ rows: 10, cls: 'mono' });
@@ -146,27 +166,57 @@ export const modelSettingsPanel: WebUiPanel = {
         } else if (r.officialEntitled === false) {
           parts.push(en ? 'Not in account official picker (routed by backend tier)' : '不在该账号官方下拉列表（由后端按套餐权益路由）');
         }
-        let observedTitle = '';
-        if (r.lastAttribution) {
-          const obsTime = formatObservedTime(r.lastObservedAt);
-          if (obsTime) observedTitle = obsTime.full;
+        const titleParts: string[] = [];
+        const obsTime = formatObservedTime(r.lastObservedAt);
+        if (obsTime) {
+          titleParts.push(en ? `Last routed at ${obsTime.full}` : zhHant ? `最近實測時間：${obsTime.full}` : `最近实测时间：${obsTime.full}`);
+        }
+        const resolvedThinkLabel = formatThinkingLevel(r.lastResolvedThinkingLevel, en, zhHant);
+        const requestedThinkLabel = formatThinkingLevel(r.requestedThinkingLevel, en, zhHant);
+        if (resolvedThinkLabel && requestedThinkLabel && r.lastResolvedThinkingLevel !== r.requestedThinkingLevel) {
+          titleParts.push(en
+            ? `Thinking: requested ${requestedThinkLabel} → actual ${resolvedThinkLabel}`
+            : zhHant
+              ? `思考等級：請求 ${requestedThinkLabel} → 實測 ${resolvedThinkLabel}`
+              : `思考等级：请求 ${requestedThinkLabel} → 实测 ${resolvedThinkLabel}`);
+        }
+        if (r.lastThoughtChars !== undefined) {
+          titleParts.push(en
+            ? `Thought stream: ${r.lastThoughtChars} chars`
+            : zhHant
+              ? `思考流：${r.lastThoughtChars} 字元`
+              : `思考流：${r.lastThoughtChars} 字符`);
+        }
+        if (r.lastAttribution || resolvedThinkLabel) {
           const tags: string[] = [];
           if (r.downgraded) tags.push(en ? 'downgraded' : zhHant ? '已降級/回落' : '已降级/回落');
+          if (resolvedThinkLabel) {
+            const clampedNote = requestedThinkLabel && r.lastResolvedThinkingLevel !== r.requestedThinkingLevel
+              ? (en ? `, req ${requestedThinkLabel}` : zhHant ? `，請求 ${requestedThinkLabel}` : `，请求 ${requestedThinkLabel}`)
+              : '';
+            tags.push(en
+              ? `thinking: ${resolvedThinkLabel}${clampedNote}`
+              : zhHant
+                ? `實測思考：${resolvedThinkLabel}${clampedNote}`
+                : `实测思考：${resolvedThinkLabel}${clampedNote}`);
+          }
           if (obsTime) tags.push(obsTime.short);
           if (r.lastAccount) tags.push(r.lastAccount);
           const suffix = tags.length
             ? (en ? ` (${tags.join(' · ')})` : `（${tags.join(' · ')}）`)
             : '';
-          parts.push(en
-            ? `Last actual model: ${r.lastAttribution}${suffix}`
-            : zhHant
-              ? `最近實測歸屬：${r.lastAttribution}${suffix}`
-              : `最近实测归属：${r.lastAttribution}${suffix}`);
+          if (r.lastAttribution) {
+            parts.push(en
+              ? `Last actual model: ${r.lastAttribution}${suffix}`
+              : zhHant
+                ? `最近實測歸屬：${r.lastAttribution}${suffix}`
+                : `最近实测归属：${r.lastAttribution}${suffix}`);
+          } else {
+            parts.push(tags.join(' · '));
+          }
         }
         routeNote.textContent = parts.join(' · ');
-        routeNote.title = observedTitle
-          ? (en ? `Last routed at ${observedTitle}` : zhHant ? `最近實測時間：${observedTitle}` : `最近实测时间：${observedTitle}`)
-          : '';
+        routeNote.title = titleParts.join(' · ');
         routeNote.hidden = !parts.length;
       } else {
         routeNote.textContent = '';
@@ -216,16 +266,53 @@ export const modelSettingsPanel: WebUiPanel = {
       }
 
       mirror.replaceChildren();
-      if (typeof next.mirrorSubscriptionSpend === 'boolean') {
-        const toggle = ui.h('input', 'connection-switch');
-        toggle.type = 'checkbox';
-        toggle.checked = next.mirrorSubscriptionSpend;
-        toggle.setAttribute('role', 'switch');
-        toggle.setAttribute('aria-label', mirrorTitle);
-        toggle.addEventListener('change', () => void saveSwitch('pricing-mirror', toggle), { signal: ctx.signal });
-        const wrapper = ui.field(mirrorTitle, toggle);
-        wrapper.classList.add('connection-toggle');
-        mirror.append(wrapper, ui.h('p', 'tdesc', mirrorHint));
+      if (typeof next.mirrorSubscriptionSpend === 'boolean' || typeof next.estimateRobinTokens === 'boolean') {
+        const robinBillingBox = ui.h('div', 'ggw-account-card');
+        robinBillingBox.style.cssText = 'display:grid;gap:10px;margin:6px 0 10px';
+
+        const controlsRow = ui.h('div');
+        controlsRow.style.cssText = 'display:flex;flex-wrap:wrap;gap:12px 24px;align-items:center';
+
+        if (typeof next.estimateRobinTokens === 'boolean') {
+          const check = ui.h('input');
+          check.type = 'checkbox';
+          check.checked = next.estimateRobinTokens;
+          check.style.cssText = 'width:16px;height:16px;accent-color:var(--accent);cursor:pointer;margin:0;flex:none';
+          check.setAttribute('aria-label', estimateTitle);
+          check.addEventListener('change', () => void saveSwitch('pricing-estimate', check), { signal: ctx.signal });
+
+          const checkLabel = ui.h('label');
+          checkLabel.style.cssText = 'display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;color:var(--ink)';
+          const badge = ui.h('span', 'ggw-tag warn', estimateBadgeText);
+          checkLabel.append(check, ui.h('span', null, estimateTitle), badge);
+          controlsRow.append(checkLabel);
+        }
+
+        if (typeof next.mirrorSubscriptionSpend === 'boolean') {
+          const toggle = ui.h('input', 'connection-switch');
+          toggle.type = 'checkbox';
+          toggle.checked = next.mirrorSubscriptionSpend;
+          toggle.setAttribute('role', 'switch');
+          toggle.setAttribute('aria-label', mirrorTitle);
+          toggle.addEventListener('change', () => void saveSwitch('pricing-mirror', toggle), { signal: ctx.signal });
+          const wrapper = ui.field(mirrorTitle, toggle);
+          wrapper.classList.add('connection-toggle');
+          wrapper.style.cssText = 'display:flex;align-items:center;gap:10px;margin:0';
+          controlsRow.append(wrapper);
+        }
+
+        robinBillingBox.append(controlsRow);
+        if (typeof next.estimateRobinTokens === 'boolean') {
+          const estDesc = ui.h('p', 'tdesc', estimateHint);
+          estDesc.style.margin = '0';
+          robinBillingBox.append(estDesc);
+        }
+        if (typeof next.mirrorSubscriptionSpend === 'boolean') {
+          const mirDesc = ui.h('p', 'tdesc', mirrorHint);
+          mirDesc.style.margin = '0';
+          robinBillingBox.append(mirDesc);
+        }
+        mirror.append(robinBillingBox);
       }
 
       fields.replaceChildren();
@@ -311,7 +398,7 @@ export const modelSettingsPanel: WebUiPanel = {
       }
     }
 
-    async function saveSwitch(method: 'input-save' | 'pricing-mirror', toggle: HTMLInputElement, args: Record<string, unknown> = {}) {
+    async function saveSwitch(method: 'input-save' | 'pricing-mirror' | 'pricing-estimate', toggle: HTMLInputElement, args: Record<string, unknown> = {}) {
       if (!state || saving) {
         toggle.checked = !toggle.checked;
         return;

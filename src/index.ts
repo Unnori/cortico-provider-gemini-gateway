@@ -247,25 +247,32 @@ export const GEMINI_GATEWAY = {
         },
       },
       resolveRobinModeCategory: (model, accountId) => oauth.resolveDiscoveredModeCategory(model, accountId),
+      estimateRobinTokens: () => configuration(current()).estimateRobinTokens !== false,
       onRobinRouting: (obs, accountId) => {
         oauth.recordRouting(obs, accountId);
+        const routingData = {
+          ...(accountId ? { accountId } : {}),
+          requestedModel: obs.requestedModel,
+          requestedModeCategory: obs.requestedModeCategory,
+          resolvedModeCategory: obs.resolvedModeCategory,
+          requestedThinkingLevel: obs.requestedThinkingLevel,
+          resolvedThinkingLevel: obs.resolvedThinkingLevel,
+          attribution: obs.attribution,
+          thoughtChars: obs.thoughtChars ?? 0,
+          ...(obs.fallback !== undefined ? { fallback: obs.fallback } : {}),
+          ...(obs.downgradeReason !== undefined ? { downgradeReason: obs.downgradeReason } : {}),
+        };
+        host.log.debug('Robin routing observed', routingData);
         const downgraded = obs.fallback === 1
           || (obs.downgradeReason !== undefined && obs.downgradeReason > 0)
           || (obs.requestedModeCategory !== undefined
             && obs.resolvedModeCategory !== undefined
             && obs.resolvedModeCategory !== obs.requestedModeCategory);
         if (downgraded) {
-          host.log.warn('Robin backend routed or downgraded model', {
-            ...(accountId ? { accountId } : {}),
-            requestedModel: obs.requestedModel,
-            requestedModeCategory: obs.requestedModeCategory,
-            resolvedModeCategory: obs.resolvedModeCategory,
-            attribution: obs.attribution,
-            fallback: obs.fallback,
-            downgradeReason: obs.downgradeReason,
-          });
+          host.log.warn('Robin backend routed or downgraded model', routingData);
         }
       },
+      onToolCallRepair: info => host.log.info('Repaired malformed tool_call JSON', info),
       onCleanupError: error => host.log.warn('Gemini gateway conversation cleanup failed', {
         error: error instanceof Error ? error.message : String(error),
       }),
@@ -284,6 +291,8 @@ export const GEMINI_GATEWAY = {
         const observedAccount = oauth.describeAccount(observed?.accountId);
         return buildRobinRouteSummary({
           model,
+          thinking: cur.spec?.thinking,
+          reasoningEffort: cur.spec?.reasoningEffort,
           userStatus: acct.userStatus,
           plan: acct.plan,
           userTier: acct.userTier,

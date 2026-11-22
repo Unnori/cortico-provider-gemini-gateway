@@ -146,6 +146,115 @@ describe('streamed tool calls', () => {
     }]);
   });
 
+  it('repairs unescaped ASCII double quotes (even & odd), embedded JSON, code fences, and trailing commas in tool_call payloads', () => {
+    const repairs: { name: string; strategy: string }[] = [];
+    const run = (raw: string, charByChar = false) => {
+      const parser = new ToolCallStream({ onRepair: info => repairs.push(info) });
+      const parts = charByChar
+        ? Array.from(raw).flatMap(ch => parser.feed(ch))
+        : parser.feed(raw);
+      parts.push(...parser.finish());
+      return { parts, unrecovered: parser.hadUnrecoveredToolMarkup };
+    };
+
+    // Real incident regression: unescaped quotes inside inline code (`inputSupport.model: "gemini-4-neon"`)
+    const realIncident = '<tool_call>{"name":"wechat_send","id":"call_0_provider_detect","args":{"text":"刚刚调了 `wechat_status`，里面只暴露了模型名（`inputSupport.model: "gemini-4-neon"`），**没有 Provider 名称**。\\n\\n收尾喵~"}}</tool_call>';
+    const incidentRes = run(realIncident, true);
+    expect(incidentRes.unrecovered).toBe(false);
+    expect(incidentRes.parts).toEqual([{
+      functionCall: {
+        name: 'wechat_send',
+        id: 'call_0_provider_detect',
+        args: {
+          text: '刚刚调了 `wechat_status`，里面只暴露了模型名（`inputSupport.model: "gemini-4-neon"`），**没有 Provider 名称**。\n\n收尾喵~',
+        },
+      },
+    }]);
+    expect(repairs.at(-1)).toEqual({ name: 'wechat_send', strategy: 'lenient-json' });
+
+    // Embedded JSON object inside string value (both with trailing text and ending right at `}"}}`)
+    const embeddedWithTail = '<tool_call>{"name":"wechat_send","args":{"text":"返回了 {"ok": true, "msg": "done"} 给你"}}</tool_call>';
+    expect(run(embeddedWithTail).parts).toEqual([{
+      functionCall: { name: 'wechat_send', args: { text: '返回了 {"ok": true, "msg": "done"} 给你' } },
+    }]);
+
+    const embeddedAtEnd = '<tool_call>{"name":"wechat_send","args":{"text":"示例：{"a": "1", "b": "2"}"}}</tool_call>';
+    expect(run(embeddedAtEnd).parts).toEqual([{
+      functionCall: { name: 'wechat_send', args: { text: '示例：{"a": "1", "b": "2"}' } },
+    }]);
+
+    // Multi-field args where multiple string values contain unescaped quotes & comma-separated quotes
+    const multiField = '<tool_call>{"name":"edit_file","args":{"target":"const a = "1"","replacement":"const a = "2"","note":"他说 "你好"，我说 "ok""}}</tool_call>';
+    expect(run(multiField).parts).toEqual([{
+      functionCall: {
+        name: 'edit_file',
+        args: { target: 'const a = "1"', replacement: 'const a = "2"', note: '他说 "你好"，我说 "ok"' },
+      },
+    }]);
+
+    // Combined unescaped quotes + unescaped LaTeX backslashes + raw newline
+    const combined = String.raw`<tool_call>{"name":"wechat_send","args":{"text":"公式 \circ 和模型 "gemini-4-neon"` + '\n第二行"}}</tool_call>';
+    expect(run(combined).parts).toEqual([{
+      functionCall: { name: 'wechat_send', args: { text: '公式 \\circ 和模型 "gemini-4-neon"\n第二行' } },
+    }]);
+
+    // Odd unescaped quote (e.g. inch mark 15") inverts quote parity during feed(), recovered cleanly in finish()
+    const oddSingle = '<tool_call>{"name":"wechat_send","args":{"text":"买了个 15" 屏幕，真香"}}</tool_call>';
+    const oddSingleRes = run(oddSingle, true);
+    expect(oddSingleRes.unrecovered).toBe(false);
+    expect(oddSingleRes.parts).toEqual([{
+      functionCall: { name: 'wechat_send', args: { text: '买了个 15" 屏幕，真香' } },
+    }]);
+
+    // Odd unescaped quote in first call followed by a second call back-to-back
+    const oddMulti = '<tool_call>{"name":"wechat_send","args":{"text":"15" 屏幕"}}</tool_call>\n<tool_call>{"name":"end_turn","args":{}}</tool_call>';
+    const oddMultiRes = run(oddMulti, true);
+    expect(oddMultiRes.unrecovered).toBe(false);
+    expect(oddMultiRes.parts.filter(p => p.functionCall)).toEqual([
+      { functionCall: { name: 'wechat_send', args: { text: '15" 屏幕' } } },
+      { functionCall: { name: 'end_turn', args: {} } },
+    ]);
+
+    // Embedded unescaped <tool_call>...</tool_call> + odd quote inside outer message does not split prematurely
+    const embeddedTagAndOddQuote = '<tool_call>{"name":"wechat_send","args":{"text":"示例 <tool_call>{"name":"x","args":{}}</tool_call> 还有 15" 屏幕"}}</tool_call>';
+    const embeddedTagRes = run(embeddedTagAndOddQuote);
+    expect(embeddedTagRes.unrecovered).toBe(false);
+    expect(embeddedTagRes.parts).toEqual([{
+      functionCall: { name: 'wechat_send', args: { text: '示例 <tool_call>{"name":"x","args":{}}</tool_call> 还有 15" 屏幕' } },
+    }]);
+
+    // Call 1 with odd quote + Call 2 genuinely truncated mid-JSON -> flags unrecovered markup for Call 2
+    const oddThenTruncated = '<tool_call>{"name":"wechat_send","args":{"text":"15" 屏幕"}}</tool_call><tool_call>{"name":"end_turn","args":{';
+    const oddTruncRes = run(oddThenTruncated);
+    expect(oddTruncRes.unrecovered).toBe(true);
+    expect(oddTruncRes.parts).toEqual([
+      { functionCall: { name: 'wechat_send', args: { text: '15" 屏幕' } } },
+      { text: '<tool_call>{"name":"end_turn","args":{' },
+    ]);
+
+    // Code-fenced JSON, trailing comma, double-encoded arguments string, and zero-arg omitted args
+    expect(run('<tool_call>\n```json\n{"name":"wechat_send","args":{"text":"ok",}}\n```\n</tool_call>').parts).toEqual([
+      { functionCall: { name: 'wechat_send', args: { text: 'ok' } } },
+    ]);
+    expect(run('<tool_call>{"name":"wechat_send","arguments":"{\\"text\\":\\"hi\\"}"}</tool_call>').parts).toEqual([
+      { functionCall: { name: 'wechat_send', args: { text: 'hi' } } },
+    ]);
+    expect(run('<tool_call>{"name":"end_turn"}</tool_call>').parts).toEqual([
+      { functionCall: { name: 'end_turn', args: {} } },
+    ]);
+
+    // Safety: truncated/invalid calls and pathological backtracking inputs stay bounded & safe
+    const truncated = run('<tool_call>{"name":"wechat_send","args":{"text":"说到一半');
+    expect(truncated.unrecovered).toBe(true);
+    expect(truncated.parts.filter(p => p.functionCall)).toEqual([]);
+
+    const startMs = Date.now();
+    const pathological = `<tool_call>{"name":"x","args":{"a":"${'", "k":"v'.repeat(80)}}</tool_call>`;
+    const pathRes = run(pathological);
+    expect(Date.now() - startMs).toBeLessThan(200);
+    expect(pathRes.parts.filter(p => p.functionCall)).toEqual([]);
+  });
+
   it('accepts arguments alias in tool_call JSON and truncates Robin hallucinated follow-up turns & echoed stop cues', async () => {
     const run = (raw: string) => {
       const parser = new ToolCallStream();

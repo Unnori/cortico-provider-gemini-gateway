@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { estimateTokens } from 'cortico/protocol/open-responses/tokens.ts';
 import { requestJson } from 'cortico/providers/transport/response-http.ts';
 import { canonicalMime } from './catalog.ts';
 import { gatewayFrames } from './frames.ts';
@@ -20,7 +21,8 @@ import {
 } from './robin-grpc.ts';
 import {
   decodeGatewayEvent, RobinPartFilter, toGeminiRequest, toRobinRequest, toRpcRequest, ToolCallStream,
-  type GatewayEvent, type GatewayProtocol, type GeminiChunk, type GeminiPart, type GeminiRequest, type UploadAttachment,
+  type GatewayEvent, type GatewayProtocol, type GeminiChunk, type GeminiPart, type GeminiRequest,
+  type ToolCallRepairStrategy, type UploadAttachment,
 } from './shim.ts';
 import { httpUrl, record } from './state.ts';
 
@@ -52,7 +54,9 @@ export interface GatewayClientOptions {
   encodeRequest?: (request: GeminiRequest, upload: UploadAttachment | undefined, temporaryChat: boolean) => Promise<unknown>;
   decodeEvent?: (payload: unknown) => GatewayEvent;
   resolveRobinModeCategory?: (model: string, accountId?: string) => number | undefined;
+  estimateRobinTokens?: boolean | (() => boolean);
   onRobinRouting?: (observation: RobinRoutingObservation, accountId?: string) => void;
+  onToolCallRepair?: (info: { name: string; strategy: ToolCallRepairStrategy }) => void;
   onCleanupError?: (error: unknown) => void;
   proxyUrl?: string;
   robinTextIdleTimeoutMs?: number;
@@ -346,7 +350,7 @@ export class GatewayClient {
     const reasoningEffort = typeof thinkingCfg?.thinkingLevel === 'string' ? thinkingCfg.thinkingLevel : undefined;
     const overrideModeCategory = this.options.resolveRobinModeCategory?.(input.model, accountId);
     const requestedMode = resolveRobinMode(input.model, includeThoughts, reasoningEffort, overrideModeCategory);
-    const parser = new ToolCallStream();
+    const parser = new ToolCallStream(this.options.onToolCallRepair ? { onRepair: this.options.onToolCallRepair } : undefined);
     const filter = new RobinPartFilter();
     let emittedText = '';
     let emittedThought = '';
@@ -358,6 +362,7 @@ export class GatewayClient {
     let observedAttribution: string | undefined;
     let observedResolvedMode: number | undefined;
     let observedThinking: number | undefined;
+    let observedThoughtChars = 0;
     let observedFallback: number | undefined;
     let observedDowngrade: number | undefined;
 
@@ -385,6 +390,9 @@ export class GatewayClient {
       if (frame.modelVersion) observedAttribution = frame.modelVersion;
       if (frame.resolvedModeCategory !== undefined) observedResolvedMode = frame.resolvedModeCategory;
       if (frame.resolvedThinkingLevel !== undefined) observedThinking = frame.resolvedThinkingLevel;
+      if (typeof frame.thought === 'string' && frame.thought.length > observedThoughtChars) {
+        observedThoughtChars = frame.thought.length;
+      }
       if (frame.fallback !== undefined) observedFallback = frame.fallback;
       if (frame.downgradeReason !== undefined) observedDowngrade = frame.downgradeReason;
       const rawParts: GeminiPart[] = [];
@@ -426,6 +434,7 @@ export class GatewayClient {
     if (
       observedAttribution !== undefined
       || observedResolvedMode !== undefined
+      || observedThinking !== undefined
       || observedFallback !== undefined
       || observedDowngrade !== undefined
     ) {
@@ -436,13 +445,15 @@ export class GatewayClient {
         ...(observedResolvedMode !== undefined ? { resolvedModeCategory: observedResolvedMode } : {}),
         ...(observedThinking !== undefined ? { resolvedThinkingLevel: observedThinking } : {}),
         ...(observedAttribution ? { attribution: observedAttribution } : {}),
+        thoughtChars: observedThoughtChars,
         ...(observedFallback !== undefined ? { fallback: observedFallback } : {}),
         ...(observedDowngrade !== undefined ? { downgradeReason: observedDowngrade } : {}),
         observedAt: new Date().toISOString(),
       }, accountId);
     }
-    const hadPendingToolMarkup = parser.hasPendingToolMarkup;
-    const tail = [...filter.feed(parser.finish()), ...filter.finish()];
+    const parserTail = parser.finish();
+    const hadPendingToolMarkup = parser.hadUnrecoveredToolMarkup;
+    const tail = [...filter.feed(parserTail), ...filter.finish()];
     for (const part of tail) {
       if (part.functionCall) emittedToolCallCount += 1;
       else if (!part.thought && typeof part.text === 'string' && part.text) emittedVisibleTextCount += 1;
@@ -465,8 +476,33 @@ export class GatewayClient {
     //   Coopanion pet replies (which are tool calls) still execute instead of getting blocked by Core.
     const markIncomplete = !confirmedComplete && (hadPendingToolMarkup || emittedToolCallCount === 0);
     const finishReason = markIncomplete ? 'MAX_TOKENS' : 'STOP';
+    let estimatedUsage: Record<string, unknown> | undefined;
+    const shouldEstimate = typeof this.options.estimateRobinTokens === 'function'
+      ? this.options.estimateRobinTokens()
+      : Boolean(this.options.estimateRobinTokens);
+    if (shouldEstimate) {
+      const attachmentTokens = attachments.reduce(
+        (sum, att) => sum + (att.mimeType.startsWith('image/') ? 258 : 512),
+        0,
+      );
+      const promptTokenCount = estimateTokens(prompt.query.text) + attachmentTokens;
+      const candidatesTokenCount = emittedText ? estimateTokens(emittedText) : 0;
+      const thoughtsTokenCount = emittedThought ? estimateTokens(emittedThought) : 0;
+      estimatedUsage = {
+        promptTokenCount,
+        candidatesTokenCount,
+        ...(thoughtsTokenCount > 0 ? { thoughtsTokenCount } : {}),
+        cachedContentTokenCount: 0,
+        totalTokenCount: promptTokenCount + candidatesTokenCount + thoughtsTokenCount,
+        estimated: true,
+        source: 'robin-local-estimate',
+      };
+    }
     onMeta({ completed: true });
-    yield { candidates: [{ ...(tail.length ? { content: { role: 'model', parts: tail } } : {}), finishReason }] };
+    yield {
+      candidates: [{ ...(tail.length ? { content: { role: 'model', parts: tail } } : {}), finishReason }],
+      ...(estimatedUsage ? { usageMetadata: estimatedUsage } : {}),
+    };
   }
 
   async *stream(input: GeminiRequest, options: GatewayStreamOptions = {}): AsyncGenerator<GeminiChunk> {
@@ -545,7 +581,7 @@ export class GatewayClient {
             const headerId = response.headers.get(this.options.conversationHeader ?? 'x-conversation-id');
             if (headerId) conversations.add(headerId);
             await checkResponse(response, 'generation');
-            const parser = new ToolCallStream();
+            const parser = new ToolCallStream(this.options.onToolCallRepair ? { onRepair: this.options.onToolCallRepair } : undefined);
             const robinFilter = this.protocol === 'robin' ? new RobinPartFilter() : undefined;
             let received = false;
             let finishReason: string | undefined;

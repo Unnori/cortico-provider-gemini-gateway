@@ -29,6 +29,14 @@ function formatObservedTime(iso) {
     full: `${dt.getFullYear()}-${date} ${time}`
   };
 }
+function formatThinkingLevel(level, en, zhHant) {
+  if (level === void 0 || !Number.isFinite(level)) return void 0;
+  if (level === 0) return en ? "Off (0)" : zhHant ? "\u95DC (0)" : "\u5173 (0)";
+  if (level === 1) return en ? "Low (1)" : "Low / \u5FEB (1)";
+  if (level === 4) return en ? "Medium (4)" : zhHant ? "Medium / \u6A19\u6E96 (4)" : "Medium / \u6807\u51C6 (4)";
+  if (level === 2) return en ? "High (2)" : "High / \u6DF1\u5165 (2)";
+  return `level ${level}`;
+}
 var modelSettingsPanel = {
   mount: async (ctx) => {
     const en = ctx.language !== "zh" && ctx.language !== "zh-Hant";
@@ -63,6 +71,9 @@ var modelSettingsPanel = {
     const mirror = ui.h("div");
     const mirrorTitle = en ? "Show Robin estimates under Actual spend" : zhHant ? "\u540C\u6B65\u8A02\u95B1\u6298\u7B97\u984D\u5230\u300C\u5BE6\u969B\u652F\u51FA\u300D" : "\u540C\u6B65\u8BA2\u9605\u6298\u7B97\u989D\u5230\u300C\u5B9E\u9645\u652F\u51FA\u300D";
     const mirrorHint = en ? "Applies to new calls. The amount is a subscription estimate. Manual Actual spend rates take precedence." : zhHant ? "\u5C0D\u65B0\u547C\u53EB\u751F\u6548\u3002\u91D1\u984D\u70BA\u8A02\u95B1\u4F30\u7B97\uFF0C\u624B\u52D5\u8A2D\u5B9A\u7684\u5BE6\u969B\u652F\u51FA\u8CBB\u7387\u512A\u5148\u3002" : "\u5BF9\u65B0\u8C03\u7528\u751F\u6548\u3002\u91D1\u989D\u4E3A\u8BA2\u9605\u4F30\u7B97\uFF0C\u624B\u52A8\u8BBE\u7F6E\u7684\u5B9E\u9645\u652F\u51FA\u8D39\u7387\u4F18\u5148\u3002";
+    const estimateTitle = en ? "Local Robin token estimate (estimated, not measured)" : zhHant ? "\u555F\u7528\u672C\u5730 Token \u4F30\u7B97\u515C\u5E95\uFF08\u4F30\u6E2C\u503C\uFF0C\u975E\u5BE6\u6E2C\uFF09" : "\u542F\u7528\u672C\u5730 Token \u4F30\u7B97\u515C\u5E95\uFF08\u4F30\u6D4B\u503C\uFF0C\u975E\u5B9E\u6D4B\uFF09";
+    const estimateBadgeText = en ? "Estimated" : zhHant ? "\u4F30\u6E2C\u503C" : "\u4F30\u6D4B\u503C";
+    const estimateHint = en ? "Approximate estimate only, not upstream measurements: Robin protocol does not report token counts or cache hits. Estimates input/output tokens from prompt and visible reply text locally (cache hits are not counted; hidden reasoning tokens are excluded) so cumulative token stats and spend estimates work." : zhHant ? "\u26A0\uFE0F \u6B64\u9805\u70BA\u672C\u6A5F\u8FD1\u4F3C\u4F30\u6E2C\u503C\uFF0C\u4E26\u975E Google \u4E0A\u6E38\u5BE6\u6E2C\u6578\u64DA\uFF1ARobin \u5354\u8B70\u672C\u8EAB\u4E0D\u4E0B\u767C Token \u8207\u5FEB\u53D6\u547D\u4E2D\uFF1B\u958B\u555F\u5F8C\u6309\u5BE6\u969B\u6536\u767C\u6587\u672C\u4F30\u7B97\u8F38\u5165\u8F38\u51FA Token\uFF08\u5FEB\u53D6\u547D\u4E2D\u4E0D\u8A08\u6578\uFF0C\u4E0D\u542B\u96B1\u85CF\u601D\u8003 Token\uFF09\uFF0C\u4EE5\u4F7F\u7D2F\u8A08\u7528\u91CF\u8207\u6298\u7B97\u91D1\u984D\u6B63\u5E38\u7D2F\u8A08\u3002" : "\u26A0\uFE0F \u6B64\u9879\u4E3A\u672C\u673A\u8FD1\u4F3C\u4F30\u6D4B\u503C\uFF0C\u5E76\u975E Google \u4E0A\u6E38\u5B9E\u6D4B\u6570\u636E\uFF1ARobin \u534F\u8BAE\u672C\u8EAB\u4E0D\u4E0B\u53D1 Token \u4E0E\u7F13\u5B58\u547D\u4E2D\uFF1B\u5F00\u542F\u540E\u6309\u5B9E\u9645\u6536\u53D1\u6587\u672C\u4F30\u7B97\u8F93\u5165\u8F93\u51FA Token\uFF08\u7F13\u5B58\u547D\u4E2D\u4E0D\u8BA1\u6570\uFF0C\u4E0D\u542B\u9690\u85CF\u601D\u8003 Token\uFF09\uFF0C\u4EE5\u4F7F\u7D2F\u8BA1\u7528\u91CF\u4E0E\u6298\u7B97\u91D1\u989D\u6B63\u5E38\u7D2F\u8BA1\u3002";
     const advanced = ui.h("details", "ggw-details pricing-rules");
     const raw = ui.textarea({ rows: 10, cls: "mono" });
     raw.setAttribute("aria-label", en ? "Full pricing rules" : "\u5B8C\u6574\u8BA1\u4EF7\u89C4\u5219");
@@ -123,19 +134,37 @@ var modelSettingsPanel = {
         } else if (r.officialEntitled === false) {
           parts.push(en ? "Not in account official picker (routed by backend tier)" : "\u4E0D\u5728\u8BE5\u8D26\u53F7\u5B98\u65B9\u4E0B\u62C9\u5217\u8868\uFF08\u7531\u540E\u7AEF\u6309\u5957\u9910\u6743\u76CA\u8DEF\u7531\uFF09");
         }
-        let observedTitle = "";
-        if (r.lastAttribution) {
-          const obsTime = formatObservedTime(r.lastObservedAt);
-          if (obsTime) observedTitle = obsTime.full;
+        const titleParts = [];
+        const obsTime = formatObservedTime(r.lastObservedAt);
+        if (obsTime) {
+          titleParts.push(en ? `Last routed at ${obsTime.full}` : zhHant ? `\u6700\u8FD1\u5BE6\u6E2C\u6642\u9593\uFF1A${obsTime.full}` : `\u6700\u8FD1\u5B9E\u6D4B\u65F6\u95F4\uFF1A${obsTime.full}`);
+        }
+        const resolvedThinkLabel = formatThinkingLevel(r.lastResolvedThinkingLevel, en, zhHant);
+        const requestedThinkLabel = formatThinkingLevel(r.requestedThinkingLevel, en, zhHant);
+        if (resolvedThinkLabel && requestedThinkLabel && r.lastResolvedThinkingLevel !== r.requestedThinkingLevel) {
+          titleParts.push(en ? `Thinking: requested ${requestedThinkLabel} \u2192 actual ${resolvedThinkLabel}` : zhHant ? `\u601D\u8003\u7B49\u7D1A\uFF1A\u8ACB\u6C42 ${requestedThinkLabel} \u2192 \u5BE6\u6E2C ${resolvedThinkLabel}` : `\u601D\u8003\u7B49\u7EA7\uFF1A\u8BF7\u6C42 ${requestedThinkLabel} \u2192 \u5B9E\u6D4B ${resolvedThinkLabel}`);
+        }
+        if (r.lastThoughtChars !== void 0) {
+          titleParts.push(en ? `Thought stream: ${r.lastThoughtChars} chars` : zhHant ? `\u601D\u8003\u6D41\uFF1A${r.lastThoughtChars} \u5B57\u5143` : `\u601D\u8003\u6D41\uFF1A${r.lastThoughtChars} \u5B57\u7B26`);
+        }
+        if (r.lastAttribution || resolvedThinkLabel) {
           const tags = [];
           if (r.downgraded) tags.push(en ? "downgraded" : zhHant ? "\u5DF2\u964D\u7D1A/\u56DE\u843D" : "\u5DF2\u964D\u7EA7/\u56DE\u843D");
+          if (resolvedThinkLabel) {
+            const clampedNote = requestedThinkLabel && r.lastResolvedThinkingLevel !== r.requestedThinkingLevel ? en ? `, req ${requestedThinkLabel}` : zhHant ? `\uFF0C\u8ACB\u6C42 ${requestedThinkLabel}` : `\uFF0C\u8BF7\u6C42 ${requestedThinkLabel}` : "";
+            tags.push(en ? `thinking: ${resolvedThinkLabel}${clampedNote}` : zhHant ? `\u5BE6\u6E2C\u601D\u8003\uFF1A${resolvedThinkLabel}${clampedNote}` : `\u5B9E\u6D4B\u601D\u8003\uFF1A${resolvedThinkLabel}${clampedNote}`);
+          }
           if (obsTime) tags.push(obsTime.short);
           if (r.lastAccount) tags.push(r.lastAccount);
           const suffix = tags.length ? en ? ` (${tags.join(" \xB7 ")})` : `\uFF08${tags.join(" \xB7 ")}\uFF09` : "";
-          parts.push(en ? `Last actual model: ${r.lastAttribution}${suffix}` : zhHant ? `\u6700\u8FD1\u5BE6\u6E2C\u6B78\u5C6C\uFF1A${r.lastAttribution}${suffix}` : `\u6700\u8FD1\u5B9E\u6D4B\u5F52\u5C5E\uFF1A${r.lastAttribution}${suffix}`);
+          if (r.lastAttribution) {
+            parts.push(en ? `Last actual model: ${r.lastAttribution}${suffix}` : zhHant ? `\u6700\u8FD1\u5BE6\u6E2C\u6B78\u5C6C\uFF1A${r.lastAttribution}${suffix}` : `\u6700\u8FD1\u5B9E\u6D4B\u5F52\u5C5E\uFF1A${r.lastAttribution}${suffix}`);
+          } else {
+            parts.push(tags.join(" \xB7 "));
+          }
         }
         routeNote.textContent = parts.join(" \xB7 ");
-        routeNote.title = observedTitle ? en ? `Last routed at ${observedTitle}` : zhHant ? `\u6700\u8FD1\u5BE6\u6E2C\u6642\u9593\uFF1A${observedTitle}` : `\u6700\u8FD1\u5B9E\u6D4B\u65F6\u95F4\uFF1A${observedTitle}` : "";
+        routeNote.title = titleParts.join(" \xB7 ");
         routeNote.hidden = !parts.length;
       } else {
         routeNote.textContent = "";
@@ -161,16 +190,48 @@ var modelSettingsPanel = {
         switches.append(wrapper);
       }
       mirror.replaceChildren();
-      if (typeof next.mirrorSubscriptionSpend === "boolean") {
-        const toggle = ui.h("input", "connection-switch");
-        toggle.type = "checkbox";
-        toggle.checked = next.mirrorSubscriptionSpend;
-        toggle.setAttribute("role", "switch");
-        toggle.setAttribute("aria-label", mirrorTitle);
-        toggle.addEventListener("change", () => void saveSwitch("pricing-mirror", toggle), { signal: ctx.signal });
-        const wrapper = ui.field(mirrorTitle, toggle);
-        wrapper.classList.add("connection-toggle");
-        mirror.append(wrapper, ui.h("p", "tdesc", mirrorHint));
+      if (typeof next.mirrorSubscriptionSpend === "boolean" || typeof next.estimateRobinTokens === "boolean") {
+        const robinBillingBox = ui.h("div", "ggw-account-card");
+        robinBillingBox.style.cssText = "display:grid;gap:10px;margin:6px 0 10px";
+        const controlsRow = ui.h("div");
+        controlsRow.style.cssText = "display:flex;flex-wrap:wrap;gap:12px 24px;align-items:center";
+        if (typeof next.estimateRobinTokens === "boolean") {
+          const check = ui.h("input");
+          check.type = "checkbox";
+          check.checked = next.estimateRobinTokens;
+          check.style.cssText = "width:16px;height:16px;accent-color:var(--accent);cursor:pointer;margin:0;flex:none";
+          check.setAttribute("aria-label", estimateTitle);
+          check.addEventListener("change", () => void saveSwitch("pricing-estimate", check), { signal: ctx.signal });
+          const checkLabel = ui.h("label");
+          checkLabel.style.cssText = "display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;color:var(--ink)";
+          const badge = ui.h("span", "ggw-tag warn", estimateBadgeText);
+          checkLabel.append(check, ui.h("span", null, estimateTitle), badge);
+          controlsRow.append(checkLabel);
+        }
+        if (typeof next.mirrorSubscriptionSpend === "boolean") {
+          const toggle = ui.h("input", "connection-switch");
+          toggle.type = "checkbox";
+          toggle.checked = next.mirrorSubscriptionSpend;
+          toggle.setAttribute("role", "switch");
+          toggle.setAttribute("aria-label", mirrorTitle);
+          toggle.addEventListener("change", () => void saveSwitch("pricing-mirror", toggle), { signal: ctx.signal });
+          const wrapper = ui.field(mirrorTitle, toggle);
+          wrapper.classList.add("connection-toggle");
+          wrapper.style.cssText = "display:flex;align-items:center;gap:10px;margin:0";
+          controlsRow.append(wrapper);
+        }
+        robinBillingBox.append(controlsRow);
+        if (typeof next.estimateRobinTokens === "boolean") {
+          const estDesc = ui.h("p", "tdesc", estimateHint);
+          estDesc.style.margin = "0";
+          robinBillingBox.append(estDesc);
+        }
+        if (typeof next.mirrorSubscriptionSpend === "boolean") {
+          const mirDesc = ui.h("p", "tdesc", mirrorHint);
+          mirDesc.style.margin = "0";
+          robinBillingBox.append(mirDesc);
+        }
+        mirror.append(robinBillingBox);
       }
       fields.replaceChildren();
       for (const [index, definition] of next.definitions.entries()) {
