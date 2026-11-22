@@ -1053,7 +1053,10 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
           }
           if (typeof decoded.text === 'string' && decoded.text.length > 0) {
             sawVisibleText = true;
-            if (decoded.text.length > latestText.length) {
+            if (
+              decoded.text.length > latestText.length
+              || (decoded.text !== latestText && decoded.text.includes('</tool_call>'))
+            ) {
               latestText = decoded.text;
               madeProgress = true;
             }

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { decodeGatewayEvent, RobinPartFilter, toGeminiRequest, toRobinRequest, toRpcRequest, ToolCallStream, type GeminiRequest } from '../src/shim.ts';
+import { decodeGatewayEvent, RobinPartFilter, toGeminiRequest, toRobinRequest, toRpcRequest, ToolCallStream, unwrapRobinAutoLinks, type GeminiRequest } from '../src/shim.ts';
 
 describe('Gemini request adapters', () => {
   const schema = { type: 'object', properties: { q: { type: 'string' } }, additionalProperties: false };
@@ -253,6 +253,22 @@ describe('streamed tool calls', () => {
     const pathRes = run(pathological);
     expect(Date.now() - startMs).toBeLessThan(200);
     expect(pathRes.parts.filter(p => p.functionCall)).toEqual([]);
+  });
+
+  it('unwraps Robin server-side Markdown auto-links while preserving intentional links and images', () => {
+    expect(unwrapRobinAutoLinks(
+      '<tool_call>{"name":"workspace_run","args":{"command":"bash","args":["-lc","curl -s -m 6 [http://127.0.0.1:7788/health](http://127.0.0.1:7788/health) && echo [www.google.com](https://www.google.com)"]}}</tool_call>',
+    )).toBe(
+      '<tool_call>{"name":"workspace_run","args":{"command":"bash","args":["-lc","curl -s -m 6 http://127.0.0.1:7788/health && echo www.google.com"]}}</tool_call>',
+    );
+    expect(unwrapRobinAutoLinks(
+      'See [https://en.wikipedia.org/wiki/Foo_(bar)](https://en.wikipedia.org/wiki/Foo_(bar)), [www.example.com](http://www.example.com/), and [a@b.com](mailto:a@b.com).',
+    )).toBe(
+      'See https://en.wikipedia.org/wiki/Foo_(bar), www.example.com, and a@b.com.',
+    );
+    // Intentional Markdown links with distinct labels, different targets, and images remain intact.
+    const intentional = 'Read [Docs](https://example.com), [https://a.com](https://b.com), and ![https://a.com/x.png](https://a.com/x.png).';
+    expect(unwrapRobinAutoLinks(intentional)).toBe(intentional);
   });
 
   it('accepts arguments alias in tool_call JSON and truncates Robin hallucinated follow-up turns & echoed stop cues', async () => {

@@ -1188,4 +1188,114 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });
+
+  it('recovers cleanly when Robin auto-linkifies URLs mid-stream or rewrites cumulative frame prefixes', async () => {
+    type CaseName = 'tool-autolink' | 'prose-autolink' | 'tool-prefix-rewrite' | 'prose-prefix-rewrite';
+    let currentCase: CaseName = 'tool-autolink';
+    const server = http2.createServer();
+
+    server.on('stream', (stream, headers) => {
+      if (headers[':path'] !== ROBIN_GRPC_PROCESS_QUERY) {
+        stream.respond({ ':status': 404 });
+        stream.end();
+        return;
+      }
+      stream.resume();
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        const writeFrame = (text: string, completed = false) => {
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text,
+            responseId: `rc_${currentCase}`,
+            attribution: 'Used 4 Neon model',
+            completed,
+          })));
+        };
+
+        if (currentCase === 'tool-autolink') {
+          // Exact live wire reproduction: Robin auto-links partial URL at :77, then rewrites to :7788/health.
+          writeFrame('<tool_call>{"name":"workspace_run","args');
+          writeFrame('<tool_call>{"name":"workspace_run","args":{"command":"bash","args":["-lc","curl -s -m 6 [http://127.0.0.1:77](http://127.0.0.1:77)');
+          writeFrame('<tool_call>{"name":"workspace_run","args":{"command":"bash","args":["-lc","curl -s -m 6 [http://127.0.0.1:7788/health](http://127.0.0.1:7788/health) && echo ok"]}}</tool_call>', true);
+        } else if (currentCase === 'prose-autolink') {
+          writeFrame('Visit [https://github.com/Unnori/cortico](https://github.com/Unnori/cortico)');
+          writeFrame('Visit [https://github.com/Unnori/cortico-provider-gemini-gateway](https://github.com/Unnori/cortico-provider-gemini-gateway) and [www.google.com](https://www.google.com) done.', true);
+        } else if (currentCase === 'tool-prefix-rewrite') {
+          // Non-auto-link prefix rewrite inside an open, not-yet-emitted <tool_call>.
+          writeFrame('先查一下\n<tool_call>{"name":"run","args":{"q":"foo');
+          writeFrame('先查一下\n<tool_call>{"name":"run","args":{"q":"[foo](https://custom.example) done"}}</tool_call>', true);
+        } else {
+          // Non-auto-link prefix rewrite in already-emitted plain prose followed by a tool call.
+          writeFrame('请看 example.com');
+          writeFrame('请看 [example.com](https://docs.example.com) 后面继续\n<tool_call>{"name":"end_turn","args":{}}</tool_call>', true);
+        }
+
+        stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+        stream.end();
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const client = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        auth: { accessToken: async () => 'fresh-token' },
+      });
+
+      currentCase = 'tool-autolink';
+      const r1 = await consume(client.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'workspace_run', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'check health' }] }],
+      }));
+      expect(r1.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{
+        functionCall: {
+          name: 'workspace_run',
+          args: { command: 'bash', args: ['-lc', 'curl -s -m 6 http://127.0.0.1:7788/health && echo ok'] },
+        },
+      }]);
+      expect(r1.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+
+      currentCase = 'prose-autolink';
+      const r2 = await consume(client.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'links' }] }],
+      }));
+      expect(r2.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('')).toBe(
+        'Visit https://github.com/Unnori/cortico-provider-gemini-gateway and www.google.com done.',
+      );
+
+      currentCase = 'tool-prefix-rewrite';
+      const r3 = await consume(client.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'run', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'search' }] }],
+      }));
+      const parts3 = r3.flatMap(c => c.candidates?.[0]?.content?.parts ?? []);
+      expect(parts3.filter(p => p.text).map(p => p.text).join('')).toBe('先查一下\n');
+      expect(parts3.filter(p => p.functionCall)).toEqual([
+        { functionCall: { name: 'run', args: { q: '[foo](https://custom.example) done' } } },
+      ]);
+
+      currentCase = 'prose-prefix-rewrite';
+      const r4 = await consume(client.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'end_turn', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'bye' }] }],
+      }));
+      const parts4 = r4.flatMap(c => c.candidates?.[0]?.content?.parts ?? []);
+      expect(parts4.filter(p => p.text).map(p => p.text).join('')).toBe('请看 example.com 后面继续\n');
+      expect(parts4.filter(p => p.functionCall)).toEqual([
+        { functionCall: { name: 'end_turn', args: {} } },
+      ]);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
 });

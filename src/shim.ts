@@ -719,6 +719,88 @@ function hasOrphanCloseBeforeOpen(text: string): boolean {
   return nextOpen < 0 || nextClose < nextOpen;
 }
 
+function isAutoLinkLabel(label: string): 'url' | 'www' | 'email' | null {
+  if (!label || /[\s"'<>[\]]/.test(label)) return null;
+  if (/^https?:\/\/\S+$/i.test(label)) return 'url';
+  if (/^www\.[^\s.]+\.[^\s]+$/i.test(label)) return 'www';
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(label)) return 'email';
+  return null;
+}
+
+function matchesAutoLinkTarget(label: string, kind: 'url' | 'www' | 'email', href: string): boolean {
+  if (kind === 'url') {
+    return href === label || href === `${label}/`;
+  }
+  if (kind === 'www') {
+    return href === `https://${label}` || href === `http://${label}`
+      || href === `https://${label}/` || href === `http://${label}/`;
+  }
+  return href === `mailto:${label}`;
+}
+
+/**
+ * Unwraps Google Robin's server-side Markdown auto-links (`[http://...](http://...)`,
+ * `[https://...](https://...)`, `[www.x](https://www.x)`, `[a@b](mailto:a@b)`) back to the
+ * raw URL/text the model emitted. Prevents streaming prefix mutations mid-URL from stalling
+ * incremental frame diffing and keeps tool-call arguments (e.g. bash `curl` commands) intact.
+ * Intentional Markdown links with distinct labels (`[Docs](https://...)`) and images (`![...](...)`)
+ * are preserved unchanged.
+ */
+export function unwrapRobinAutoLinks(text: string): string {
+  if (!text.includes('](')) return text;
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const open = text.indexOf('[', i);
+    if (open < 0) {
+      out += text.slice(i);
+      break;
+    }
+    if (open > i) out += text.slice(i, open);
+    if (open > 0 && text[open - 1] === '!') {
+      out += '[';
+      i = open + 1;
+      continue;
+    }
+    const closeBracket = text.indexOf(']', open + 1);
+    if (closeBracket < 0 || text[closeBracket + 1] !== '(') {
+      out += '[';
+      i = open + 1;
+      continue;
+    }
+    const label = text.slice(open + 1, closeBracket);
+    const kind = isAutoLinkLabel(label);
+    if (!kind) {
+      out += '[';
+      i = open + 1;
+      continue;
+    }
+    let depth = 1;
+    let j = closeBracket + 2;
+    while (j < text.length && depth > 0) {
+      const ch = text[j];
+      if (ch === '\n' || ch === '\r' || ch === ' ' || ch === '\t') break;
+      if (ch === '(') depth += 1;
+      else if (ch === ')') depth -= 1;
+      j += 1;
+    }
+    if (depth !== 0) {
+      out += '[';
+      i = open + 1;
+      continue;
+    }
+    const href = text.slice(closeBracket + 2, j - 1);
+    if (matchesAutoLinkTarget(label, kind, href)) {
+      out += label;
+      i = j;
+    } else {
+      out += '[';
+      i = open + 1;
+    }
+  }
+  return out;
+}
+
 /** Retains only a possible opening tag prefix or the current tool block across text deltas. */
 export class ToolCallStream {
   private prefix = '';
@@ -736,6 +818,20 @@ export class ToolCallStream {
   /** True when an opening `<tool_call>` (or partial `<tool_call` prefix) has not yet closed with `</tool_call>`. */
   get hasPendingToolMarkup(): boolean {
     return this.tool !== undefined || this.prefix.length > 0;
+  }
+
+  /** Number of trailing raw characters currently buffered inside an open `<tool_call>` or partial `<tool_` prefix. */
+  get pendingRawLength(): number {
+    return this.tool !== undefined ? TOOL_OPEN.length + this.tool.length : this.prefix.length;
+  }
+
+  /** Discards any buffered, not-yet-emitted `<tool_call>` or partial `<tool_` prefix so a mutated frame can be re-fed cleanly. */
+  discardPending(): void {
+    this.prefix = '';
+    this.tool = undefined;
+    this.quoted = false;
+    this.escaped = false;
+    this.closing = 0;
   }
 
   /** True after `finish()` if any unclosed `<tool_call` markup remained unrecovered. */

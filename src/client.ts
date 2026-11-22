@@ -21,6 +21,7 @@ import {
 } from './robin-grpc.ts';
 import {
   decodeGatewayEvent, RobinPartFilter, toGeminiRequest, toRobinRequest, toRpcRequest, ToolCallStream,
+  unwrapRobinAutoLinks,
   type GatewayEvent, type GatewayProtocol, type GeminiChunk, type GeminiPart, type GeminiRequest,
   type ToolCallRepairStrategy, type UploadAttachment,
 } from './shim.ts';
@@ -81,6 +82,59 @@ export interface GatewayStreamOptions {
 
 function endpoint(base: string, route: string): URL {
   return httpUrl(new URL(route, base.replace(/\/+$/, '') + '/').href);
+}
+
+function longestCommonPrefix(a: string, b: string): number {
+  const limit = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < limit && a.charCodeAt(i) === b.charCodeAt(i)) i += 1;
+  return i;
+}
+
+function skipMarkdownLinkTail(text: string, pos: number): number {
+  if (text[pos] !== ']' || text[pos + 1] !== '(') return pos;
+  let depth = 1;
+  let j = pos + 2;
+  while (j < text.length && depth > 0) {
+    const ch = text[j];
+    if (ch === '\n' || ch === '\r' || ch === ' ' || ch === '\t') return pos;
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    j += 1;
+  }
+  return depth === 0 ? j : pos;
+}
+
+/**
+ * When a cumulative Robin frame mutates already-emitted plain text (outside a pending `<tool_call>`),
+ * locates where genuinely new unseen text begins so streaming continues without freezing or repeating text.
+ */
+function findPlainTextResyncOffset(emitted: string, next: string, commonPrefixLen: number): number {
+  const tail = emitted.slice(commonPrefixLen);
+  if (tail) {
+    const maxAnchor = Math.min(tail.length, 32);
+    const minAnchor = Math.min(tail.length, 6);
+    for (let len = maxAnchor; len >= minAnchor; len = len > 12 ? Math.floor(len / 2) : len - 1) {
+      const anchor = emitted.slice(emitted.length - len);
+      const found = next.indexOf(anchor, commonPrefixLen);
+      if (found >= 0 && found - commonPrefixLen <= 256) {
+        const end = found + anchor.length;
+        const skipped = skipMarkdownLinkTail(next, end);
+        if (len >= 3 || skipped > end || found - commonPrefixLen <= 16) {
+          return skipped;
+        }
+      }
+      if (len <= minAnchor) break;
+    }
+    if (tail.startsWith('[') && next[commonPrefixLen] === '[') {
+      const closeBracket = next.indexOf(']', commonPrefixLen + 1);
+      if (closeBracket > commonPrefixLen && next[closeBracket + 1] === '(') {
+        const afterLink = skipMarkdownLinkTail(next, closeBracket);
+        if (afterLink > closeBracket) return afterLink;
+      }
+    }
+  }
+  return Math.min(emitted.length, next.length);
 }
 
 async function checkResponse(response: Response, operation: string): Promise<void> {
@@ -396,18 +450,47 @@ export class GatewayClient {
       if (frame.fallback !== undefined) observedFallback = frame.fallback;
       if (frame.downgradeReason !== undefined) observedDowngrade = frame.downgradeReason;
       const rawParts: GeminiPart[] = [];
-      if (includeThoughts && typeof frame.thought === 'string' && frame.thought.length > emittedThought.length) {
-        if (frame.thought.startsWith(emittedThought)) {
-          const delta = frame.thought.slice(emittedThought.length);
-          emittedThought = frame.thought;
-          if (delta) rawParts.push({ text: delta, thought: true });
+      if (includeThoughts && typeof frame.thought === 'string' && frame.thought.length > 0) {
+        const normalizedThought = unwrapRobinAutoLinks(frame.thought);
+        if (normalizedThought.length > emittedThought.length) {
+          if (normalizedThought.startsWith(emittedThought)) {
+            const delta = normalizedThought.slice(emittedThought.length);
+            emittedThought = normalizedThought;
+            if (delta) rawParts.push({ text: delta, thought: true });
+          } else {
+            const commonPrefixLen = longestCommonPrefix(emittedThought, normalizedThought);
+            const resyncOffset = findPlainTextResyncOffset(emittedThought, normalizedThought, commonPrefixLen);
+            const delta = normalizedThought.slice(resyncOffset);
+            emittedThought = normalizedThought;
+            if (delta) rawParts.push({ text: delta, thought: true });
+          }
         }
       }
-      if (typeof frame.text === 'string' && frame.text.length > emittedText.length) {
-        if (frame.text.startsWith(emittedText)) {
-          const delta = frame.text.slice(emittedText.length);
-          emittedText = frame.text;
-          if (delta) rawParts.push(...parser.feed(delta));
+      if (typeof frame.text === 'string' && frame.text.length > 0) {
+        const normalizedText = unwrapRobinAutoLinks(frame.text);
+        if (normalizedText !== emittedText) {
+          if (normalizedText.startsWith(emittedText)) {
+            const delta = normalizedText.slice(emittedText.length);
+            emittedText = normalizedText;
+            if (delta) rawParts.push(...parser.feed(delta));
+          } else {
+            const commonPrefixLen = longestCommonPrefix(emittedText, normalizedText);
+            const committedOffset = emittedText.length - parser.pendingRawLength;
+            if (
+              commonPrefixLen >= committedOffset
+              && (normalizedText.length >= emittedText.length || normalizedText.includes('</tool_call>') || frame.completed)
+            ) {
+              parser.discardPending();
+              const resynced = normalizedText.slice(committedOffset);
+              emittedText = normalizedText;
+              if (resynced) rawParts.push(...parser.feed(resynced));
+            } else if (normalizedText.length > emittedText.length) {
+              const resyncOffset = findPlainTextResyncOffset(emittedText, normalizedText, commonPrefixLen);
+              const delta = normalizedText.slice(resyncOffset);
+              emittedText = normalizedText;
+              if (delta) rawParts.push(...parser.feed(delta));
+            }
+          }
         }
       }
       const parts = filter.feed(rawParts);
