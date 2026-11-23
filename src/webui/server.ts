@@ -16,6 +16,7 @@ import {
   type GatewayPresetId,
 } from '../options.ts';
 import type { AccountQuotaOption, QuotaBarMode, QuotaSnapshot } from '../quota.ts';
+import { planTierRank } from '../robin-models.ts';
 import type { GatewayProtocol } from '../shim.ts';
 import { httpUrl, record } from '../state.ts';
 import {
@@ -505,7 +506,15 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
                 summary: accounts[0].error || (en ? 'All accounts failed quota check.' : '全部账号连接检测均失败。'),
               };
             }
-            const plan = quota.plan ? ` · ${quota.plan}` : '';
+            const healthyPlans = [...new Map(
+              accounts
+                .filter(a => !a.error && a.plan)
+                .map(a => [a.plan!, planTierRank(a.plan, a.userTier)] as const),
+            ).entries()]
+              .sort((a, b) => b[1] - a[1])
+              .map(([label]) => label);
+            const planLabel = healthyPlans.length ? healthyPlans.join(' / ') : quota.plan;
+            const plan = planLabel ? ` · ${planLabel}` : '';
             const poolNote = accounts.length > 1
               ? (en ? ` · ${okCount}/${accounts.length} accounts ready` : ` · ${okCount}/${accounts.length} 个账号可用`)
               : '';
@@ -673,6 +682,9 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
         if (!accountId) throw new Error(en ? 'Select an account to set as primary.' : '请指定要设为主用的账号。');
         const control = host.instance(name).control as GatewayInstanceControl;
         control.oauth.auth.setPrimaryAccount(accountId);
+        if (configuration(entry).protocol === 'robin') {
+          void control.queryUserStatus(undefined, false, accountId).catch(() => null);
+        }
         return asAuthStatus(control, entry, !host.editing);
       }
       if (method === 'set-routing') {

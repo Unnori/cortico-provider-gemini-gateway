@@ -32,6 +32,39 @@ function inlineMedia(url: unknown): NonNullable<GeminiPart['inlineData']> {
   return { mimeType: canonicalMime(match[1]), data: match[2] };
 }
 
+const SAFE_TOOL_CALL_ID_RE = /^[a-zA-Z0-9_-]{1,40}$/;
+const ORDINAL_CALL_ID_RE = /^call_\d+_/;
+
+/**
+ * Ensures every emitted tool `call_id` is globally unique across the conversation history
+ * and compatible with strict providers (DeepSeek / OpenAI <=40 chars / Claude `[a-zA-Z0-9_-]+`).
+ * Always mints fresh IDs for text-parsed Robin/RPC tool calls so LLM-invented repeating IDs
+ * like `call_0_end_turn` never poison history when hot-switching providers.
+ */
+function mintUniqueCallId(
+  rawId: string | undefined,
+  usedCallIds: Set<string>,
+  alwaysMint: boolean,
+): string {
+  const trimmed = typeof rawId === 'string' ? rawId.trim() : '';
+  if (
+    !alwaysMint
+    && trimmed
+    && SAFE_TOOL_CALL_ID_RE.test(trimmed)
+    && !ORDINAL_CALL_ID_RE.test(trimmed)
+    && !usedCallIds.has(trimmed)
+  ) {
+    usedCallIds.add(trimmed);
+    return trimmed;
+  }
+  let generated: string;
+  do {
+    generated = `call_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  } while (usedCallIds.has(generated));
+  usedCallIds.add(generated);
+  return generated;
+}
+
 function toolConfig(choice: Request['tool_choice']): GeminiRequest['toolConfig'] {
   if (choice == null) return undefined;
   if (typeof choice !== 'string' && choice.type === 'function') {
@@ -361,6 +394,14 @@ export class CustomGeminiProvider extends BaseProvider {
     try {
       const input = toGeminiInput(request, options, this.host, this.prepare(model));
       if (!/^gemini-[\w.:-]+$/.test(input.model)) throw new Error('Configure a Gemini model ID for this gateway');
+      const usedCallIds = new Set<string>();
+      for (const turn of input.contents) {
+        for (const part of turn.parts) {
+          if (part.functionCall?.id) usedCallIds.add(part.functionCall.id);
+          if (part.functionResponse?.id) usedCallIds.add(part.functionResponse.id);
+        }
+      }
+      const alwaysMintCallId = this.client.gatewayProtocol !== 'gemini';
       for await (const chunk of this.client.stream(input, { signal: options.signal, onAttempt: attempt => attempts.push(attempt) })) {
         if (chunk.usageMetadata) nativeUsage = chunk.usageMetadata;
         const metadata: ChunkMeta = { id: chunk.responseId, model: chunk.modelVersion, usage: chunk.usageMetadata && chatUsage(chunk.usageMetadata) };
@@ -371,7 +412,7 @@ export class CustomGeminiProvider extends BaseProvider {
           if (call) {
             if (!call.name || (call.args !== undefined && !record(call.args))) throw new Error('Invalid Gemini functionCall');
             assembly.feedFunctionCall({
-              id: call.id || `call_${randomUUID()}`,
+              id: mintUniqueCallId(call.id, usedCallIds, alwaysMintCallId),
               name: call.name,
               argumentsJson: JSON.stringify(call.args ?? {}),
             }, metadata, emit);

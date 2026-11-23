@@ -33,8 +33,9 @@ const metadata = (entry: LLMProviderEntry, model: string): ModelMetadata | undef
   let fallbacks: string[] | undefined;
   if (isRobin) {
     const ctrl = robinAccounts.get(accountKey(entry));
-    const acct = ctrl?.getCachedAccountInfo();
     const obs = ctrl?.getObservedRouting(model);
+    const targetId = ctrl?.resolveEffectiveAccountId(configuration(entry).accountRouting, model, obs?.accountId);
+    const acct = ctrl?.getCachedAccountInfo(targetId);
     fallbacks = robinCatalogLookupIds(model, acct?.plan, acct?.userTier, obs?.attribution);
   }
   return catalogs.get(catalogKey(entry))?.get(model, fallbacks) ?? geminiBaseline(model);
@@ -171,10 +172,12 @@ export const GEMINI_GATEWAY = {
     if (options.protocol === 'robin') robinAccounts.set(accountKey(entry), oauth);
     const resolveModelMeta = (model: string): ModelMetadata | undefined => {
       const cur = current();
-      const isRobin = configuration(cur).protocol === 'robin';
+      const curCfg = configuration(cur);
+      const isRobin = curCfg.protocol === 'robin';
       if (!isRobin) return catalog.get(model) ?? geminiBaseline(model);
-      const acct = oauth.getCachedAccountInfo();
       const observed = oauth.getObservedRouting(model);
+      const targetId = oauth.resolveEffectiveAccountId(curCfg.accountRouting, model, observed?.accountId);
+      const acct = oauth.getCachedAccountInfo(targetId);
       const fallbacks = robinCatalogLookupIds(model, acct.plan, acct.userTier, observed?.attribution);
       return catalog.get(model, fallbacks) ?? geminiBaseline(model);
     };
@@ -191,10 +194,10 @@ export const GEMINI_GATEWAY = {
           oauth.setProxyUrl(configuration(current()).proxyUrl);
           return oauth.auth.accessToken(force);
         },
-        selectAccounts: () => {
+        selectAccounts: model => {
           oauth.refreshBundledConfig();
           oauth.setProxyUrl(configuration(current()).proxyUrl);
-          return oauth.pickAccountOrder(configuration(current()).accountRouting);
+          return oauth.pickAccountOrder(configuration(current()).accountRouting, model);
         },
         accessTokenFor: (accountId, force) => {
           oauth.refreshBundledConfig();
@@ -272,6 +275,7 @@ export const GEMINI_GATEWAY = {
           host.log.warn('Robin backend routed or downgraded model', routingData);
         }
       },
+      onRobinTransientError: info => host.log.warn('Robin backend transient failure', info),
       onToolCallRepair: info => host.log.info('Repaired malformed tool_call JSON', info),
       onCleanupError: error => host.log.warn('Gemini gateway conversation cleanup failed', {
         error: error instanceof Error ? error.message : String(error),
@@ -285,9 +289,11 @@ export const GEMINI_GATEWAY = {
       queryUserStatus: (signal, force, accountId) => oauth.queryUserStatus(current(), host, signal, force, accountId),
       robinRouteSummary: model => {
         const cur = current();
-        if (configuration(cur).protocol !== 'robin') return undefined;
-        const acct = oauth.getCachedAccountInfo();
+        const curCfg = configuration(cur);
+        if (curCfg.protocol !== 'robin') return undefined;
         const observed = oauth.getObservedRouting(model);
+        const targetId = oauth.resolveEffectiveAccountId(curCfg.accountRouting, model, observed?.accountId);
+        const acct = oauth.getCachedAccountInfo(targetId);
         const observedAccount = oauth.describeAccount(observed?.accountId);
         return buildRobinRouteSummary({
           model,
@@ -298,18 +304,24 @@ export const GEMINI_GATEWAY = {
           userTier: acct.userTier,
           observed,
           observedAccount,
-          overrideModeCategory: oauth.resolveDiscoveredModeCategory(model),
+          overrideModeCategory: oauth.resolveDiscoveredModeCategory(model, targetId),
         });
       },
       acceptTerms: (language, signal, accountId) => oauth.acceptTerms(current(), host, language, signal, accountId),
       metadata: model => resolveModelMeta(model),
       refreshCatalog: async () => {
         const cur = current();
+        const curCfg = configuration(cur);
         const tasks: Promise<unknown>[] = [catalog.refresh(true)];
-        if (configuration(cur).protocol === 'robin' && oauth.authEnabled(cur) && oauth.auth.status().signedIn) {
+        if (curCfg.protocol === 'robin' && oauth.authEnabled(cur) && oauth.auth.status().signedIn) {
           tasks.push(
-            oauth.queryUserStatus(cur, host, undefined, true).catch(() => null),
-            oauth.queryQuota(cur, host).catch(() => null),
+            (async () => {
+              await oauth.queryQuota(cur, host).catch(() => null);
+              const activeId = oauth.resolveEffectiveAccountId(curCfg.accountRouting, cur.spec?.model);
+              const highestId = oauth.findHighestTierAccountId();
+              const statusIds = [...new Set([activeId, highestId].filter((id): id is string => Boolean(id)))];
+              await Promise.all(statusIds.map(id => oauth.queryUserStatus(cur, host, undefined, true, id).catch(() => null)));
+            })(),
           );
         }
         await Promise.all(tasks);
@@ -324,31 +336,49 @@ export const GEMINI_GATEWAY = {
       start: () => {
         const cur = current();
         const curCfg = configuration(cur);
-        if (curCfg.protocol === 'robin' && oauth.authEnabled(cur) && oauth.auth.listAccounts().length > 1) {
-          void oauth.queryQuota(cur, host).catch(() => {});
+        if (curCfg.protocol === 'robin' && oauth.authEnabled(cur) && oauth.auth.listAccounts().length > 0) {
+          void (async () => {
+            await oauth.queryQuota(cur, host).catch(() => null);
+            const activeId = oauth.resolveEffectiveAccountId(curCfg.accountRouting, cur.spec?.model);
+            const highestId = oauth.findHighestTierAccountId();
+            const statusIds = [...new Set([activeId, highestId].filter((id): id is string => Boolean(id)))];
+            await Promise.all(statusIds.map(id => oauth.queryUserStatus(cur, host, undefined, false, id).catch(() => null)));
+          })();
         }
         return catalog.refresh();
       },
       listModels: async () => {
         const cur = current();
-        const isRobin = configuration(cur).protocol === 'robin';
+        const curCfg = configuration(cur);
+        const isRobin = curCfg.protocol === 'robin';
         if (isRobin) {
           const signedIn = oauth.authEnabled(cur) && oauth.auth.status().signedIn;
-          const [userStatus, quota] = await Promise.all([
-            signedIn ? oauth.queryUserStatus(cur, host, undefined, true).catch(err => {
-              host.log.warn('Robin GetUserStatus failed while listing models', {
-                error: err instanceof Error ? err.message : String(err),
-              });
-              return oauth.getCachedAccountInfo().userStatus ?? null;
-            }) : Promise.resolve(null),
+          const [quota] = await Promise.all([
             signedIn ? oauth.queryQuota(cur, host).catch(() => null) : Promise.resolve(null),
             catalog.refresh().catch(() => undefined),
           ]);
-          const acct = oauth.getCachedAccountInfo();
+          const activeId = signedIn ? oauth.resolveEffectiveAccountId(curCfg.accountRouting, cur.spec?.model) : undefined;
+          const highestId = signedIn ? oauth.findHighestTierAccountId() : undefined;
+          let userStatus: RobinUserStatus | null = null;
+          if (signedIn && activeId) {
+            const statusIds = [...new Set([activeId, highestId].filter((id): id is string => Boolean(id)))];
+            const fetched = await Promise.all(statusIds.map(id =>
+              oauth.queryUserStatus(cur, host, undefined, true, id).catch(err => {
+                host.log.warn('Robin GetUserStatus failed while listing models', {
+                  accountId: id,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+                return oauth.getCachedAccountInfo(id).userStatus ?? null;
+              }),
+            ));
+            userStatus = fetched[0] ?? fetched.find(Boolean) ?? null;
+          }
+          const acct = oauth.getCachedAccountInfo(activeId);
           return buildRobinListedModels({
             userStatus,
-            plan: quota?.plan ?? acct.plan,
-            userTier: quota?.userTier ?? acct.userTier,
+            plan: acct.plan ?? quota?.plan,
+            userTier: acct.userTier ?? quota?.userTier,
+            poolPlans: oauth.getPoolPlans(),
             configuredModel: cur.spec?.model,
             resolveMeta: id => resolveModelMeta(id),
             observedRouting: id => oauth.getObservedRouting(id),

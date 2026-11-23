@@ -2,6 +2,7 @@ import type { ListedModel } from 'cortico/providers/base.ts';
 import { geminiModelId, type ModelMetadata } from './catalog.ts';
 import {
   resolveRobinMode,
+  type RobinModeOption,
   type RobinRoutingObservation,
   type RobinUserStatus,
 } from './robin-grpc.ts';
@@ -18,6 +19,7 @@ export interface RobinRouteSummary {
   requestedThinkingLevel?: number;
   officialEntitled?: boolean;
   officialLabel?: string;
+  ultraOnly?: boolean;
   lastAttribution?: string;
   lastObservedAt?: string;
   lastAccount?: string;
@@ -33,9 +35,32 @@ export interface BuildRobinListedModelsOptions {
   userStatus?: RobinUserStatus | null;
   plan?: string;
   userTier?: string;
+  poolPlans?: readonly string[];
   configuredModel?: string;
   resolveMeta: (id: string) => ModelMetadata | undefined;
   observedRouting?: (id: string) => RobinRoutingObservation | undefined;
+}
+
+export function isUltraPlan(plan?: string, userTier?: string): boolean {
+  const tier = userTier?.trim().toUpperCase();
+  return tier === 'TIER2' || tier === 'TIER_NEON' || tier === 'TIER_ULTRA'
+    || plan?.trim().toLowerCase() === 'ultra';
+}
+
+export function planTierRank(plan?: string, userTier?: string): number {
+  if (isUltraPlan(plan, userTier)) return 4;
+  const tier = userTier?.trim().toUpperCase();
+  const p = plan?.trim().toLowerCase();
+  if (tier === 'TIER1' || tier === 'TIER_PRO' || tier === 'TIER_PREMIUM' || p === 'pro') return 3;
+  if (tier === 'TIER_LITE' || tier === 'TIER_PLUS' || tier === 'TIER_HELIUM' || p === 'plus') return 2;
+  if (tier === 'TIER_BASIC' || tier === 'TIER_FREE' || tier === 'TIER0' || p === 'free') return 1;
+  return p ? 1 : 0;
+}
+
+export function isUltraOnlyRobinModel(modelOrName?: string, modeCategory?: number): boolean {
+  if (modeCategory === 8) return true;
+  if (!modelOrName) return false;
+  return /\bcarbon\b/i.test(modelOrName);
 }
 
 function isFreePlan(plan?: string, userTier?: string): boolean {
@@ -49,14 +74,34 @@ function isPaidTier(plan?: string, userTier?: string): boolean {
   );
 }
 
-function formatOfficialDisplayName(modelName: string, title: string, modeCategory: number, plan?: string): string {
-  const base = /^gemini\b/i.test(modelName)
-    ? modelName
-    : modelName
-      ? `Gemini ${modelName}`
-      : `Gemini ${title}`;
+function formatOfficialDisplayName(
+  mode: RobinModeOption,
+  plan?: string,
+  userTier?: string,
+  poolHasUltra = false,
+): string {
+  const base = /^gemini\b/i.test(mode.modelName)
+    ? mode.modelName
+    : mode.modelName
+      ? `Gemini ${mode.modelName}`
+      : `Gemini ${mode.title}`;
+  const ultraOnly = isUltraOnlyRobinModel(mode.modelId, mode.modeCategory)
+    || isUltraOnlyRobinModel(mode.modelName, mode.modeCategory)
+    || mode.entitled === false;
+
+  if (ultraOnly) {
+    if (isUltraPlan(plan, userTier) && mode.entitled !== false) {
+      return `${base} [官方下发 · mode ${mode.modeCategory} · 仅 Ultra 可用]`;
+    }
+    if (poolHasUltra) {
+      return `${base} [官方下发 · mode ${mode.modeCategory} · 仅 Ultra 可用 · 池内 Ultra 优先]`;
+    }
+    const downgradeNote = plan ? `${plan} 选择会被降级` : '非 Ultra 会被降级';
+    return `${base} [mode ${mode.modeCategory} · 仅 Ultra 可用（${downgradeNote}）]`;
+  }
+
   const tierNote = plan ? `${plan} 可用` : '当前账号可用';
-  return `${base} [官方下发 · mode ${modeCategory} · ${tierNote}]`;
+  return `${base} [官方下发 · mode ${mode.modeCategory} · ${tierNote}]`;
 }
 
 function formatNativeRouteDisplayName(
@@ -97,10 +142,14 @@ function formatNativeRouteDisplayName(
  * clearly labeling source & account tier accessibility without mixing unrelated external API models.
  */
 export function buildRobinListedModels(options: BuildRobinListedModelsOptions): ListedModel[] {
-  const { userStatus, plan, userTier, configuredModel, resolveMeta, observedRouting } = options;
+  const { userStatus, plan, userTier, poolPlans, configuredModel, resolveMeta, observedRouting } = options;
   const result: ListedModel[] = [];
   const seenIds = new Set<string>();
   const officialModes = new Set<number>();
+  const poolHasUltra = Boolean(
+    isUltraPlan(plan, userTier)
+    || poolPlans?.some(p => isUltraPlan(p)),
+  );
 
   const push = (id: string, displayName: string) => {
     if (seenIds.has(id)) return;
@@ -117,8 +166,8 @@ export function buildRobinListedModels(options: BuildRobinListedModelsOptions): 
 
   // 1. Official models returned directly by RobinService/GetUserStatus for the signed-in account.
   for (const mode of userStatus?.modes ?? []) {
-    officialModes.add(mode.modeCategory);
-    push(mode.modelId, formatOfficialDisplayName(mode.modelName, mode.title, mode.modeCategory, plan));
+    if (mode.entitled !== false) officialModes.add(mode.modeCategory);
+    push(mode.modelId, formatOfficialDisplayName(mode, plan, userTier, poolHasUltra));
   }
 
   // 2. Explicit 3 native Robin protocol route tiers with clear source & tier-accessibility annotations.
@@ -146,12 +195,15 @@ export function buildRobinListedModels(options: BuildRobinListedModelsOptions): 
     if (!seenIds.has(cleanId)) {
       const mapped = resolveRobinMode(cleanId);
       const modeTag = mapped.smartModelSelection ? 'Auto' : `mode ${mapped.modeCategory}`;
-      const freeWarn = isFreePlan(plan, userTier) && mapped.modeCategory === 3
+      const ultraWarn = isUltraOnlyRobinModel(cleanId, mapped.modeCategory) && !poolHasUltra
+        ? ` · 仅 Ultra 可用（${plan ? `${plan} 会被降级` : '非 Ultra 会被降级'}）`
+        : '';
+      const freeWarn = !ultraWarn && isFreePlan(plan, userTier) && mapped.modeCategory === 3
         ? ' · Free 下由后端路由至 3.1 Pro'
         : '';
       const obs = observedRouting?.(cleanId);
       const obsTag = obs?.attribution ? ` · 实测: ${obs.attribution}` : '';
-      push(cleanId, `${cleanId} [当前已选 · 映射 ${modeTag}${freeWarn}${obsTag}]`);
+      push(cleanId, `${cleanId} [当前已选 · 映射 ${modeTag}${ultraWarn}${freeWarn}${obsTag}]`);
     }
   }
 
@@ -177,7 +229,8 @@ export function robinCatalogLookupIds(
   // Prefer the real server-observed model attribution when available.
   if (observedAttribution) {
     const attr = observedAttribution.toLowerCase();
-    if (attr.includes('4 neon') || attr.includes('neon')) add('gemini-4-neon');
+    if (attr.includes('4 carbon') || attr.includes('carbon')) add('gemini-4-carbon');
+    else if (attr.includes('4 neon') || attr.includes('neon')) add('gemini-4-neon');
     else if (attr.includes('4 hydrogen') || attr.includes('hydrogen')) add('gemini-4-hydrogen');
     else if (attr.includes('3.5 flash-lite')) add('gemini-3.5-flash-lite');
     else if (attr.includes('3.1 pro')) add('gemini-3.1-pro');
@@ -190,7 +243,12 @@ export function robinCatalogLookupIds(
   add(id);
   const free = isFreePlan(plan, userTier);
 
-  if (id === ROBIN_PRO_MODEL_ID || id === 'gemini-4-neon' || id === 'gemini-4-argon') {
+  if (id === 'gemini-4-carbon') {
+    add('gemini-4-neon');
+    add('gemini-3.1-pro');
+    add('gemini-3.1-pro-preview');
+    add('gemini-2.5-pro');
+  } else if (id === ROBIN_PRO_MODEL_ID || id === 'gemini-4-neon' || id === 'gemini-4-argon') {
     if (free) {
       add('gemini-3.1-pro');
       add('gemini-3.1-pro-preview');
@@ -231,7 +289,10 @@ export function buildRobinRouteSummary(opts: {
 }): RobinRouteSummary {
   const { model, thinking, reasoningEffort, userStatus, plan, userTier, observed, observedAccount, overrideModeCategory } = opts;
   const resolved = resolveRobinMode(model, thinking ?? true, reasoningEffort, overrideModeCategory);
-  const official = userStatus?.modes.find(m => m.modelId === geminiModelId(model) || m.modeCategory === resolved.modeCategory);
+  const ultraOnly = isUltraOnlyRobinModel(model, resolved.modeCategory);
+  const official = userStatus?.modes.find(m =>
+    m.entitled !== false && (m.modelId === geminiModelId(model) || m.modeCategory === resolved.modeCategory),
+  );
   const downgraded = Boolean(
     observed && (
       observed.fallback === 1
@@ -250,6 +311,7 @@ export function buildRobinRouteSummary(opts: {
     ...(requestedThinkingLevel !== undefined ? { requestedThinkingLevel } : {}),
     ...(userStatus ? { officialEntitled: Boolean(official) } : {}),
     ...(official ? { officialLabel: `${official.modelName} (mode ${official.modeCategory})` } : {}),
+    ...(ultraOnly ? { ultraOnly: true } : {}),
     ...(observed?.attribution ? { lastAttribution: observed.attribution } : {}),
     ...(observed?.observedAt ? { lastObservedAt: observed.observedAt } : {}),
     ...(observedAccount ? { lastAccount: observedAccount } : {}),

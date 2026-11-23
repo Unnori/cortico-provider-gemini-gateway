@@ -430,6 +430,8 @@ export interface RobinModeOption {
   description?: string;
   modeCategory: number;
   modelId: string;
+  /** True when the mode is enabled in the account's active policy (field 34), false when only advertised in catalog (field 17). */
+  entitled?: boolean;
 }
 
 export interface RobinUserStatus {
@@ -501,7 +503,10 @@ export function resolveRobinMode(
   if (lower.includes('hydrogen') || lower.includes('robin-fast') || lower.includes('flash')) {
     return { modeCategory: 1, smartModelSelection: false, thinkingLevel };
   }
-  // Pro / Neon / Argon (migrated from retired mode 8) / default high-capability route.
+  if (lower.includes('carbon')) {
+    return { modeCategory: 8, smartModelSelection: false, thinkingLevel };
+  }
+  // Pro / Neon / Argon / default high-capability route.
   return { modeCategory: 3, smartModelSelection: false, thinkingLevel };
 }
 
@@ -822,6 +827,8 @@ export interface StreamRobinGrpcOptions {
   completedGraceMs?: number;
   /** Max idle time after visible text starts arriving when `completed` has not yet arrived. */
   textIdleTimeoutMs?: number;
+  /** Longer idle time while an unclosed `<tool_call>` tag is actively streaming so large tool payloads are not cut off mid-JSON. */
+  openToolIdleTimeoutMs?: number;
   /** Shorter idle time once a closed `</tool_call>` block has arrived and no open `<tool_call>` tag remains. */
   toolIdleTimeoutMs?: number;
   /** Shortest idle time once a terminal `end_turn` tool call has closed at the tail of visible text. */
@@ -831,11 +838,20 @@ export interface StreamRobinGrpcOptions {
   onStreamSummary?: (summary: RobinGrpcStreamSummary) => void;
 }
 
-function detectClosedToolIdleKind(text: string): 'end_turn' | 'tool' | 'none' {
-  const lastClose = text.lastIndexOf('</tool_call>');
-  if (lastClose < 0) return 'none';
+function hasPartialToolOpenPrefix(text: string): boolean {
+  const open = '<tool_call>';
+  for (let len = Math.min(open.length - 1, text.length); len > 0; len--) {
+    if (text.endsWith(open.slice(0, len))) return true;
+  }
+  return false;
+}
+
+function detectToolIdleKind(text: string): 'end_turn' | 'tool' | 'open_tool' | 'none' {
   const lastOpen = text.lastIndexOf('<tool_call>');
-  if (lastOpen < 0 || lastOpen > lastClose) return 'none';
+  const lastClose = text.lastIndexOf('</tool_call>');
+  if (lastOpen >= 0 && lastOpen > lastClose) return 'open_tool';
+  if (hasPartialToolOpenPrefix(text)) return 'open_tool';
+  if (lastClose < 0 || lastOpen < 0) return 'none';
   const trailing = text.slice(lastClose + '</tool_call>'.length);
   if (!trailing.trim()) {
     const inner = text.slice(lastOpen + '<tool_call>'.length, lastClose).trim();
@@ -857,6 +873,8 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
   const timeoutMs = options.timeoutMs ?? 180_000;
   const completedGraceMs = options.completedGraceMs ?? 500;
   const textIdleTimeoutMs = options.textIdleTimeoutMs ?? 12_000;
+  const openToolIdleTimeoutMs = options.openToolIdleTimeoutMs
+    ?? (options.textIdleTimeoutMs !== undefined ? options.textIdleTimeoutMs : 45_000);
   const toolIdleTimeoutMs = options.toolIdleTimeoutMs ?? 2_500;
   const endTurnIdleTimeoutMs = options.endTurnIdleTimeoutMs ?? 1_200;
   const wire = buildProcessQueryWire({
@@ -960,12 +978,14 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
     if (closed || sawCompleted || !sawVisibleText) return;
     clearTimeout(idleTimer);
     idleTimer = undefined;
-    const toolKind = detectClosedToolIdleKind(latestText);
+    const toolKind = detectToolIdleKind(latestText);
     const delay = toolKind === 'end_turn'
       ? endTurnIdleTimeoutMs
       : toolKind === 'tool'
         ? toolIdleTimeoutMs
-        : textIdleTimeoutMs;
+        : toolKind === 'open_tool'
+          ? openToolIdleTimeoutMs
+          : textIdleTimeoutMs;
     if (delay <= 0) return;
     idleTimer = setTimeout(() => {
       if (closed) return;
@@ -1341,6 +1361,7 @@ export function decodeRobinUserStatus(bytes: Buffer, fetchedAt = new Date().toIS
   }
 
   let policy: string | undefined;
+  const policyModeCategories = new Set<number>();
   const field34 = singularField(root, 34, 2);
   if (field34) {
     try {
@@ -1356,13 +1377,16 @@ export function decodeRobinUserStatus(bytes: Buffer, fetchedAt = new Date().toIS
             const title = decodeStringField(hf, 6)?.trim() ?? '';
             const modelName = decodeStringField(hf, 7)?.trim() ?? title;
             const description = decodeStringField(hf, 14)?.trim();
-            if (modeCategory !== undefined && (title || modelName)) {
-              pushMode({
-                title: title || modelName,
-                modelName: modelName || title,
-                ...(description ? { description } : {}),
-                modeCategory,
-              });
+            if (modeCategory !== undefined) {
+              policyModeCategories.add(modeCategory);
+              if (title || modelName) {
+                pushMode({
+                  title: title || modelName,
+                  modelName: modelName || title,
+                  ...(description ? { description } : {}),
+                  modeCategory,
+                });
+              }
             }
           }
           for (const opt of entryFields.filter(f => f.number === 2 && f.wire === 2).slice(0, 16)) {
@@ -1384,9 +1408,16 @@ export function decodeRobinUserStatus(bytes: Buffer, fetchedAt = new Date().toIS
     }
   }
 
+  // When active policy entries (field 34) are present, only modes listed there are truly
+  // entitled for this account; extra entries from field 17 (e.g. 4 Carbon on Pro accounts)
+  // are catalog/upsell previews that get downgraded by Google if requested on a lower tier.
+  const annotatedModes = policyModeCategories.size > 0
+    ? modes.map(mode => ({ ...mode, entitled: policyModeCategories.has(mode.modeCategory) }))
+    : modes.map(mode => ({ ...mode, entitled: true }));
+
   return {
     ...(policy ? { policy } : {}),
-    modes,
+    modes: annotatedModes,
     thinkingOptions,
     fetchedAt,
   };

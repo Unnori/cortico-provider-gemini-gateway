@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2
+
+🛡️ 修复 Ultra 套餐与 Carbon 模型权益标注、工具调用 `call_id` 跨轮去重、延长未闭合工具等待窗口，并拦截 Robin 假 200 兜底报错与半截工具卡死：
+- **修复 Ultra 套餐多处误显示为 Pro 及 Carbon（mode 8）权益标注**：解析 `GetUserStatus` 时依据账号实际生效策略（`field 34`）区分真实授权模型与目录预览项（Pro 的 `neon_pro_policy` 不含 `4 Carbon`，Ultra 的 `neon_launch_ultra_policy` 才包含），模型下拉列表、计价面板路由摘要与连接检测均按当前生效账号及账号池准确显示 `Ultra`；`Gemini 4 Carbon` 统一标注为「仅 Ultra 可用」（无 Ultra 账号时明确提示 Pro/非 Ultra 选择会被降级，不再误标为 `Pro 可用`），并在混合账号池选择 Carbon 时自动优先调度 Ultra 账号，同时补齐 `gemini-4-carbon` 原生 `mode 8` 路由映射与默认目录/参考价基线。
+- **为工具调用生成跨轮全局唯一的 `call_id`（避免热切 DeepSeek / OpenAI 报重复 ID）**：Robin / RPC 文本协议下不再透传模型自行编造的易重名 ID（如每轮都重复出现的 `call_0_end_turn`），在经过防脑补过滤后统一签发 21 位全局唯一随机 ID（`call_<16位十六进制>`，兼容 DeepSeek 唯一性校验、OpenAI 40 字符上限与 Claude 字符集规则）；原生 Gemini REST 遇到缺失、重复或序号型 ID 时同样自动重签，减少跨供应商热切时的历史冲突。
+- **未闭合 `<tool_call>` 独立空闲超时（45 秒）**：当流式输出已吐出 `<tool_call>`（含 `<tool_` 起始前缀）但尚未收到闭合的 `</tool_call>` 时，将空闲超时窗口由普通正文的 12 秒放宽至 45 秒，避免长上下文下模型或服务端批量缓冲大段工具参数时被中途掐断（已闭合工具仍维持 2.5 秒、`end_turn` 仍维持 1.2 秒快速收尾）。
+- **未闭合 `<tool_call>` 起手卡死自动恢复**：若上游在尚未输出任何前置正文的情况下就卡死在半截 `<tool_call>{"`（如超时或无完成信号断流），不再将残缺标签写入对话历史，而是转为内部 `504` 瞬时错误自动触发切号或重试一次。
+- **识别 Robin 服务端轮换的瞬时报错兜底文案池**：当 Robin 在 HTTP 200 正常结束的响应里无工具调用、且全文精确返回 Google 常见通用报错模板（如 `I seem to be encountering an error. Can I try something else for you?`、`I encountered an error doing what you asked. Could you try again?`、`Sorry, something went wrong. Please try your request again.` 等）时，不再将其作为正常助手回复写入对话历史，而是转为内部 `503` 瞬时错误触发自动恢复（多账号模式自动切换至下一个可用账号且不将原账号置入冷却，单账号模式短暂间隔后自动重试一次，连续触发则按上游 `503` 报错处理并写日志；正常回复或引用该句后继续解释的情况保持原样放行）。
+
 ## 0.2.1
 
 🔗 修复 Google Robin 流式自动转链接导致工具调用或正文半路卡断的问题：

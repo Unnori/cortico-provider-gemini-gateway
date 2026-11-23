@@ -37,6 +37,7 @@ export const BUILTIN_ROBIN_MODELS: readonly ModelMetadata[] = [
   { id: 'gemini-robin-fast', displayName: 'Robin FAST (mode 1)', contextWindow: 1_048_576, maxOutputTokens: 65_536, inputMimeTypes: [...MULTIMODAL_VIDEO_MIME], source: 'baseline' },
   { id: 'gemini-robin-flash-lite', displayName: 'Robin Flash-Lite (mode 6)', contextWindow: 1_048_576, maxOutputTokens: 65_536, inputMimeTypes: [...BASELINE_MIME], source: 'baseline' },
   { id: 'gemini-3.5-flash-lite', displayName: 'Gemini 3.5 Flash-Lite', contextWindow: 1_048_576, maxOutputTokens: 65_536, inputMimeTypes: [...BASELINE_MIME], source: 'baseline' },
+  { id: 'gemini-4-carbon', displayName: 'Gemini 4 Carbon (Ultra)', contextWindow: 1_048_576, maxOutputTokens: 65_536, inputMimeTypes: [...MULTIMODAL_VIDEO_MIME], source: 'baseline' },
   { id: 'gemini-4-argon', displayName: 'Gemini 4 Argon (Ultra)', contextWindow: 1_048_576, maxOutputTokens: 65_536, inputMimeTypes: [...MULTIMODAL_VIDEO_MIME], source: 'baseline' },
   { id: 'gemini-4-neon', displayName: 'Gemini 4 Neon', contextWindow: 1_048_576, maxOutputTokens: 65_536, inputMimeTypes: [...MULTIMODAL_VIDEO_MIME], source: 'baseline' },
   { id: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen (Fast)', contextWindow: 1_048_576, maxOutputTokens: 65_536, inputMimeTypes: [...MULTIMODAL_VIDEO_MIME], source: 'baseline' },

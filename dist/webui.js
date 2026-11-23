@@ -131,6 +131,8 @@ var modelSettingsPanel = {
         }
         if (r.officialEntitled === true && r.officialLabel) {
           parts.push(en ? `Official: ${r.officialLabel}` : `\u5B98\u65B9\u4E0B\u53D1\uFF1A${r.officialLabel}`);
+        } else if (r.ultraOnly && r.officialEntitled === false) {
+          parts.push(en ? "Ultra only (Pro/Free accounts will be downgraded by backend)" : "\u4EC5 Ultra \u53EF\u7528\uFF08Pro/Free \u8D26\u53F7\u9009\u62E9\u4F1A\u88AB\u540E\u7AEF\u964D\u7EA7\uFF09");
         } else if (r.officialEntitled === false) {
           parts.push(en ? "Not in account official picker (routed by backend tier)" : "\u4E0D\u5728\u8BE5\u8D26\u53F7\u5B98\u65B9\u4E0B\u62C9\u5217\u8868\uFF08\u7531\u540E\u7AEF\u6309\u5957\u9910\u6743\u76CA\u8DEF\u7531\uFF09");
         }

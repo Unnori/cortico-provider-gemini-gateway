@@ -27,6 +27,7 @@ import {
 import { configuration, resolveHeaders, shouldUseOAuth, type AccountRoutingMode } from './options.ts';
 import { GatewayError } from './queue.ts';
 import { geminiModelId } from './catalog.ts';
+import { isUltraOnlyRobinModel, isUltraPlan, planTierRank } from './robin-models.ts';
 import {
   type AccountQuotaOption,
   type AccountQuotaSnapshot,
@@ -396,7 +397,45 @@ export class GatewayControl {
     };
   }
 
-  pickAccountOrder(routing: AccountRoutingMode): string[] {
+  isAccountUltra(accountId: string): boolean {
+    const rt = this.accountRuntime.get(accountId);
+    if (!rt) return false;
+    if (isUltraPlan(rt.plan?.plan, rt.plan?.userTier)) return true;
+    const status = rt.userStatus?.value;
+    if (status?.policy?.toLowerCase().includes('ultra')) return true;
+    if (status?.modes.some(m => m.modeCategory === 8 && m.entitled !== false)) return true;
+    return false;
+  }
+
+  getPoolPlans(): string[] {
+    const seen = new Map<string, number>();
+    for (const acct of this.auth.listAccounts()) {
+      const rt = this.accountRuntime.get(acct.id);
+      const plan = rt?.plan?.plan ?? (this.isAccountUltra(acct.id) ? 'Ultra' : undefined);
+      if (!plan) continue;
+      const rank = planTierRank(plan, rt?.plan?.userTier);
+      if (!seen.has(plan) || (seen.get(plan) ?? 0) < rank) seen.set(plan, rank);
+    }
+    return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([plan]) => plan);
+  }
+
+  findHighestTierAccountId(): string | undefined {
+    const accounts = orderPrimaryFirst(this.auth.listAccounts());
+    let bestId: string | undefined;
+    let bestRank = -1;
+    for (const acct of accounts) {
+      const rt = this.accountRuntime.get(acct.id);
+      const plan = rt?.plan?.plan ?? (this.isAccountUltra(acct.id) ? 'Ultra' : undefined);
+      const rank = planTierRank(plan, rt?.plan?.userTier);
+      if (rank > bestRank) {
+        bestRank = rank;
+        bestId = acct.id;
+      }
+    }
+    return bestId ?? this.auth.primaryAccountId();
+  }
+
+  private rankAccounts(routing: AccountRoutingMode, model: string | undefined, advanceCursor: boolean): string[] {
     const ordered = routing === 'failover'
       ? orderPrimaryFirst(this.auth.listAccounts())
       : this.auth.listAccounts();
@@ -415,7 +454,8 @@ export class GatewayControl {
 
     let orderedHealthy = healthy;
     if (routing === 'round-robin' && healthy.length > 1) {
-      const offset = this.rrCursor++ % healthy.length;
+      const cursor = advanceCursor ? this.rrCursor++ : this.rrCursor;
+      const offset = cursor % healthy.length;
       orderedHealthy = [...healthy.slice(offset), ...healthy.slice(0, offset)];
     } else if (routing === 'least-used' && healthy.length > 1) {
       orderedHealthy = [...healthy].sort((a, b) => {
@@ -434,7 +474,33 @@ export class GatewayControl {
       });
     }
 
+    // For Ultra-only models (e.g. gemini-4-carbon / mode 8), prioritize Ultra-entitled accounts
+    // ahead of Pro/Free accounts so requests do not silently hit Pro and get downgraded.
+    if (isUltraOnlyRobinModel(model) && orderedHealthy.length > 1) {
+      const ultraHealthy = orderedHealthy.filter(a => this.isAccountUltra(a.id));
+      if (ultraHealthy.length > 0 && ultraHealthy.length < orderedHealthy.length) {
+        const otherHealthy = orderedHealthy.filter(a => !this.isAccountUltra(a.id));
+        orderedHealthy = [...ultraHealthy, ...otherHealthy];
+      }
+    }
+
     return [...orderedHealthy.map(a => a.id), ...cooled.map(c => c.acct.id)];
+  }
+
+  pickAccountOrder(routing: AccountRoutingMode, model?: string): string[] {
+    return this.rankAccounts(routing, model, true);
+  }
+
+  resolveEffectiveAccountId(
+    routing: AccountRoutingMode,
+    model?: string,
+    preferredAccountId?: string,
+  ): string | undefined {
+    const accounts = this.auth.listAccounts();
+    if (preferredAccountId && accounts.some(a => a.id === preferredAccountId)) {
+      return preferredAccountId;
+    }
+    return this.rankAccounts(routing, model, false)[0] ?? this.auth.primaryAccountId();
   }
 
   recordRouting(observation: RobinRoutingObservation, accountId?: string): void {
@@ -478,7 +544,11 @@ export class GatewayControl {
     let userStatus = primaryRt?.userStatus?.value;
     let plan = primaryRt?.plan?.plan;
     let userTier = primaryRt?.plan?.userTier;
-    if (!userStatus || !plan) {
+    if (!plan && resolvedId && this.isAccountUltra(resolvedId)) {
+      plan = 'Ultra';
+      userTier ??= 'TIER2';
+    }
+    if (!accountId && (!userStatus || !plan)) {
       for (const rt of this.accountRuntime.values()) {
         if (!userStatus && rt.userStatus?.value) userStatus = rt.userStatus.value;
         if (!plan && rt.plan?.plan) plan = rt.plan.plan;
@@ -538,6 +608,16 @@ export class GatewayControl {
           connectHttp2: h2Connector,
         });
         rt.userStatus = { value: status, expiresAt: Date.now() + ROBIN_STATUS_TTL_MS };
+        if (!rt.plan?.plan && status.policy) {
+          const policyLower = status.policy.toLowerCase();
+          if (policyLower.includes('ultra')) {
+            rt.plan = { plan: 'Ultra', userTier: 'TIER2', expiresAt: Date.now() + ROBIN_STATUS_TTL_MS };
+          } else if (policyLower.includes('pro')) {
+            rt.plan = { plan: 'Pro', userTier: 'TIER1', expiresAt: Date.now() + ROBIN_STATUS_TTL_MS };
+          } else if (policyLower.includes('free')) {
+            rt.plan = { plan: 'Free', userTier: 'TIER_BASIC', expiresAt: Date.now() + ROBIN_STATUS_TTL_MS };
+          }
+        }
         return status;
       } catch (error) {
         if (error instanceof GatewayError && error.status === 401 && attempt === 0 && !signal?.aborted) {

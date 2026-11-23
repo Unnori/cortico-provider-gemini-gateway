@@ -30,7 +30,7 @@ import { httpUrl, record } from './state.ts';
 export interface GatewayAuthProvider {
   accessToken(force?: boolean): Promise<string>;
   enabled?: () => boolean;
-  selectAccounts?: () => string[];
+  selectAccounts?: (model?: string) => string[];
   accessTokenFor?: (accountId: string, force?: boolean) => Promise<string>;
   onAccountSuccess?: (accountId: string) => void;
   onAccountFailure?: (accountId: string, status: number | null, detail?: string) => void;
@@ -57,12 +57,15 @@ export interface GatewayClientOptions {
   resolveRobinModeCategory?: (model: string, accountId?: string) => number | undefined;
   estimateRobinTokens?: boolean | (() => boolean);
   onRobinRouting?: (observation: RobinRoutingObservation, accountId?: string) => void;
+  onRobinTransientError?: (info: { accountId?: string; detail: string; action: 'failover' | 'retry' | 'fail' }) => void;
   onToolCallRepair?: (info: { name: string; strategy: ToolCallRepairStrategy }) => void;
   onCleanupError?: (error: unknown) => void;
   proxyUrl?: string;
   robinTextIdleTimeoutMs?: number;
+  robinOpenToolIdleTimeoutMs?: number;
   robinToolIdleTimeoutMs?: number;
   robinEndTurnIdleTimeoutMs?: number;
+  robinTransientRetryDelayMs?: number;
   fetch?: typeof fetch;
   connectHttp2?: Http2Connector;
 }
@@ -148,6 +151,55 @@ async function checkResponse(response: Response, operation: string): Promise<voi
 
 const ROBIN_UPLOAD_CACHE_TTL_MS = 10 * 60_000;
 const ROBIN_UPLOAD_CACHE_MAX = 32;
+const ROBIN_CANNED_ERROR_TEXTS: readonly string[] = [
+  'i seem to be encountering an error. can i try something else for you?',
+  'i encountered an error doing what you asked. could you try again?',
+  'sorry, something went wrong. please try your request again.',
+  'something went wrong. please try again.',
+  'something went wrong. please try again later.',
+  'an error occurred. please try again.',
+  "i'm having a hard time fulfilling your request. can i help you with something else instead?",
+  "i'm having trouble fulfilling your request. please try again.",
+  "i'm having trouble right now. please try again later.",
+  "i couldn't complete your request. please try again.",
+  "something went wrong and i couldn't complete your request. please try again.",
+  'sorry, i ran into an error. please try again.',
+  'i ran into an error. please try again.',
+];
+
+function isRobinCannedErrorPrefix(normalized: string): boolean {
+  return ROBIN_CANNED_ERROR_TEXTS.some(phrase => phrase.startsWith(normalized));
+}
+
+function isRobinCannedErrorExact(normalized: string): boolean {
+  return ROBIN_CANNED_ERROR_TEXTS.includes(normalized);
+}
+
+class RobinTransientError extends GatewayError {
+  constructor(status: number, detail: string) {
+    super(status, 'generation', { detail });
+  }
+}
+
+function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    timer.unref();
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 export class GatewayClient {
   private readonly queue = new SerialQueue();
@@ -164,6 +216,10 @@ export class GatewayClient {
     this.request = options.fetch ?? createProxyFetchFor(options.proxyUrl);
     this.h2Connector = options.connectHttp2 ?? createHttp2Connector(options.proxyUrl);
     this.protocol = options.protocol ?? 'rpc';
+  }
+
+  get gatewayProtocol(): GatewayProtocol {
+    return this.protocol;
   }
 
   private async headers(force: boolean, accountId?: string): Promise<Headers> {
@@ -408,9 +464,11 @@ export class GatewayClient {
     const filter = new RobinPartFilter();
     let emittedText = '';
     let emittedThought = '';
+    let heldCannedText = '';
     let received = false;
     let emittedToolCallCount = 0;
     let emittedVisibleTextCount = 0;
+    let emittedThoughtCount = 0;
     let truncatedEarly = false;
     let streamSummary: RobinGrpcStreamSummary | undefined;
     let observedAttribution: string | undefined;
@@ -433,6 +491,7 @@ export class GatewayClient {
       temporaryChat: this.options.temporaryChat ?? true,
       signal,
       ...(this.options.robinTextIdleTimeoutMs !== undefined ? { textIdleTimeoutMs: this.options.robinTextIdleTimeoutMs } : {}),
+      ...(this.options.robinOpenToolIdleTimeoutMs !== undefined ? { openToolIdleTimeoutMs: this.options.robinOpenToolIdleTimeoutMs } : {}),
       ...(this.options.robinToolIdleTimeoutMs !== undefined ? { toolIdleTimeoutMs: this.options.robinToolIdleTimeoutMs } : {}),
       ...(this.options.robinEndTurnIdleTimeoutMs !== undefined ? { endTurnIdleTimeoutMs: this.options.robinEndTurnIdleTimeoutMs } : {}),
       connectHttp2: this.h2Connector,
@@ -493,14 +552,43 @@ export class GatewayClient {
           }
         }
       }
-      const parts = filter.feed(rawParts);
-      for (const part of parts) {
-        if (part.functionCall) emittedToolCallCount += 1;
-        else if (!part.thought && typeof part.text === 'string' && part.text) emittedVisibleTextCount += 1;
+      const filteredParts = filter.feed(rawParts);
+      const parts: GeminiPart[] = [];
+      for (const part of filteredParts) {
+        if (part.functionCall) {
+          if (heldCannedText) {
+            parts.push({ text: heldCannedText });
+            emittedVisibleTextCount += 1;
+            heldCannedText = '';
+          }
+          emittedToolCallCount += 1;
+          parts.push(part);
+          continue;
+        }
+        if (!part.thought && typeof part.text === 'string' && part.text) {
+          if (emittedToolCallCount === 0 && emittedVisibleTextCount === 0) {
+            const candidate = heldCannedText + part.text;
+            const norm = candidate.trimStart().toLowerCase();
+            if (!norm || isRobinCannedErrorPrefix(norm)) {
+              heldCannedText = candidate;
+              continue;
+            }
+            heldCannedText = '';
+            emittedVisibleTextCount += 1;
+            parts.push({ text: candidate });
+            continue;
+          }
+          emittedVisibleTextCount += 1;
+          parts.push(part);
+          continue;
+        }
+        if (part.thought && typeof part.text === 'string' && part.text) emittedThoughtCount += 1;
+        parts.push(part);
       }
-      received ||= Boolean(parts.length || frame.completed || emittedText.length > 0);
+      const hasEmittedOutput = emittedToolCallCount > 0 || emittedVisibleTextCount > 0 || emittedThoughtCount > 0;
+      received ||= Boolean(parts.length || heldCannedText.length > 0 || frame.completed || emittedText.length > 0);
       if (parts.length) onMeta({ observed: true });
-      if (parts.length || frame.responseId || frame.modelVersion) {
+      if (parts.length || (!heldCannedText && (!parser.hasPendingToolMarkup || hasEmittedOutput) && (frame.responseId || frame.modelVersion))) {
         yield {
           ...(parts.length ? { candidates: [{ content: { role: 'model', parts } }] } : {}),
           responseId: frame.responseId,
@@ -514,6 +602,56 @@ export class GatewayClient {
     }
 
     if (!received) throw new Error('Gemini gateway stream ended without a complete response');
+    const hadPriorOutput = emittedToolCallCount > 0 || emittedVisibleTextCount > 0 || emittedThoughtCount > 0;
+    const parserTail = parser.finish();
+    const hadPendingToolMarkup = parser.hadUnrecoveredToolMarkup;
+    const rawTail = [...filter.feed(parserTail), ...filter.finish()];
+    const tail: GeminiPart[] = [];
+    for (const part of rawTail) {
+      if (part.functionCall) {
+        if (heldCannedText) {
+          tail.push({ text: heldCannedText });
+          emittedVisibleTextCount += 1;
+          heldCannedText = '';
+        }
+        emittedToolCallCount += 1;
+        tail.push(part);
+      } else if (!part.thought && typeof part.text === 'string' && part.text) {
+        if (emittedToolCallCount === 0 && emittedVisibleTextCount === 0) {
+          heldCannedText += part.text;
+        } else {
+          emittedVisibleTextCount += 1;
+          tail.push(part);
+        }
+      } else {
+        tail.push(part);
+      }
+    }
+    if (heldCannedText) {
+      if (emittedToolCallCount === 0 && emittedVisibleTextCount === 0
+          && isRobinCannedErrorExact(heldCannedText.trim().toLowerCase())) {
+        throw new RobinTransientError(
+          503,
+          `Robin upstream returned transient canned error ("${heldCannedText.trim()}")`,
+        );
+      }
+      tail.unshift({ text: heldCannedText });
+      emittedVisibleTextCount += 1;
+      heldCannedText = '';
+    }
+    const confirmedComplete = Boolean(
+      truncatedEarly
+      || streamSummary?.sawCompleted
+      || streamSummary?.sawGrpcStatusOk,
+    );
+    if (!confirmedComplete && !hadPriorOutput && hadPendingToolMarkup && emittedToolCallCount === 0) {
+      throw new RobinTransientError(
+        504,
+        streamSummary?.endedByIdleTimeout
+          ? `Robin gRPC stream stalled mid-<tool_call> (${emittedText.length} chars buffered without closing)`
+          : `Robin gRPC stream ended mid-<tool_call> without completion (${emittedText.length} chars buffered)`,
+      );
+    }
     if (
       observedAttribution !== undefined
       || observedResolvedMode !== undefined
@@ -534,18 +672,6 @@ export class GatewayClient {
         observedAt: new Date().toISOString(),
       }, accountId);
     }
-    const parserTail = parser.finish();
-    const hadPendingToolMarkup = parser.hadUnrecoveredToolMarkup;
-    const tail = [...filter.feed(parserTail), ...filter.finish()];
-    for (const part of tail) {
-      if (part.functionCall) emittedToolCallCount += 1;
-      else if (!part.thought && typeof part.text === 'string' && part.text) emittedVisibleTextCount += 1;
-    }
-    const confirmedComplete = Boolean(
-      truncatedEarly
-      || streamSummary?.sawCompleted
-      || streamSummary?.sawGrpcStatusOk,
-    );
     if (!confirmedComplete && emittedVisibleTextCount === 0 && emittedToolCallCount === 0) {
       throw new GatewayError(504, 'generation', {
         detail: streamSummary?.endedByIdleTimeout
@@ -600,21 +726,25 @@ export class GatewayClient {
       const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
       const authActive = Boolean(this.options.auth && (!this.options.auth.enabled || this.options.auth.enabled()));
       const selectedIds = authActive && this.options.auth?.selectAccounts
-        ? this.options.auth.selectAccounts()
+        ? this.options.auth.selectAccounts(input.model)
         : [];
       const accountCandidates: (string | undefined)[] = selectedIds.length > 0 ? selectedIds : [undefined];
+
+      let transientRetries = 0;
 
       for (let accountIndex = 0; accountIndex < accountCandidates.length; accountIndex++) {
         const accountId = accountCandidates[accountIndex];
         const hasNextAccount = accountIndex + 1 < accountCandidates.length;
         let body: string | undefined;
         let failoverToNext = false;
+        let forceRefresh = false;
+        let refreshed401 = false;
 
-        for (let attempt = 0; attempt < 2; attempt++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
           signal.throwIfAborted();
           let headers: Headers;
           try {
-            headers = await this.headers(attempt === 1, accountId);
+            headers = await this.headers(forceRefresh, accountId);
           } catch (error) {
             if (accountId && hasNextAccount && !signal.aborted) {
               this.options.auth?.onAccountFailure?.(
@@ -625,7 +755,7 @@ export class GatewayClient {
               failoverToNext = true;
               break;
             }
-            if (attempt === 1) throw new GatewayError(401, 'OAuth refresh', { cause: error });
+            if (forceRefresh) throw new GatewayError(401, 'OAuth refresh', { cause: error });
             throw error;
           }
           signal.throwIfAborted();
@@ -708,8 +838,26 @@ export class GatewayClient {
               this.clearRobinAttachmentCacheFor(accountId);
             }
             if (!signal.aborted && error instanceof GatewayError && error.status === 401
-                && attempt === 0 && authActive && !observed) {
+                && !refreshed401 && authActive && !observed) {
+              refreshed401 = true;
+              forceRefresh = true;
               continue;
+            }
+            if (!signal.aborted && !observed && error instanceof RobinTransientError) {
+              if (transientRetries < 1) {
+                transientRetries += 1;
+                if (hasNextAccount) {
+                  this.options.onRobinTransientError?.({ accountId, detail: error.message, action: 'failover' });
+                  failoverToNext = true;
+                  break;
+                }
+                this.options.onRobinTransientError?.({ accountId, detail: error.message, action: 'retry' });
+                await sleepAbortable(this.options.robinTransientRetryDelayMs ?? 500, signal);
+                forceRefresh = false;
+                continue;
+              }
+              this.options.onRobinTransientError?.({ accountId, detail: error.message, action: 'fail' });
+              throw error;
             }
             const isTermsError = error instanceof GatewayError
               && /accept our terms of service|terms of service|服务条款/i.test(error.message);

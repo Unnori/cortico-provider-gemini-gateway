@@ -574,6 +574,7 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
       description: 'Quick answers',
       modeCategory: 6,
       modelId: 'gemini-3.5-flash-lite',
+      entitled: true,
     }]);
     expect(decoded.thinkingOptions.map(o => [o.label, o.thinkingLevel])).toEqual([
       ['Low', 1],
@@ -621,6 +622,85 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
     });
     expect(proList.slice(0, 3).map(m => m.id)).toEqual(['gemini-4-neon', 'gemini-4-hydrogen', 'gemini-3.5-flash-lite']);
     expect(proList[0].displayName).toContain('Pro 可用');
+
+    // Pro account whose field 17 advertises 4 Carbon (mode 8) while field 34 (neon_pro_policy) omits mode 8:
+    // Carbon MUST NOT be marked as "Pro 可用" and MUST be marked Ultra-only with downgrade warning.
+    const f17Neon = Buffer.concat([stringField(1, 'v_neon'), stringField(2, 'Neon'), stringField(3, '4 Neon'), varintField(23, 3)]);
+    const f17Carbon = Buffer.concat([stringField(1, 'v_carbon'), stringField(2, 'Carbon'), stringField(3, '4 Carbon'), varintField(23, 8)]);
+    const f34NeonRow = Buffer.concat([lengthDelimited(1, Buffer.concat([varintField(3, 3), stringField(6, 'Neon'), stringField(7, '4 Neon')]))]);
+    const f34CarbonRow = Buffer.concat([lengthDelimited(1, Buffer.concat([varintField(3, 8), stringField(6, 'Carbon'), stringField(7, '4 Carbon')]))]);
+    const proRawStatus = decodeRobinUserStatus(Buffer.concat([
+      lengthDelimited(17, f17Neon),
+      lengthDelimited(17, f17Carbon),
+      lengthDelimited(34, Buffer.concat([stringField(1, 'neon_pro_policy'), lengthDelimited(2, f34NeonRow)])),
+    ]));
+    expect(proRawStatus.modes.find(m => m.modelId === 'gemini-4-neon')?.entitled).toBe(true);
+    expect(proRawStatus.modes.find(m => m.modelId === 'gemini-4-carbon')?.entitled).toBe(false);
+
+    const proOnlyCarbonList = buildRobinListedModels({
+      userStatus: proRawStatus,
+      plan: 'Pro',
+      userTier: 'TIER1',
+      poolPlans: ['Pro'],
+      resolveMeta: id => geminiBaseline(id),
+    });
+    const proCarbonEntry = proOnlyCarbonList.find(m => m.id === 'gemini-4-carbon')!;
+    expect(proCarbonEntry.displayName).toContain('仅 Ultra 可用');
+    expect(proCarbonEntry.displayName).toContain('降级');
+    expect(proCarbonEntry.displayName).not.toContain('Pro 可用');
+
+    // Ultra account whose field 34 (neon_launch_ultra_policy) includes mode 8:
+    // Regular models show "Ultra 可用" (never "Pro 可用") and Carbon shows "仅 Ultra 可用".
+    const ultraRawStatus = decodeRobinUserStatus(Buffer.concat([
+      lengthDelimited(17, f17Neon),
+      lengthDelimited(17, f17Carbon),
+      lengthDelimited(34, Buffer.concat([
+        stringField(1, 'neon_launch_ultra_policy'),
+        lengthDelimited(2, f34NeonRow),
+        lengthDelimited(2, f34CarbonRow),
+      ])),
+    ]));
+    expect(ultraRawStatus.modes.find(m => m.modelId === 'gemini-4-carbon')?.entitled).toBe(true);
+
+    const ultraList = buildRobinListedModels({
+      userStatus: ultraRawStatus,
+      plan: 'Ultra',
+      userTier: 'TIER2',
+      poolPlans: ['Ultra'],
+      resolveMeta: id => geminiBaseline(id),
+    });
+    expect(ultraList.find(m => m.id === 'gemini-4-neon')?.displayName).toContain('Ultra 可用');
+    expect(ultraList.find(m => m.id === 'gemini-4-neon')?.displayName).not.toContain('Pro 可用');
+    expect(ultraList.find(m => m.id === 'gemini-4-carbon')?.displayName).toContain('仅 Ultra 可用');
+    expect(ultraList.find(m => m.id === 'gemini-4-carbon')?.displayName).not.toContain('Pro 可用');
+    expect(ultraList.find(m => m.id === 'gemini-robin-pro')?.displayName).toContain('Ultra 可用');
+    expect(ultraList.find(m => m.id === 'gemini-robin-fast')?.displayName).toContain('Ultra 可用');
+
+    // resolveRobinMode maps gemini-4-carbon directly to mode 8 even without cached GetUserStatus.
+    expect(resolveRobinMode('gemini-4-carbon', true, 'low')).toEqual({
+      modeCategory: 8,
+      smartModelSelection: false,
+      thinkingLevel: 1,
+    });
+
+    // buildRobinRouteSummary marks Carbon as officialEntitled=false on Pro and officialEntitled=true on Ultra.
+    const proCarbonSummary = buildRobinRouteSummary({
+      model: 'gemini-4-carbon',
+      userStatus: proRawStatus,
+      plan: 'Pro',
+      userTier: 'TIER1',
+    });
+    expect(proCarbonSummary.ultraOnly).toBe(true);
+    expect(proCarbonSummary.officialEntitled).toBe(false);
+    const ultraCarbonSummary = buildRobinRouteSummary({
+      model: 'gemini-4-carbon',
+      userStatus: ultraRawStatus,
+      plan: 'Ultra',
+      userTier: 'TIER2',
+    });
+    expect(ultraCarbonSummary.ultraOnly).toBe(true);
+    expect(ultraCarbonSummary.officialEntitled).toBe(true);
+    expect(ultraCarbonSummary.plan).toBe('Ultra');
 
     // Catalog lookup aligns Free PRO route to 3.1 Pro and Pro PRO route to 4 Neon.
     expect(robinCatalogLookupIds('gemini-robin-pro', 'Free', 'TIER_BASIC')).toEqual(
@@ -1295,6 +1375,288 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
         { functionCall: { name: 'end_turn', args: {} } },
       ]);
     } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it('intercepts Robin transient canned errors (retry on single account, failover on multi-account, preserve legitimate quotes)', async () => {
+    type Mode = 'single-retry-ok' | 'multi-failover-ok' | 'persistent-canned' | 'quoted-canned' | 'prefix-only';
+    let mode: Mode = 'single-retry-ok';
+    let callCount = 0;
+    const seenTokens: string[] = [];
+    const server = http2.createServer();
+
+    server.on('stream', (stream, headers) => {
+      if (headers[':path'] !== ROBIN_GRPC_PROCESS_QUERY) {
+        stream.respond({ ':status': 404 });
+        stream.end();
+        return;
+      }
+      seenTokens.push(String(headers.authorization ?? ''));
+      callCount += 1;
+      const attemptNo = callCount;
+      stream.resume();
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        const send = (text: string, completed = false) => {
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text,
+            responseId: `rc_canned_${attemptNo}`,
+            attribution: 'Used 4 Neon model',
+            completed,
+          })));
+        };
+
+        if (mode === 'single-retry-ok') {
+          if (attemptNo === 1) {
+            // Split across 2 frames to verify prefix buffering holds cleanly without leaking downstream.
+            send('I seem to be encountering ');
+            send('I seem to be encountering an error. Can I try something else for you?', true);
+          } else {
+            send('<tool_call>{"name":"pet_say","args":{"script":"重试成功啦！"}}</tool_call>', true);
+          }
+        } else if (mode === 'multi-failover-ok') {
+          if (attemptNo === 1) {
+            send('I encountered an error doing what you asked. Could you try again?', true);
+          } else {
+            send('二号账号接力成功！', true);
+          }
+        } else if (mode === 'persistent-canned') {
+          send('Sorry, something went wrong. Please try your request again.', true);
+        } else if (mode === 'quoted-canned') {
+          send('I seem to be encountering an error. Can I try something else for you?');
+          send('I seem to be encountering an error. Can I try something else for you? 这句话是 Google 返回的。', true);
+        } else {
+          send('I seem to be', true);
+        }
+
+        stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+        stream.end();
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      // 1. Single account: retries once without forcing OAuth refresh and returns clean tool call.
+      const events1: { accountId?: string; action: string }[] = [];
+      const refreshFlags: boolean[] = [];
+      const singleClient = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        robinTransientRetryDelayMs: 0,
+        onRobinTransientError: info => events1.push({ accountId: info.accountId, action: info.action }),
+        auth: {
+          accessToken: async force => {
+            refreshFlags.push(Boolean(force));
+            return 'tok-single';
+          },
+        },
+      });
+      mode = 'single-retry-ok';
+      callCount = 0;
+      const res1 = await consume(singleClient.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'pet_say', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+      }));
+      expect(res1.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { functionCall: { name: 'pet_say', args: { script: '重试成功啦！' } } },
+      ]);
+      expect(events1).toEqual([{ accountId: undefined, action: 'retry' }]);
+      expect(refreshFlags).toEqual([false, false]);
+
+      // 2. Multi-account: fails over to second account WITHOUT putting first account into failure cooldown.
+      const failedAccounts: string[] = [];
+      const succeededAccounts: string[] = [];
+      const events2: { accountId?: string; action: string }[] = [];
+      const multiClient = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        robinTransientRetryDelayMs: 0,
+        onRobinTransientError: info => events2.push({ accountId: info.accountId, action: info.action }),
+        auth: {
+          accessToken: async () => 'tok-default',
+          selectAccounts: () => ['acct_1', 'acct_2'],
+          accessTokenFor: async id => `tok-${id}`,
+          onAccountFailure: id => failedAccounts.push(id),
+          onAccountSuccess: id => succeededAccounts.push(id),
+        },
+      });
+      mode = 'multi-failover-ok';
+      callCount = 0;
+      seenTokens.length = 0;
+      const res2 = await consume(multiClient.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+      }));
+      expect(res2.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('')).toBe('二号账号接力成功！');
+      expect(seenTokens).toEqual(['Bearer tok-acct_1', 'Bearer tok-acct_2']);
+      expect(failedAccounts).toEqual([]);
+      expect(succeededAccounts).toEqual(['acct_2']);
+      expect(events2).toEqual([{ accountId: 'acct_1', action: 'failover' }]);
+
+      // 3. Persistent canned error: throws GatewayError(503) instead of polluting conversation history.
+      mode = 'persistent-canned';
+      callCount = 0;
+      await expect(consume(singleClient.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'bad media' }] }],
+      }))).rejects.toMatchObject({ status: 503 });
+      expect(callCount).toBe(2);
+
+      // 4. Legitimate reply quoting the canned error followed by explanation is preserved intact.
+      mode = 'quoted-canned';
+      callCount = 0;
+      const res4 = await consume(singleClient.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'explain error' }] }],
+      }));
+      expect(res4.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('')).toBe(
+        'I seem to be encountering an error. Can I try something else for you? 这句话是 Google 返回的。',
+      );
+      expect(callCount).toBe(1);
+
+      // 5. Short partial prefix that is not the full canned error is flushed cleanly at end-of-stream.
+      mode = 'prefix-only';
+      callCount = 0;
+      const res5 = await consume(singleClient.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'short' }] }],
+      }));
+      expect(res5.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('')).toBe('I seem to be');
+      expect(callCount).toBe(1);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it('uses longer openToolIdleTimeoutMs while <tool_call> is open and fails over if an initial <tool_call> stub still stalls', async () => {
+    type Mode = 'slow-open-tool' | 'stalled-open-stub-failover';
+    let mode: Mode = 'slow-open-tool';
+    let attemptCount = 0;
+    const openStreams: http2.ServerHttp2Stream[] = [];
+    const server = http2.createServer();
+
+    server.on('stream', (stream, headers) => {
+      if (headers[':path'] !== ROBIN_GRPC_PROCESS_QUERY) {
+        stream.respond({ ':status': 404 });
+        stream.end();
+        return;
+      }
+      openStreams.push(stream);
+      attemptCount += 1;
+      const currentAttempt = attemptCount;
+      stream.resume();
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        if (mode === 'slow-open-tool') {
+          // Sends opening `<tool_call>{"` and pauses 220ms (> textIdleTimeoutMs=120ms, < openToolIdleTimeoutMs=500ms).
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: '<tool_call>{"',
+            responseId: 'rc_slow_open',
+            attribution: 'Used 4 Neon model',
+            completed: false,
+          })));
+          setTimeout(() => {
+            if (stream.closed || stream.destroyed) return;
+            stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+              text: '<tool_call>{"name":"wechat_send","args":{"text":"长工具调用稳稳吐完啦"}}</tool_call>',
+              responseId: 'rc_slow_open',
+              attribution: 'Used 4 Neon model',
+              completed: true,
+            })));
+            stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+            stream.end();
+          }, 220);
+          return;
+        }
+        // stalled-open-stub-failover: attempt 1 stalls permanently on `<tool_call>{"`, attempt 2 completes cleanly.
+        if (currentAttempt === 1) {
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: '<tool_call>{"',
+            responseId: 'rc_stub_1',
+            attribution: 'Used 4 Neon model',
+            completed: false,
+          })));
+          return;
+        }
+        stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+          text: '<tool_call>{"name":"wechat_send","args":{"text":"切号补救成功"}}</tool_call>',
+          responseId: 'rc_stub_2',
+          attribution: 'Used 4 Neon model',
+          completed: true,
+        })));
+        stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+        stream.end();
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const slowClient = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        robinTextIdleTimeoutMs: 120,
+        robinOpenToolIdleTimeoutMs: 500,
+        auth: { accessToken: async () => 'tok' },
+      });
+      mode = 'slow-open-tool';
+      attemptCount = 0;
+      const slowRes = await consume(slowClient.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'wechat_send', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'write long reply' }] }],
+      }));
+      expect(slowRes.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { functionCall: { name: 'wechat_send', args: { text: '长工具调用稳稳吐完啦' } } },
+      ]);
+      expect(slowRes.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+
+      const failedAccounts: string[] = [];
+      const transientEvents: { accountId?: string; action: string }[] = [];
+      const failoverClient = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        robinTextIdleTimeoutMs: 120,
+        robinOpenToolIdleTimeoutMs: 120,
+        robinTransientRetryDelayMs: 0,
+        onRobinTransientError: info => transientEvents.push({ accountId: info.accountId, action: info.action }),
+        auth: {
+          accessToken: async () => 'tok',
+          selectAccounts: () => ['acct_1', 'acct_2'],
+          accessTokenFor: async id => `tok-${id}`,
+          onAccountFailure: id => failedAccounts.push(id),
+        },
+      });
+      mode = 'stalled-open-stub-failover';
+      attemptCount = 0;
+      const recovered = await consume(failoverClient.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'wechat_send', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'retry stub' }] }],
+      }));
+      expect(recovered.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { functionCall: { name: 'wechat_send', args: { text: '切号补救成功' } } },
+      ]);
+      expect(recovered.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+      expect(failedAccounts).toEqual([]);
+      expect(transientEvents).toEqual([{ accountId: 'acct_1', action: 'failover' }]);
+    } finally {
+      for (const s of openStreams) {
+        try { s.destroy(); } catch { /* ignore */ }
+      }
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });

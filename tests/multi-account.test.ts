@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import http2 from 'node:http2';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -650,6 +650,74 @@ describe('multi-account OAuth pool, routing strategies, failover, and WebUI', ()
       expect(successes).toEqual(['acct_B']);
     } finally {
       await new Promise<void>(resolve => robinServer.close(() => resolve()));
+    }
+  });
+
+  it('prioritizes Ultra accounts for gemini-4-carbon and reports Ultra plan in mixed Pro+Ultra pools', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ggw-ultra-pool-'));
+    const robinServer = http2.createServer();
+    robinServer.on('stream', (stream, headers) => {
+      const auth = String(headers.authorization ?? '');
+      stream.resume();
+      stream.on('end', () => {
+        if (headers[':path'] === ROBIN_GRPC_GET_USAGE_INFO) {
+          stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+          // Account A is Pro (tier 2, 10% used), Account B is Ultra (tier 3, 25% used).
+          const payload = auth.includes('tok-pro') ? encodeUsage(2, 0.1, 0.1) : encodeUsage(3, 0.25, 0.25);
+          stream.write(frameGrpcMessage(payload));
+          stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+          stream.end();
+          return;
+        }
+        stream.respond({ ':status': 404 });
+        stream.end();
+      });
+    });
+    await new Promise<void>(resolve => robinServer.listen(0, '127.0.0.1', resolve));
+    const port = (robinServer.address() as { port: number }).port;
+
+    try {
+      const oauthDir = join(dir, 'oauth');
+      mkdirSync(oauthDir, { recursive: true });
+      const ctrl = new GatewayControl(oauthDir);
+      ctrl.saveOAuthConfig(JSON.stringify(GOOGLE_TEST_CONFIG));
+      // Seed Pro as primary and Ultra as secondary using matching profile hash.
+      writeFileSync(join(oauthDir, OAUTH_ACCOUNTS_FILE), JSON.stringify({
+        version: 2,
+        profile: testProfileHash(GOOGLE_TEST_CONFIG),
+        primaryId: 'acct_pro',
+        accounts: [
+          { id: 'acct_pro', email: 'pro@example.com', accessToken: 'tok-pro', refreshToken: 'r1', expiresAt: Date.now() + 3_600_000 },
+          { id: 'acct_ultra', email: 'ultra@example.com', accessToken: 'tok-ultra', refreshToken: 'r2', expiresAt: Date.now() + 3_600_000 },
+        ],
+      }));
+      const ctrlLoaded = new GatewayControl(oauthDir);
+      const entry: LLMProviderEntry = {
+        kind: 'gemini-gateway',
+        baseUrl: `http://127.0.0.1:${port}`,
+        spec: { model: 'gemini-4-carbon', thinking: true },
+        options: { protocol: 'robin', authMode: 'oauth', accountRouting: 'failover', quotaEndpoint: ROBIN_GRPC_GET_USAGE_INFO },
+      };
+      const snap = await ctrlLoaded.queryQuota(entry, { secret: () => '' });
+      expect(snap.accounts?.find(a => a.accountId === 'acct_pro')?.plan).toBe('Pro');
+      expect(snap.accounts?.find(a => a.accountId === 'acct_ultra')?.plan).toBe('Ultra');
+      expect(ctrlLoaded.getPoolPlans()).toEqual(['Ultra', 'Pro']);
+      expect(ctrlLoaded.findHighestTierAccountId()).toBe('acct_ultra');
+
+      // Regular Neon follows failover (Pro primary first); Carbon prioritizes Ultra ahead of Pro!
+      expect(ctrlLoaded.pickAccountOrder('failover', 'gemini-4-neon')).toEqual(['acct_pro', 'acct_ultra']);
+      expect(ctrlLoaded.pickAccountOrder('failover', 'gemini-4-carbon')).toEqual(['acct_ultra', 'acct_pro']);
+      // Even under least-used when Pro has more remaining quota (90% vs 75%), Carbon still prefers Ultra!
+      expect(ctrlLoaded.pickAccountOrder('least-used', 'gemini-4-neon')).toEqual(['acct_pro', 'acct_ultra']);
+      expect(ctrlLoaded.pickAccountOrder('least-used', 'gemini-4-carbon')).toEqual(['acct_ultra', 'acct_pro']);
+
+      // Effective account for Carbon resolves to Ultra, and getCachedAccountInfo(acct_ultra) returns Ultra (not Pro).
+      const effectiveCarbon = ctrlLoaded.resolveEffectiveAccountId('failover', 'gemini-4-carbon');
+      expect(effectiveCarbon).toBe('acct_ultra');
+      expect(ctrlLoaded.getCachedAccountInfo(effectiveCarbon)).toMatchObject({ plan: 'Ultra', userTier: 'TIER2' });
+    } finally {
+      await new Promise<void>(resolve => robinServer.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

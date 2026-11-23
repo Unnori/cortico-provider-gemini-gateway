@@ -163,6 +163,10 @@ export const modelSettingsPanel: WebUiPanel = {
         }
         if (r.officialEntitled === true && r.officialLabel) {
           parts.push(en ? `Official: ${r.officialLabel}` : `官方下发：${r.officialLabel}`);
+        } else if (r.ultraOnly && r.officialEntitled === false) {
+          parts.push(en
+            ? 'Ultra only (Pro/Free accounts will be downgraded by backend)'
+            : '仅 Ultra 可用（Pro/Free 账号选择会被后端降级）');
         } else if (r.officialEntitled === false) {
           parts.push(en ? 'Not in account official picker (routed by backend tier)' : '不在该账号官方下拉列表（由后端按套餐权益路由）');
         }

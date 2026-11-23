@@ -23,6 +23,7 @@ export const GEMINI_PRICE_ROWS: readonly PriceRow[] = [
   { id: 'gemini-robin-pro', rates: [2, 12, 0.2, null], band: [200_001, 4, 18, 0.4, null] },
   { id: 'gemini-robin-fast', rates: [1.5, 7.5, 0.15, null] },
   { id: 'gemini-robin-flash-lite', rates: [0.3, 2.5, 0.03, null] },
+  { id: 'gemini-4-carbon', rates: [4, 20, 0.2, null] },
   { id: 'gemini-4-argon', rates: [4, 20, 0.2, null] },
   { id: 'gemini-4-neon', rates: [4, 20, 0.2, null] },
   { id: 'gemini-4-hydrogen', rates: [1.5, 7.5, 0.15, null] },

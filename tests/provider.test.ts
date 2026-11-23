@@ -188,8 +188,34 @@ it('eagerly emits output_item.done for closed tool calls before the HTTP/2 strea
     expect(result.response.status).toBe('completed');
     expect(result.response.output).toEqual([
       expect.objectContaining({ type: 'reasoning' }),
-      expect.objectContaining({ type: 'function_call', call_id: 'call_0_say', name: 'pet_say', status: 'completed' }),
+      expect.objectContaining({
+        type: 'function_call',
+        call_id: expect.stringMatching(/^call_[0-9a-f]{16}$/),
+        name: 'pet_say',
+        status: 'completed',
+      }),
     ]);
+
+    // Second turn where Robin repeats the exact same model-fabricated `call_0_say` (and history already
+    // contains the first turn's call_id): minted call_id must be globally unique and <= 40 chars so
+    // hot-switching to DeepSeek/OpenAI never fails with Duplicate call_id.
+    const firstCallId = (result.response.output[1] as { call_id: string }).call_id;
+    expect(firstCallId).not.toBe('call_0_say');
+    expect(firstCallId.length).toBeLessThanOrEqual(40);
+    const result2 = await customProvider.respond({
+      model: 'gemini-robin-fast',
+      tools: [{ type: 'function', name: 'pet_say', parameters: { type: 'object' } }],
+      input: [
+        { type: 'message', role: 'user', content: 'hi' },
+        { type: 'function_call', call_id: firstCallId, name: 'pet_say', arguments: '{"script":"秒回！"}' },
+        { type: 'function_call_output', call_id: firstCallId, output: 'ok' },
+        { type: 'message', role: 'user', content: 'again' },
+      ],
+    }, { nativeSpec: { model: 'gemini-robin-fast', thinking: true } });
+    const secondCallId = (result2.response.output[1] as { call_id: string }).call_id;
+    expect(secondCallId).toMatch(/^call_[0-9a-f]{16}$/);
+    expect(secondCallId).not.toBe('call_0_say');
+    expect(secondCallId).not.toBe(firstCallId);
   } finally {
     for (const s of openStreams) {
       try { s.destroy(); } catch { /* ignore */ }
