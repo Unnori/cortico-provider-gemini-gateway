@@ -473,11 +473,13 @@ export class GatewayClient {
     }
   }
 
-  private resolveGenerationRoute(): string {
+  resolveGenerationRoute(): string {
     if (this.options.generationEndpoint) return this.options.generationEndpoint;
     if (this.protocol === 'gemini') return 'v1beta/models/{model}:streamGenerateContent?alt=sse';
     if (this.protocol === 'robin') {
-      if (!this.options.fetch && this.base.startsWith('https://')) return ROBIN_GRPC_PROCESS_QUERY;
+      if (this.base.startsWith('https://') && (!this.options.fetch || Boolean(this.options.connectHttp2))) {
+        return ROBIN_GRPC_PROCESS_QUERY;
+      }
       return '$rpc/assistant.mobile.robin.RobinService/StreamGenerate';
     }
     return 'generate?$alt=json';

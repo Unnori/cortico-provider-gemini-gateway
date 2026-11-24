@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4
+
+🛠️ 修复未显式配置 `generationEndpoint` 时 Robin HTTPS 默认误退回 `$rpc/.../StreamGenerate` 的选路问题（Issue #1）：
+- **区分「Provider 注入代理 `fetch`」与「纯 `fetch` Mock 覆盖」**：`GatewayClient.resolveGenerationRoute()` 与 `queryGatewayQuota()` 在协议为 `robin` 且目标为 `https://` 时，若未提供 `fetch` 或同时注入了 `connectHttp2` 能力，默认选择原生 HTTP/2 gRPC 路由（`/assistant.mobile.robin.RobinService/ProcessQuery` 与 `/assistant.mobile.robin.RobinService/GetUsageInfo`），不再因 `src/index.ts` 注入了代理感知 `fetch` 而误切到 `$rpc/.../StreamGenerate`；同时继续保持显式 `generationEndpoint` / `quotaEndpoint` 的最高优先级，以及仅注入自定义 `fetch`、未注入 `connectHttp2` 时的向后兼容。
+- **补充无需 OAuth 的选路回归测试**：在 `tests/provider.test.ts` 与 `tests/quota.test.ts` 中覆盖 `provider.create(...)` 默认入口、同时注入 `fetch` 与 `connectHttp2` 下的默认 gRPC 选路及显式路由覆盖场景。
+
 ## 0.2.3
 
 🖼️ 调整 Robin 媒体附件保留窗口为「最新一批输入」，并拦截 HTTP 200 安全/外审模板拒答与自动切号恢复：

@@ -361,6 +361,10 @@ export class CustomGeminiProvider extends BaseProvider {
     this.prepare = prepare;
   }
 
+  get generationRoute(): string {
+    return this.client.resolveGenerationRoute();
+  }
+
   async respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
     const model = request.model ?? options.nativeSpec?.model ?? '';
     const origin = options.origin ?? { instance: this.name, module: 'gemini-gateway', model, compatibilityDomain: this.name };

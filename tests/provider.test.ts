@@ -223,3 +223,130 @@ it('eagerly emits output_item.done for closed tool calls before the HTTP/2 strea
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+it('keeps Robin HTTPS default route on ProcessQuery when proxy fetch and connectHttp2 are both injected (without OAuth)', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'gemini-robin-route-'));
+  const host = {
+    stateDir,
+    secret: () => '',
+    readBlob: () => null,
+    keepThinking: () => false,
+    log: nullLogger(),
+  };
+  try {
+    const defaultEntry: LLMProviderEntry = {
+      kind: provider.id,
+      baseUrl: 'https://robinfrontend-pa.googleapis.com',
+      spec: { model: 'gemini-4-neon', thinking: true },
+      options: { protocol: 'robin', authMode: 'oauth', proxyUrl: 'http://127.0.0.1:7890' },
+    };
+    const defaultInstance = provider.create('robin-default-route', defaultEntry, host);
+    expect((defaultInstance.client as CustomGeminiProvider).generationRoute).toBe(ROBIN_GRPC_PROCESS_QUERY);
+
+    const explicitRpcEntry: LLMProviderEntry = {
+      ...defaultEntry,
+      options: {
+        ...defaultEntry.options,
+        generationEndpoint: '/$rpc/assistant.mobile.robin.RobinService/StreamGenerate',
+      },
+    };
+    const explicitInstance = provider.create('robin-explicit-rpc', explicitRpcEntry, host);
+    expect((explicitInstance.client as CustomGeminiProvider).generationRoute).toBe(
+      '/$rpc/assistant.mobile.robin.RobinService/StreamGenerate',
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+
+  const seenPaths: string[] = [];
+  const server = http2.createServer();
+  server.on('stream', (stream, headers) => {
+    seenPaths.push(String(headers[':path'] ?? ''));
+    stream.resume();
+    stream.on('end', () => {
+      stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+      const clientParts = Buffer.concat([
+        lengthDelimited(1, Buffer.concat([stringField(1, 'rc_grpc_default'), lengthDelimited(2, stringField(1, 'gRPC ok'))])),
+        varintField(9, 1),
+      ]);
+      stream.write(frameGrpcMessage(lengthDelimited(1003, lengthDelimited(1, clientParts))));
+      stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+      stream.end();
+    });
+  });
+
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+  const localPort = addr.port;
+
+  try {
+    const consume = async <T>(stream: AsyncIterable<T>): Promise<T[]> => {
+      const items: T[] = [];
+      for await (const item of stream) items.push(item);
+      return items;
+    };
+    const req = { model: 'gemini-4-neon', contents: [{ role: 'user' as const, parts: [{ text: 'Hello' }] }] };
+
+    // Both fetch + connectHttp2 injected, no explicit generationEndpoint -> defaults to HTTP/2 gRPC ProcessQuery.
+    const unusedFetch = vi.fn<typeof globalThis.fetch>(async () => {
+      throw new Error('fetch should not be called when Robin HTTPS defaults to ProcessQuery');
+    });
+    const connectSpy = vi.fn((_origin: string | URL, opts?: { signal?: AbortSignal }) => {
+      const session = http2.connect(`http://127.0.0.1:${localPort}`);
+      opts?.signal?.addEventListener('abort', () => {
+        try { session.close(); } catch { /* ignore */ }
+      }, { once: true });
+      return Promise.resolve(session);
+    });
+    const grpcDefaultClient = new GatewayClient({
+      baseUrl: 'https://robinfrontend-pa.googleapis.com',
+      protocol: 'robin',
+      fetch: unusedFetch,
+      connectHttp2: connectSpy,
+      auth: { accessToken: async () => 'test-token' },
+    });
+    const grpcChunks = await consume(grpcDefaultClient.stream(req));
+    expect(grpcChunks.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'gRPC ok' }]);
+    expect(unusedFetch).not.toHaveBeenCalled();
+    expect(connectSpy).toHaveBeenCalledTimes(1);
+    expect(seenPaths).toEqual([ROBIN_GRPC_PROCESS_QUERY]);
+
+    // Explicit $rpc generationEndpoint still wins over connectHttp2.
+    const rpcFetch = vi.fn<typeof globalThis.fetch>(async () => Response.json([{
+      conversationId: 'c_rpc_explicit',
+      modelResponses: [{ responseId: 'rc_rpc_explicit', textResponse: { text: 'RPC explicit ok' } }],
+    }]));
+    const unusedH2 = vi.fn(async () => {
+      throw new Error('connectHttp2 should not be called when explicit HTTP $rpc route is selected');
+    });
+    const explicitClient = new GatewayClient({
+      baseUrl: 'https://robinfrontend-pa.googleapis.com',
+      protocol: 'robin',
+      generationEndpoint: '/$rpc/assistant.mobile.robin.RobinService/StreamGenerate',
+      fetch: rpcFetch,
+      connectHttp2: unusedH2,
+    });
+    const explicitChunks = await consume(explicitClient.stream(req));
+    expect(explicitChunks.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'RPC explicit ok' }]);
+    expect(rpcFetch).toHaveBeenCalledTimes(1);
+    expect(String(rpcFetch.mock.calls[0][0])).toBe('https://robinfrontend-pa.googleapis.com/$rpc/assistant.mobile.robin.RobinService/StreamGenerate');
+    expect(unusedH2).not.toHaveBeenCalled();
+
+    // Fetch-only caller (without connectHttp2) stays on HTTP $rpc StreamGenerate for mock compatibility.
+    const fetchOnly = vi.fn<typeof globalThis.fetch>(async () => Response.json([{
+      conversationId: 'c_fetch_only',
+      modelResponses: [{ responseId: 'rc_fetch_only', textResponse: { text: 'Fetch only ok' } }],
+    }]));
+    const fetchOnlyClient = new GatewayClient({
+      baseUrl: 'https://robinfrontend-pa.googleapis.com',
+      protocol: 'robin',
+      fetch: fetchOnly,
+    });
+    const fetchOnlyChunks = await consume(fetchOnlyClient.stream(req));
+    expect(fetchOnlyChunks.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'Fetch only ok' }]);
+    expect(String(fetchOnly.mock.calls[0][0])).toBe('https://robinfrontend-pa.googleapis.com/$rpc/assistant.mobile.robin.RobinService/StreamGenerate');
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

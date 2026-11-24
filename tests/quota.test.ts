@@ -1,5 +1,29 @@
+import http2 from 'node:http2';
 import { describe, expect, it, vi } from 'vitest';
 import { parseQuotaResponse, queryGatewayQuota, robinPlanName } from '../src/quota.ts';
+import {
+  frameGrpcMessage,
+  lengthDelimited,
+  ROBIN_GRPC_GET_USAGE_INFO,
+  stringField,
+  varintField,
+} from '../src/robin-grpc.ts';
+
+function encodeFloat32Field(fieldNumber: number, value: number): Buffer {
+  const key = Buffer.from([(fieldNumber << 3) | 5]);
+  const buf = Buffer.alloc(4);
+  buf.writeFloatLE(value, 0);
+  return Buffer.concat([key, buf]);
+}
+
+function encodeUsageInfoResponse(): Buffer {
+  const ts1 = Buffer.concat([varintField(1, Math.floor(Date.parse('2026-11-19T12:00:00Z') / 1000)), varintField(2, 0)]);
+  const ts2 = Buffer.concat([varintField(1, Math.floor(Date.parse('2026-11-26T00:00:00Z') / 1000)), varintField(2, 0)]);
+  const row1 = Buffer.concat([lengthDelimited(1, ts1), encodeFloat32Field(2, 0.25), stringField(3, '5-hour usage')]);
+  const row2 = Buffer.concat([lengthDelimited(1, ts2), encodeFloat32Field(2, 0.6), stringField(3, 'Weekly usage')]);
+  const group = Buffer.concat([varintField(1, 1), lengthDelimited(2, row1), lengthDelimited(2, row2)]);
+  return Buffer.concat([varintField(2, 2), lengthDelimited(3, group)]);
+}
 
 describe('gateway quota querying', () => {
   it('parses Robin GetUsageInfo GXU pools, userTier, and overage credits', () => {
@@ -77,5 +101,50 @@ describe('gateway quota querying', () => {
       quotaEndpoint: '/$rpc/assistant.mobile.robin.RobinService/GetUsageInfo?$alt=json',
       fetch,
     })).rejects.toThrow(/HTTP 403.*PERMISSION_DENIED.*Scope/);
+  });
+
+  it('defaults Robin HTTPS quota queries to gRPC GetUsageInfo when both fetch and connectHttp2 are injected', async () => {
+    const seenPaths: string[] = [];
+    const server = http2.createServer();
+    server.on('stream', (stream, headers) => {
+      seenPaths.push(String(headers[':path'] ?? ''));
+      stream.resume();
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        stream.write(frameGrpcMessage(encodeUsageInfoResponse()));
+        stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+        stream.end();
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    const localPort = addr.port;
+
+    try {
+      const unusedFetch = vi.fn<typeof globalThis.fetch>(async () => {
+        throw new Error('fetch should not be called when connectHttp2 is provided for Robin HTTPS');
+      });
+      const snap = await queryGatewayQuota({
+        baseUrl: 'https://robinfrontend-pa.googleapis.com',
+        protocol: 'robin',
+        auth: { accessToken: async () => 'fresh-tok' },
+        fetch: unusedFetch,
+        connectHttp2: (_origin, opts) => {
+          const session = http2.connect(`http://127.0.0.1:${localPort}`);
+          opts?.signal?.addEventListener('abort', () => {
+            try { session.close(); } catch { /* ignore */ }
+          }, { once: true });
+          return Promise.resolve(session);
+        },
+      });
+      expect(unusedFetch).not.toHaveBeenCalled();
+      expect(seenPaths).toEqual([ROBIN_GRPC_GET_USAGE_INFO]);
+      expect(snap.plan).toBe('Pro');
+      expect(snap.windows.map(w => w.usedPercent)).toEqual([25, 60]);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 });

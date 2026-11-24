@@ -213,7 +213,9 @@ export function resolveQuotaEndpoint(baseUrl: string, protocol: 'rpc' | 'gemini'
 export async function queryGatewayQuota(options: QuotaQueryOptions, signal?: AbortSignal): Promise<QuotaSnapshot> {
   const configuredRoute = options.quotaEndpoint?.trim();
   const defaultRoute = options.protocol === 'robin'
-    ? (!options.fetch && options.baseUrl.startsWith('https://') ? DEFAULT_ROBIN_GRPC_QUOTA_ENDPOINT : DEFAULT_ROBIN_QUOTA_ENDPOINT)
+    ? (options.baseUrl.startsWith('https://') && (!options.fetch || Boolean(options.connectHttp2))
+      ? DEFAULT_ROBIN_GRPC_QUOTA_ENDPOINT
+      : DEFAULT_ROBIN_QUOTA_ENDPOINT)
     : undefined;
   const route = configuredRoute || defaultRoute;
   const fetchedAt = new Date().toISOString();
