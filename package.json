@@ -1,6 +1,6 @@
 {
   "name": "cortico-provider-gemini-gateway",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "description": "Gemini 多合一粮仓：支持 Robin 桌面 OAuth 多账号调度与额度看板、原生多模态附件上传，以及 Web2API 与自定义 RPC 接入。",
   "author": "云纪 & 云洄",

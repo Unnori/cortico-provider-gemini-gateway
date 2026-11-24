@@ -151,6 +151,63 @@ async function checkResponse(response: Response, operation: string): Promise<voi
 
 const ROBIN_UPLOAD_CACHE_TTL_MS = 10 * 60_000;
 const ROBIN_UPLOAD_CACHE_MAX = 32;
+const SYNTHETIC_EVENT_FRAME_TOOL = 'external_event_frame';
+const ABORTED_ROUND_TOOL_MARKERS = [
+  '[not executed: interrupted by a new event]',
+  '[an interrupt signal was sent while this tool ran]',
+  '[not executed: stream aborted mid-response]',
+] as const;
+
+function isSyntheticEventFrameTurn(turn: GeminiRequest['contents'][number]): boolean {
+  return turn.role === 'model'
+    && turn.parts.length > 0
+    && turn.parts.every(part => part.functionCall?.name === SYNTHETIC_EVENT_FRAME_TOOL);
+}
+
+function hasAbortedRoundToolMarker(turn: GeminiRequest['contents'][number] | undefined): boolean {
+  if (!turn || turn.role !== 'user') return false;
+  for (const part of turn.parts) {
+    const response = record(part.functionResponse?.response);
+    const output = typeof response?.output === 'string' ? response.output : '';
+    if (!output) continue;
+    if (ABORTED_ROUND_TOOL_MARKERS.some(marker => output.includes(marker))) return true;
+  }
+  return false;
+}
+
+/**
+ * Returns the starting index in `contents` of the latest trailing input batch whose
+ * multimodal attachments have not yet received a completed model response.
+ *
+ * Walks backwards across:
+ * 1. Consecutive `user` turns (user messages, tool results, event-frame payloads).
+ * 2. Cortico's synthetic `external_event_frame` carrier turns (`role === 'model'`
+ *    containing only `external_event_frame` calls), so back-to-back events that
+ *    preempt an unfinished model generation retain media sent earlier in the batch.
+ * 3. Interrupted or mid-stream-aborted model rounds whose immediately following
+ *    `user` turn carries a Cortico interrupt/abort tool marker, so speaking to
+ *    interrupt right after sending media still carries that media into the new request.
+ */
+export function findLatestMediaBatchStart(contents: GeminiRequest['contents']): number {
+  let start = contents.length;
+  for (let i = contents.length - 1; i >= 0; i--) {
+    const turn = contents[i];
+    if (turn.role === 'user') {
+      start = i;
+      continue;
+    }
+    if (isSyntheticEventFrameTurn(turn)) {
+      start = i;
+      continue;
+    }
+    if (turn.role === 'model' && hasAbortedRoundToolMarker(contents[i + 1])) {
+      start = i;
+      continue;
+    }
+    break;
+  }
+  return start;
+}
 const ROBIN_CANNED_ERROR_TEXTS: readonly string[] = [
   'i seem to be encountering an error. can i try something else for you?',
   'i encountered an error doing what you asked. could you try again?',
@@ -167,12 +224,143 @@ const ROBIN_CANNED_ERROR_TEXTS: readonly string[] = [
   'i ran into an error. please try again.',
 ];
 
-function isRobinCannedErrorPrefix(normalized: string): boolean {
-  return ROBIN_CANNED_ERROR_TEXTS.some(phrase => phrase.startsWith(normalized));
+const ROBIN_CANNED_REFUSAL_TEXTS: readonly string[] = [
+  "i'm just a language model and can't help with that.",
+  "i'm a language model and don't have the capacity to help with that.",
+  "i'm not able to help with that, as i'm only a language model.",
+  "i can't help with that, as i'm only a language model.",
+  "as a language model, i'm not able to assist you with that.",
+  "as a language model, i can't help with that.",
+  "i'm a text-based ai, and that is outside of my capabilities.",
+  "i'm just an ai and can't help with that.",
+  "i can't assist with that.",
+  "i can't help with that.",
+  "i'm unable to help with that.",
+  "i'm unable to assist with that.",
+  'i cannot fulfill this request.',
+  "i can't fulfill this request.",
+  "sorry, i can't help with that.",
+  "i'm sorry, i can't help with that.",
+  "i'm sorry, i can't assist with that.",
+  "i'm sorry, but i can't help with that.",
+  "i'm sorry, but i can't assist with that.",
+  '我只是一个语言模型，无法在这方面提供帮助。',
+  '我只是一个语言模型，无法帮到您。',
+  '我只是一个语言模型，无法回答这个问题。',
+  '我是一个语言模型，无法在这方面提供帮助。',
+  '抱歉，我无法协助处理此请求。',
+  '抱歉，我无法在这方面提供帮助。',
+];
+
+const ROBIN_SAFETY_REFUSAL_OPENERS: readonly string[] = [
+  "i'm just a language model",
+  'i am just a language model',
+  "i'm a language model",
+  'i am a language model',
+  "i'm only a language model",
+  'i am only a language model',
+  "i'm a large language model",
+  'i am a large language model',
+  "i'm an ai",
+  'i am an ai',
+  "i'm just an ai",
+  "i'm a text-based ai",
+  'as a language model',
+  'as a large language model',
+  'as an ai',
+  "i'm sorry",
+  'i am sorry',
+  'sorry,',
+  'apologies,',
+  'unfortunately,',
+  "i can't",
+  'i cannot',
+  "i'm unable",
+  'i am unable',
+  "i'm not able",
+  'i am not able',
+  "i don't have the",
+  'while i try to',
+  'while i want to',
+  'it appears',
+  'it seems',
+  'it looks like',
+  'this request',
+  'your request',
+  'that request',
+  '我只是一个语言模型',
+  '我只是个语言模型',
+  '我是一个语言模型',
+  '我仅是一个语言模型',
+  '抱歉，我无法',
+  '抱歉,我无法',
+  '很抱歉，我无法',
+  '该请求',
+  '此请求',
+  '这个请求',
+];
+
+const ROBIN_CANNED_HOLD_MAX_CHARS = 360;
+const ROBIN_REFUSAL_TRAILING_OFFER_RE = /(?:\s+(?:is\s+there\s+(?:anything|something)\s+else\s+i\s+can\s+(?:try\s+for\s+you|help(?:\s+you)?\s+with|assist(?:\s+you)?\s+with|do\s+for\s+you)\??|can\s+i\s+(?:help(?:\s+you)?\s+with|try)\s+(?:anything|something)\s+else(?:\s+(?:for\s+you|instead))?\??|how\s+else\s+can\s+i\s+(?:help|assist)(?:\s+you)?\??|please\s+let\s+me\s+know\s+if\s+[^.!?\n]{0,80}[.!])|[，,。\s]*(?:还有什么(?:其他|别)的[^。？！?\n]{0,30}可以帮(?:到)?(?:你|您)[吗嘛]?[？?]?))\s*$/i;
+const ROBIN_POLICY_GUIDELINES_LINK_RE = /https?:\/\/gemini\.google\/policy-guidelines\/?\)?[。.!！]?$/i;
+const ROBIN_POLICY_GUIDELINES_CONTEXT_RE = /(?:go(?:es)?\s+against|against\s+my|violates?|can'?t|cannot|unable|not\s+able|sorry|apologize|language\s+model|guidelines?|policies|违反|不符合|准则|指南|政策|无法|抱歉)/i;
+const ROBIN_EN_LM_REFUSAL_RE = /^(?:(?:i'?m\s+)?sorry[,!.\s]+|apologies[,!.\s]+|unfortunately[,!.\s]+)?(?:(?:as\s+an?\s+(?:large\s+)?(?:ai\s+)?language\s+model[, ]+|i(?:'m|\s+am)\s+(?:just|only)?\s*(?:an?\s+)?(?:large\s+)?(?:ai\s+|text-based\s+)?(?:language\s+model|ai)\s*(?:,\s*)?(?:and\s+)?)(?:i\s+)?(?:can'?t|cannot|am\s+unable|'?m\s+unable|am\s+not\s+able|'?m\s+not\s+able|don'?t\s+have\s+the\s+(?:ability|capacity)\s+to|that\s+is\s+outside\s+(?:of\s+)?my\s+capabilities)[^.?!\n]{0,100}[.!]?|(?:i\s+(?:can'?t|cannot|am\s+unable|'?m\s+unable|am\s+not\s+able|'?m\s+not\s+able)\s+(?:help|assist|fulfill|comply|do)[^.?!\n]{0,80}(?:as|because)\s+i(?:'m|\s+am)\s+(?:just|only)\s+(?:an?\s+)?(?:large\s+)?(?:ai\s+)?language\s+model[.!]?))$/i;
+const ROBIN_EN_GUIDELINES_REFUSAL_RE = /^(?:(?:i'?m\s+)?sorry[,!.\s]+|apologies[,!.\s]+|unfortunately[,!.\s]+|while\s+i\s+(?:try|want)\s+to\s+be[^,]{0,60},\s*)?(?:i\s+(?:can'?t|cannot|am\s+unable|'?m\s+unable|am\s+not\s+able|'?m\s+not\s+able)|it\s+(?:appears|seems|looks\s+like)|(?:this|your|that)\s+(?:request|one))[^.\n]{0,160}(?:go(?:es)?\s+against|violates?)\s+my\s+(?:policy\s+)?(?:guidelines?|policies)[.!]?$/i;
+const ROBIN_ZH_REFUSAL_RE = /^(?:(?:很)?抱歉[，,！!。\s]*)?(?:我(?:只是|仅是|是)一个?(?:大)?语言模型[，,\s]*(?:无法|不能|帮不了)[^。！？!\n]{0,40}|(?:该|此|这个)?请求[^。！？!\n]{0,40}(?:违反|不符合)[^。！？!\n]{0,20}(?:准则|指南|政策))[。！!]?$/u;
+
+function normalizeRobinCannedText(text: string): string {
+  return text
+    .trim()
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
 }
 
-function isRobinCannedErrorExact(normalized: string): boolean {
-  return ROBIN_CANNED_ERROR_TEXTS.includes(normalized);
+/**
+ * Classifies a complete Robin response (containing zero tool calls) as a synthetic
+ * transient error or outer safety/policy refusal, returning `null` for genuine replies
+ * (including replies that quote a canned phrase and continue with real commentary).
+ */
+export function classifyRobinCannedRejection(rawText: string): 'transient-error' | 'safety-refusal' | null {
+  const normalized = normalizeRobinCannedText(rawText);
+  if (!normalized) return null;
+  if (ROBIN_CANNED_ERROR_TEXTS.includes(normalized)) return 'transient-error';
+  if (normalized.length > ROBIN_CANNED_HOLD_MAX_CHARS || /\n\s*\n/.test(rawText.trim())) return null;
+  const core = normalized.replace(ROBIN_REFUSAL_TRAILING_OFFER_RE, '').trim();
+  if (ROBIN_CANNED_REFUSAL_TEXTS.includes(normalized) || ROBIN_CANNED_REFUSAL_TEXTS.includes(core)) {
+    return 'safety-refusal';
+  }
+  if (ROBIN_POLICY_GUIDELINES_LINK_RE.test(core) && ROBIN_POLICY_GUIDELINES_CONTEXT_RE.test(core)) {
+    return 'safety-refusal';
+  }
+  if (core.length <= 240 && (
+    ROBIN_EN_LM_REFUSAL_RE.test(core)
+    || ROBIN_EN_GUIDELINES_REFUSAL_RE.test(core)
+    || ROBIN_ZH_REFUSAL_RE.test(core)
+  )) {
+    return 'safety-refusal';
+  }
+  return null;
+}
+
+function shouldHoldRobinCannedCandidate(rawText: string): boolean {
+  const norm = normalizeRobinCannedText(rawText);
+  if (!norm) return true;
+  if (classifyRobinCannedRejection(rawText) !== null) return true;
+  if (
+    ROBIN_CANNED_ERROR_TEXTS.some(phrase => phrase.startsWith(norm))
+    || ROBIN_CANNED_REFUSAL_TEXTS.some(phrase => phrase.startsWith(norm))
+  ) {
+    return true;
+  }
+  if (
+    norm.length <= ROBIN_CANNED_HOLD_MAX_CHARS
+    && !/\n\s*\n/.test(rawText)
+    && ROBIN_SAFETY_REFUSAL_OPENERS.some(opener => opener.startsWith(norm) || norm.startsWith(opener))
+  ) {
+    return true;
+  }
+  return false;
 }
 
 class RobinTransientError extends GatewayError {
@@ -354,16 +542,17 @@ export class GatewayClient {
     input.contents.forEach((turn, turnIndex) => collect('turn', turnIndex, turn.parts));
     if (!candidates.length) return { request: input, uploader: undefined };
 
-    // Keep only supported multimodal attachments from the latest turn, within Robin's per-request budgets.
-    // Earlier-turn attachments are never re-uploaded or re-inferred; they become compact text placeholders.
-    const lastTurnIndex = input.contents.length - 1;
+    // Keep supported multimodal attachments from the latest trailing input batch (including
+    // back-to-back preempted event frames and interrupted rounds), within Robin's per-request budgets.
+    // Attachments from earlier completed turns become compact text placeholders instead of re-inferring.
+    const batchStartIndex = findLatestMediaBatchStart(input.contents);
     const keptKeys = new Set<string>();
     const keptList: InlineCandidate[] = [];
     let totalBytes = 0;
     for (let i = candidates.length - 1; i >= 0; i--) {
       const candidate = candidates[i];
       if (!candidate.mimeType) continue;
-      if (candidate.section !== 'turn' || candidate.turnIndex !== lastTurnIndex) continue;
+      if (candidate.section !== 'turn' || candidate.turnIndex < batchStartIndex) continue;
       if (keptList.length >= ROBIN_MAX_ATTACHMENTS_PER_REQUEST) continue;
       if (totalBytes + candidate.bytes.length > ROBIN_MAX_ATTACHMENT_BYTES) continue;
       totalBytes += candidate.bytes.length;
@@ -411,7 +600,7 @@ export class GatewayClient {
         const key = `${section}:${turnIndex}:${partIndex}`;
         const candidate = byKey.get(key);
         if (!candidate || !keptKeys.has(key)) {
-          if (candidate?.mimeType && (candidate.section !== 'turn' || candidate.turnIndex !== lastTurnIndex)) {
+          if (candidate?.mimeType && (candidate.section !== 'turn' || candidate.turnIndex < batchStartIndex)) {
             return { text: candidate.mimeType.startsWith('image/') ? '[Earlier image omitted]' : '[Earlier attachment omitted]' };
           }
           const reason = !candidate?.mimeType
@@ -461,7 +650,7 @@ export class GatewayClient {
     const overrideModeCategory = this.options.resolveRobinModeCategory?.(input.model, accountId);
     const requestedMode = resolveRobinMode(input.model, includeThoughts, reasoningEffort, overrideModeCategory);
     const parser = new ToolCallStream(this.options.onToolCallRepair ? { onRepair: this.options.onToolCallRepair } : undefined);
-    const filter = new RobinPartFilter();
+    let filter = new RobinPartFilter();
     let emittedText = '';
     let emittedThought = '';
     let heldCannedText = '';
@@ -533,21 +722,29 @@ export class GatewayClient {
             emittedText = normalizedText;
             if (delta) rawParts.push(...parser.feed(delta));
           } else {
-            const commonPrefixLen = longestCommonPrefix(emittedText, normalizedText);
-            const committedOffset = emittedText.length - parser.pendingRawLength;
-            if (
-              commonPrefixLen >= committedOffset
-              && (normalizedText.length >= emittedText.length || normalizedText.includes('</tool_call>') || frame.completed)
-            ) {
+            if (emittedToolCallCount === 0 && emittedVisibleTextCount === 0 && heldCannedText.length > 0) {
               parser.discardPending();
-              const resynced = normalizedText.slice(committedOffset);
+              heldCannedText = '';
+              filter = new RobinPartFilter();
               emittedText = normalizedText;
-              if (resynced) rawParts.push(...parser.feed(resynced));
-            } else if (normalizedText.length > emittedText.length) {
-              const resyncOffset = findPlainTextResyncOffset(emittedText, normalizedText, commonPrefixLen);
-              const delta = normalizedText.slice(resyncOffset);
-              emittedText = normalizedText;
-              if (delta) rawParts.push(...parser.feed(delta));
+              if (normalizedText) rawParts.push(...parser.feed(normalizedText));
+            } else {
+              const commonPrefixLen = longestCommonPrefix(emittedText, normalizedText);
+              const committedOffset = emittedText.length - parser.pendingRawLength;
+              if (
+                commonPrefixLen >= committedOffset
+                && (normalizedText.length >= emittedText.length || normalizedText.includes('</tool_call>') || frame.completed)
+              ) {
+                parser.discardPending();
+                const resynced = normalizedText.slice(committedOffset);
+                emittedText = normalizedText;
+                if (resynced) rawParts.push(...parser.feed(resynced));
+              } else if (normalizedText.length > emittedText.length) {
+                const resyncOffset = findPlainTextResyncOffset(emittedText, normalizedText, commonPrefixLen);
+                const delta = normalizedText.slice(resyncOffset);
+                emittedText = normalizedText;
+                if (delta) rawParts.push(...parser.feed(delta));
+              }
             }
           }
         }
@@ -568,8 +765,7 @@ export class GatewayClient {
         if (!part.thought && typeof part.text === 'string' && part.text) {
           if (emittedToolCallCount === 0 && emittedVisibleTextCount === 0) {
             const candidate = heldCannedText + part.text;
-            const norm = candidate.trimStart().toLowerCase();
-            if (!norm || isRobinCannedErrorPrefix(norm)) {
+            if (shouldHoldRobinCannedCandidate(candidate)) {
               heldCannedText = candidate;
               continue;
             }
@@ -628,12 +824,20 @@ export class GatewayClient {
       }
     }
     if (heldCannedText) {
-      if (emittedToolCallCount === 0 && emittedVisibleTextCount === 0
-          && isRobinCannedErrorExact(heldCannedText.trim().toLowerCase())) {
-        throw new RobinTransientError(
-          503,
-          `Robin upstream returned transient canned error ("${heldCannedText.trim()}")`,
-        );
+      if (emittedToolCallCount === 0 && emittedVisibleTextCount === 0) {
+        const rejectionKind = classifyRobinCannedRejection(heldCannedText);
+        if (rejectionKind === 'transient-error') {
+          throw new RobinTransientError(
+            503,
+            `Robin upstream returned transient canned error ("${heldCannedText.trim()}")`,
+          );
+        }
+        if (rejectionKind === 'safety-refusal') {
+          throw new RobinTransientError(
+            422,
+            `Robin upstream blocked response by safety/policy filter ("${heldCannedText.trim()}")`,
+          );
+        }
       }
       tail.unshift({ text: heldCannedText });
       emittedVisibleTextCount += 1;
@@ -730,7 +934,8 @@ export class GatewayClient {
         : [];
       const accountCandidates: (string | undefined)[] = selectedIds.length > 0 ? selectedIds : [undefined];
 
-      let transientRetries = 0;
+      let transientFailovers = 0;
+      let singleAccountTransientRetries = 0;
 
       for (let accountIndex = 0; accountIndex < accountCandidates.length; accountIndex++) {
         const accountId = accountCandidates[accountIndex];
@@ -844,13 +1049,14 @@ export class GatewayClient {
               continue;
             }
             if (!signal.aborted && !observed && error instanceof RobinTransientError) {
-              if (transientRetries < 1) {
-                transientRetries += 1;
-                if (hasNextAccount) {
-                  this.options.onRobinTransientError?.({ accountId, detail: error.message, action: 'failover' });
-                  failoverToNext = true;
-                  break;
-                }
+              if (hasNextAccount && transientFailovers < 4) {
+                transientFailovers += 1;
+                this.options.onRobinTransientError?.({ accountId, detail: error.message, action: 'failover' });
+                failoverToNext = true;
+                break;
+              }
+              if (accountIndex === 0 && singleAccountTransientRetries < 1) {
+                singleAccountTransientRetries += 1;
                 this.options.onRobinTransientError?.({ accountId, detail: error.message, action: 'retry' });
                 await sleepAbortable(this.options.robinTransientRetryDelayMs ?? 500, signal);
                 forceRefresh = false;

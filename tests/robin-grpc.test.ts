@@ -1,6 +1,6 @@
 import http2 from 'node:http2';
 import { describe, expect, it, vi } from 'vitest';
-import { GatewayClient } from '../src/client.ts';
+import { classifyRobinCannedRejection, findLatestMediaBatchStart, GatewayClient } from '../src/client.ts';
 import { queryGatewayQuota } from '../src/quota.ts';
 import {
   acceptRobinTermsOfService,
@@ -1657,6 +1657,466 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
       for (const s of openStreams) {
         try { s.destroy(); } catch { /* ignore */ }
       }
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it('keeps media across the latest preempted or interrupted input batch while pruning earlier completed turns', async () => {
+    const evfCall = (id: string) => ({
+      role: 'model' as const,
+      parts: [{ functionCall: { name: 'external_event_frame', id, args: {} } }],
+    });
+    const evfResult = (id: string, output: string, extra: GeminiRequest['contents'][number]['parts'] = []) => ({
+      role: 'user' as const,
+      parts: [{ functionResponse: { name: 'external_event_frame', id, response: { output } } }, ...extra],
+    });
+    const pngBytes = (seed: number) => Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52]),
+      Buffer.from([seed, seed + 1, seed + 2, seed + 3]),
+    ]);
+    const wavBytes = Buffer.from([
+      0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45,
+      0x66, 0x6d, 0x74, 0x20, 0x10, 0x00, 0x00, 0x00,
+    ]);
+
+    // Pure boundary checks:
+    expect(findLatestMediaBatchStart([
+      { role: 'user', parts: [{ text: 'old' }] },
+      { role: 'model', parts: [{ functionCall: { name: 'end_turn', id: 'c1', args: {} } }] },
+      { role: 'user', parts: [{ functionResponse: { name: 'end_turn', id: 'c1', response: { output: '[turn ended]' } } }] },
+      evfCall('evf_1'),
+      evfResult('evf_1', '[1 new event] sent image'),
+      evfCall('evf_2'),
+      evfResult('evf_2', '[1 new event] follow-up preempt'),
+    ])).toBe(2);
+
+    expect(findLatestMediaBatchStart([
+      evfCall('evf_1'),
+      evfResult('evf_1', '[1 new event] sent image'),
+      { role: 'model', parts: [{ functionCall: { name: 'read_file', id: 'c_read', args: { path: 'a.ts' } } }] },
+      { role: 'user', parts: [{ functionResponse: { name: 'read_file', id: 'c_read', response: { output: 'export const x = 1;' } } }] },
+    ])).toBe(3);
+
+    expect(findLatestMediaBatchStart([
+      { role: 'user', parts: [{ text: 'part 1' }] },
+      { role: 'user', parts: [{ text: 'part 2' }] },
+    ])).toBe(0);
+
+    const uploadedContentTypes: string[] = [];
+    const receivedAttachmentsPerTurn: Array<Array<{ blobId: string; mimeType: string; name: string }>> = [];
+    const receivedTextsPerTurn: string[] = [];
+    let uploadCounter = 0;
+
+    const server = http2.createServer();
+    let baseUrl = '';
+    server.on('stream', (stream, headers) => {
+      const path = String(headers[':path'] ?? '');
+      const method = String(headers[':method'] ?? '');
+      const chunks: Buffer[] = [];
+      stream.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      stream.on('end', () => {
+        if (method === 'POST' && path === '/upload/') {
+          uploadCounter += 1;
+          uploadedContentTypes.push(String(headers['x-goog-upload-content-type'] ?? ''));
+          stream.respond({
+            ':status': 200,
+            'x-goog-upload-status': 'active',
+            'x-goog-upload-url': `${baseUrl}/upload/batch-${uploadCounter}`,
+          });
+          stream.end();
+          return;
+        }
+        if (method === 'PUT' && path.startsWith('/upload/batch-')) {
+          const idx = path.slice('/upload/batch-'.length);
+          stream.respond({ ':status': 200, 'x-goog-upload-status': 'final' });
+          stream.end(`/contrib_service/ttl_1d/batch-${idx}`);
+          return;
+        }
+        if (path === ROBIN_GRPC_PROCESS_QUERY) {
+          const reqFrames = new GrpcMessageReader().push(Buffer.concat(chunks));
+          const reqF1 = parseProtobuf(reqFrames[0]);
+          const reqInit = parseProtobuf(reqF1.find(f => f.number === 1000)!.payload);
+          const req1001 = parseProtobuf(reqInit.find(f => f.number === 1001)!.payload);
+          const reqTpl = parseProtobuf(req1001.find(f => f.number === 1)!.payload);
+          const reqQuery = parseProtobuf(reqTpl.find(f => f.number === 1)!.payload);
+          receivedTextsPerTurn.push(reqQuery.find(f => f.number === 1)?.payload.toString('utf8') ?? '');
+          const atts = reqQuery.filter(f => f.number === 3).map(f => {
+            const attFields = parseProtobuf(f.payload);
+            const blobFields = parseProtobuf(attFields.find(a => a.number === 1)!.payload);
+            return {
+              blobId: blobFields.find(b => b.number === 1)!.payload.toString('utf8'),
+              mimeType: blobFields.find(b => b.number === 3)!.payload.toString('utf8'),
+              name: attFields.find(a => a.number === 2)!.payload.toString('utf8'),
+            };
+          });
+          receivedAttachmentsPerTurn.push(atts);
+
+          stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({ text: `Saw ${atts.length} attachment(s)`, completed: true })));
+          stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+          stream.end();
+          return;
+        }
+        stream.respond({ ':status': 404 });
+        stream.end();
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const client = new GatewayClient({
+        baseUrl,
+        robinUploadOrigin: baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        auth: { accessToken: async () => 'fresh-token' },
+      });
+
+      const oldImg = pngBytes(1).toString('base64');
+      const img1 = pngBytes(2).toString('base64');
+      const audio1 = wavBytes.toString('base64');
+
+      // 1) Initial attempt with img1 (before preempt) uploads img1 once.
+      const beforePreempt: GeminiRequest = {
+        model: 'gemini-4-neon',
+        contents: [
+          evfCall('evf_0'),
+          evfResult('evf_0', '[1 new event] earlier image', [{ inlineData: { mimeType: 'image/png', data: oldImg } }]),
+          { role: 'model', parts: [{ functionCall: { name: 'end_turn', id: 'c_old', args: {} } }] },
+          { role: 'user', parts: [{ functionResponse: { name: 'end_turn', id: 'c_old', response: { output: '[turn ended]' } } }] },
+          evfCall('evf_1'),
+          evfResult('evf_1', '[1 new event] check this photo', [{ inlineData: { mimeType: 'image/png', data: img1 } }]),
+        ],
+      };
+      await consume(client.stream(beforePreempt));
+      expect(uploadedContentTypes).toEqual(['image/png']);
+      expect(receivedAttachmentsPerTurn[0]).toEqual([
+        { blobId: '/contrib_service/ttl_1d/batch-1', mimeType: 'image/png', name: 'image-1.png' },
+      ]);
+      expect(receivedTextsPerTurn[0]).toContain('[Earlier image omitted]');
+
+      // 2) Preempted by follow-up text + voice frames: img1 is preserved (and served from SHA-256 cache),
+      //    audio1 is uploaded alongside it, while oldImg stays omitted.
+      const afterPreempt: GeminiRequest = {
+        model: 'gemini-4-neon',
+        contents: [
+          ...beforePreempt.contents,
+          evfCall('evf_2'),
+          evfResult('evf_2', '[1 new event] wait look at the top-left corner'),
+          evfCall('evf_3'),
+          evfResult('evf_3', '[1 new event] voice follow-up', [{ inlineData: { mimeType: 'audio/wav', data: audio1 } }]),
+        ],
+      };
+      await consume(client.stream(afterPreempt));
+      expect(uploadedContentTypes).toEqual(['image/png', 'audio/wav']);
+      expect(receivedAttachmentsPerTurn[1]).toEqual([
+        { blobId: '/contrib_service/ttl_1d/batch-1', mimeType: 'image/png', name: 'image-1.png' },
+        { blobId: '/contrib_service/ttl_1d/batch-2', mimeType: 'audio/wav', name: 'audio-1.wav' },
+      ]);
+      expect(receivedTextsPerTurn[1]).toContain('[Earlier image omitted]');
+      expect(receivedTextsPerTurn[1]).toContain('[Attached image: image-1.png (image/png)]');
+      expect(receivedTextsPerTurn[1]).toContain('[Attached audio: audio-1.wav (audio/wav)]');
+
+      // 3) Mid-round interrupt after model started speaking: img1 + interrupting audio both ride into the new request.
+      const afterInterrupt: GeminiRequest = {
+        model: 'gemini-4-neon',
+        contents: [
+          ...beforePreempt.contents,
+          {
+            role: 'model',
+            parts: [
+              { functionCall: { name: 'pet_say', id: 'c_say', args: { script: '哇这图...' } } },
+              { functionCall: { name: 'end_turn', id: 'c_end', args: {} } },
+            ],
+          },
+          {
+            role: 'user',
+            parts: [
+              { functionResponse: { name: 'pet_say', id: 'c_say', response: { output: 'spoke partial [an interrupt signal was sent while this tool ran]' } } },
+              { functionResponse: { name: 'end_turn', id: 'c_end', response: { output: '[not executed: interrupted by a new event]' } } },
+            ],
+          },
+          evfCall('evf_4'),
+          evfResult('evf_4', '[1 new event] stop talking and read the error in the image', [{ inlineData: { mimeType: 'audio/wav', data: audio1 } }]),
+        ],
+      };
+      await consume(client.stream(afterInterrupt));
+      expect(uploadedContentTypes).toEqual(['image/png', 'audio/wav']);
+      expect(receivedAttachmentsPerTurn[2]).toEqual([
+        { blobId: '/contrib_service/ttl_1d/batch-1', mimeType: 'image/png', name: 'image-1.png' },
+        { blobId: '/contrib_service/ttl_1d/batch-2', mimeType: 'audio/wav', name: 'audio-1.wav' },
+      ]);
+
+      // 4) Once the assistant finishes normally, the next follow-up omits all earlier media cleanly.
+      const afterCompleted: GeminiRequest = {
+        model: 'gemini-4-neon',
+        contents: [
+          ...afterInterrupt.contents,
+          { role: 'model', parts: [{ functionCall: { name: 'end_turn', id: 'c_done', args: {} } }] },
+          { role: 'user', parts: [{ functionResponse: { name: 'end_turn', id: 'c_done', response: { output: '[turn ended]' } } }] },
+          evfCall('evf_5'),
+          evfResult('evf_5', '[1 new event] got it thanks'),
+        ],
+      };
+      await consume(client.stream(afterCompleted));
+      expect(receivedAttachmentsPerTurn[3]).toEqual([]);
+      expect(receivedTextsPerTurn[3]).toContain('[Earlier image omitted]');
+      expect(receivedTextsPerTurn[3]).toContain('[Earlier attachment omitted]');
+
+      // 5) Over-cap burst (5 images across consecutive preempted frames) keeps the newest 4 in chronological order.
+      const burstContents: GeminiRequest['contents'] = [];
+      for (let k = 1; k <= 5; k++) {
+        burstContents.push(evfCall(`evf_burst_${k}`));
+        burstContents.push(evfResult(`evf_burst_${k}`, `[1 new event] pic ${k}`, [
+          { inlineData: { mimeType: 'image/png', data: pngBytes(20 + k).toString('base64') } },
+        ]));
+      }
+      await consume(client.stream({ model: 'gemini-4-neon', contents: burstContents }));
+      expect(receivedAttachmentsPerTurn[4]).toHaveLength(4);
+      expect(receivedAttachmentsPerTurn[4].map(a => a.name)).toEqual([
+        'image-1.png', 'image-2.png', 'image-3.png', 'image-4.png',
+      ]);
+      expect(receivedTextsPerTurn[4]).toContain('[Attachment omitted: oversized or excess image omitted]');
+      expect(receivedTextsPerTurn[4]).not.toContain('[Earlier image omitted]');
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it('intercepts HTTP 200 Robin safety/policy refusals (including 2-frame replacement), fails over across accounts, and throws 422 without polluting history', async () => {
+    // 1. Unit classification checks (positives and negatives).
+    expect(classifyRobinCannedRejection("I'm just a language model and can't help with that.")).toBe('safety-refusal');
+    expect(classifyRobinCannedRejection(
+      'It appears this one would go against my [guidelines](https://gemini.google/policy-guidelines/). Is there something else I can try for you?',
+    )).toBe('safety-refusal');
+    expect(classifyRobinCannedRejection(
+      "I'm unable to assist with that particular request, as it may go against my [guidelines](https://gemini.google/policy-guidelines/).",
+    )).toBe('safety-refusal');
+    expect(classifyRobinCannedRejection(
+      'That request may go against my [guidelines](https://gemini.google/policy-guidelines/).',
+    )).toBe('safety-refusal');
+    expect(classifyRobinCannedRejection('我只是一个语言模型，无法在这方面提供帮助。')).toBe('safety-refusal');
+    expect(classifyRobinCannedRejection('I seem to be encountering an error. Can I try something else for you?')).toBe('transient-error');
+
+    expect(classifyRobinCannedRejection("I'm just a language model and can't help with that. 这句话是外审返回的。")).toBeNull();
+    expect(classifyRobinCannedRejection("I'm sorry, I couldn't find that file.")).toBeNull();
+    expect(classifyRobinCannedRejection(
+      'Let me explain the policy.\n\nSee [guidelines](https://gemini.google/policy-guidelines/) for full details.',
+    )).toBeNull();
+
+    type Mode =
+      | 'multi-3-failover-ok'
+      | 'multi-3-persistent'
+      | 'single-retry-ok'
+      | 'single-persistent'
+      | 'frame2-recovered-text'
+      | 'quoted-plus-explanation'
+      | 'refusal-then-tool';
+    let mode: Mode = 'multi-3-failover-ok';
+    let callCount = 0;
+    const seenTokens: string[] = [];
+    const server = http2.createServer();
+
+    server.on('stream', (stream, headers) => {
+      if (headers[':path'] !== ROBIN_GRPC_PROCESS_QUERY) {
+        stream.respond({ ':status': 404 });
+        stream.end();
+        return;
+      }
+      callCount += 1;
+      const attemptNo = callCount;
+      seenTokens.push(String(headers.authorization ?? ''));
+      stream.resume();
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        const send = (text: string, completed = false) => {
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text,
+            responseId: `rc_refusal_${attemptNo}`,
+            attribution: 'Used 4 Neon Medium model',
+            completed,
+          })));
+        };
+
+        if (mode === 'multi-3-failover-ok') {
+          if (attemptNo === 1) {
+            send("I'm just a language model and can't help with that.");
+            send('It appears this one would go against my [guidelines](https://gemini.google/policy-guidelines/). Is there something else I can try for you?', true);
+          } else if (attemptNo === 2) {
+            send("I'm just a language model and can't help with that.");
+            send("I'm unable to assist with that particular request, as it may go against my [guidelines](https://gemini.google/policy-guidelines/).", true);
+          } else {
+            send('<tool_call>{"name":"wechat_send","args":{"text":"三号账号正常接力回复！"}}</tool_call>', true);
+          }
+        } else if (mode === 'multi-3-persistent') {
+          send("I'm just a language model and can't help with that.");
+          send('It appears this one would go against my [guidelines](https://gemini.google/policy-guidelines/). Is there something else I can try for you?', true);
+        } else if (mode === 'single-retry-ok') {
+          if (attemptNo === 1) {
+            send("I'm just a language model and can't help with that.", true);
+          } else {
+            send('<tool_call>{"name":"wechat_send","args":{"text":"单号重试避开外审啦！"}}</tool_call>', true);
+          }
+        } else if (mode === 'single-persistent') {
+          send('That request may go against my [guidelines](https://gemini.google/policy-guidelines/).', true);
+        } else if (mode === 'frame2-recovered-text') {
+          send("I'm just a language model and can't help with that.");
+          send('正常恢复后的回复', true);
+        } else if (mode === 'quoted-plus-explanation') {
+          send("I'm just a language model and can't help with that. 这句只是在引用外审日志。", true);
+        } else {
+          send("I'm just a language model and can't help with that.");
+          send("I'm just a language model and can't help with that.\n<tool_call>{\"name\":\"wechat_send\",\"args\":{\"text\":\"附带工具调用\"}}</tool_call>", true);
+        }
+
+        stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+        stream.end();
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      // 2. 3-account pool failover across 2-frame policy refusals without putting accounts into cooldown.
+      const failedAccounts: string[] = [];
+      const succeededAccounts: string[] = [];
+      const transientEvents: { accountId?: string; action: string; detail: string }[] = [];
+      const multiClient = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        robinTransientRetryDelayMs: 0,
+        onRobinTransientError: info => transientEvents.push({
+          accountId: info.accountId,
+          action: info.action,
+          detail: info.detail,
+        }),
+        auth: {
+          accessToken: async () => 'tok-default',
+          selectAccounts: () => ['acct_1', 'acct_2', 'acct_3'],
+          accessTokenFor: async id => `tok-${id}`,
+          onAccountFailure: id => failedAccounts.push(id),
+          onAccountSuccess: id => succeededAccounts.push(id),
+        },
+      });
+
+      mode = 'multi-3-failover-ok';
+      callCount = 0;
+      seenTokens.length = 0;
+      const res2 = await consume(multiClient.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'wechat_send', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+      }));
+      expect(res2.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { functionCall: { name: 'wechat_send', args: { text: '三号账号正常接力回复！' } } },
+      ]);
+      expect(seenTokens).toEqual(['Bearer tok-acct_1', 'Bearer tok-acct_2', 'Bearer tok-acct_3']);
+      expect(failedAccounts).toEqual([]);
+      expect(succeededAccounts).toEqual(['acct_3']);
+      expect(transientEvents.map(e => ({ accountId: e.accountId, action: e.action }))).toEqual([
+        { accountId: 'acct_1', action: 'failover' },
+        { accountId: 'acct_2', action: 'failover' },
+      ]);
+
+      // 3. Persistent refusal across 3-account pool emits zero chunks and throws status 422.
+      mode = 'multi-3-persistent';
+      callCount = 0;
+      seenTokens.length = 0;
+      transientEvents.length = 0;
+      const emittedOnFail: unknown[] = [];
+      await expect((async () => {
+        for await (const chunk of multiClient.stream({
+          model: 'gemini-4-neon',
+          contents: [{ role: 'user', parts: [{ text: 'sensitive' }] }],
+        })) {
+          emittedOnFail.push(chunk);
+        }
+      })()).rejects.toMatchObject({ status: 422 });
+      expect(callCount).toBe(3);
+      expect(seenTokens).toEqual(['Bearer tok-acct_1', 'Bearer tok-acct_2', 'Bearer tok-acct_3']);
+      expect(emittedOnFail).toEqual([]);
+      expect(transientEvents.map(e => ({ accountId: e.accountId, action: e.action }))).toEqual([
+        { accountId: 'acct_1', action: 'failover' },
+        { accountId: 'acct_2', action: 'failover' },
+        { accountId: 'acct_3', action: 'fail' },
+      ]);
+
+      // 4. Single-account refusal retries once cleanly and throws 422 when persistent.
+      const singleEvents: { action: string }[] = [];
+      const singleClient = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        robinTransientRetryDelayMs: 0,
+        onRobinTransientError: info => singleEvents.push({ action: info.action }),
+        auth: { accessToken: async () => 'tok-single' },
+      });
+      mode = 'single-retry-ok';
+      callCount = 0;
+      const singleRecovered = await consume(singleClient.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'wechat_send', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'retry' }] }],
+      }));
+      expect(singleRecovered.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { functionCall: { name: 'wechat_send', args: { text: '单号重试避开外审啦！' } } },
+      ]);
+      expect(callCount).toBe(2);
+      expect(singleEvents).toEqual([{ action: 'retry' }]);
+
+      mode = 'single-persistent';
+      callCount = 0;
+      singleEvents.length = 0;
+      await expect(consume(singleClient.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'still blocked' }] }],
+      }))).rejects.toMatchObject({ status: 422 });
+      expect(callCount).toBe(2);
+      expect(singleEvents).toEqual([{ action: 'retry' }, { action: 'fail' }]);
+
+      // 5. Frame-1 refusal replaced by Frame-2 normal text drops Frame 1 completely.
+      mode = 'frame2-recovered-text';
+      callCount = 0;
+      const recoveredText = await consume(singleClient.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'recover' }] }],
+      }));
+      expect(recoveredText.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('')).toBe('正常恢复后的回复');
+      expect(callCount).toBe(1);
+
+      // 6. Quoted refusal with commentary or accompanied by tool calls passes through intact without retry.
+      mode = 'quoted-plus-explanation';
+      callCount = 0;
+      const quoted = await consume(singleClient.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'explain' }] }],
+      }));
+      expect(quoted.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('')).toBe(
+        "I'm just a language model and can't help with that. 这句只是在引用外审日志。",
+      );
+      expect(callCount).toBe(1);
+
+      mode = 'refusal-then-tool';
+      callCount = 0;
+      const withTool = await consume(singleClient.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'wechat_send', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'tool' }] }],
+      }));
+      expect(withTool.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { text: "I'm just a language model and can't help with that." },
+        { functionCall: { name: 'wechat_send', args: { text: '附带工具调用' } } },
+      ]);
+      expect(callCount).toBe(1);
+    } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });
