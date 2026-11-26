@@ -32,6 +32,7 @@ export interface GatewayConfiguration extends GatewayClientOptions {
   inputFiles?: boolean;
   mirrorSubscriptionSpend?: boolean;
   estimateRobinTokens?: boolean;
+  strictModelRouting?: boolean;
 }
 
 export function option(entry: LLMProviderEntry, key: string): string | undefined {
@@ -127,6 +128,7 @@ export function configuration(entry: LLMProviderEntry): GatewayConfiguration {
     inputFiles,
     mirrorSubscriptionSpend,
     estimateRobinTokens,
+    strictModelRouting: boolOpt('strictModelRouting') ?? false,
   };
 }
 
