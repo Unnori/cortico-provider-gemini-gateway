@@ -1,4 +1,6 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { ConfigGroup } from 'cortico/core/config-schema.ts';
+import type { Generation } from 'cortico/core/generation.ts';
 import type { Language } from 'cortico/core/language.ts';
 import type { LLMProviderEntry, ReasoningTier } from 'cortico/core/types.ts';
 import type { ProviderModule } from 'cortico/providers/base.ts';
@@ -10,7 +12,7 @@ import { CustomGeminiProvider } from './native.ts';
 import { configuration, option, resolveHeaders } from './options.ts';
 import { resolveProviderPrices } from './pricing.ts';
 import type { QuotaSnapshot } from './quota.ts';
-import type { RobinTermsResult, RobinUserStatus } from './robin-grpc.ts';
+import type { RobinRoutingObservation, RobinTermsResult, RobinUserStatus } from './robin-grpc.ts';
 import {
   buildRobinListedModels,
   buildRobinRouteSummary,
@@ -22,6 +24,29 @@ import { gatewayWebUi } from './webui/server.ts';
 
 const catalogs = new Map<string, ModelCatalog>();
 const robinAccounts = new Map<string, GatewayControl>();
+
+export function describeRobinDowngradeReason(code?: number): string {
+  if (code === 2) return 'quota-limit-fallback (code 2)';
+  if (code === 3) return 'rate-or-quota-fallback (code 3)';
+  if (code === 6) return 'auto-routing / quota-or-tier-fallback (code 6)';
+  if (code === 8) return 'tier-or-capacity-downgrade (code 8)';
+  return code === undefined ? 'unknown' : `code ${code}`;
+}
+
+export function describeRobinModeCategory(cat?: number): string {
+  const labels: Record<number, string> = { 1: 'FAST', 3: 'PRO', 6: 'FLASH-LITE', 8: 'ULTRA' };
+  return cat === undefined ? 'unknown' : labels[cat] ?? `code ${cat}`;
+}
+
+interface GenerationRouting {
+  latest?: Pick<RobinRoutingObservation, 'requestedModeCategory' | 'resolvedModeCategory' | 'downgradeReason' | 'attribution'> & {
+    accountId?: string;
+    downgraded: boolean;
+    resolvedModeLabel: string;
+    downgradeReasonLabel: string;
+  };
+  retried: boolean;
+}
 const catalogKey = (entry: LLMProviderEntry) => JSON.stringify([
   entry.baseUrl, entry.options?.modelsDevUrl, entry.options?.openRouterUrl, entry.options?.proxyUrl,
 ]);
@@ -96,6 +121,13 @@ function gatewayConfigGroups(name: string, language: Language): ConfigGroup[] {
       type: 'object',
       title: en ? 'Gateway Headers' : '网关请求头',
       properties: {
+        [`${prefix}strictModelRouting`]: {
+          type: 'boolean',
+          title: en ? 'Cool down accounts after any Robin downgrade' : 'Robin 任意降级后暂时冷却账号',
+          description: en
+            ? 'Extend cooldown failover beyond quota codes to all Robin silent fallbacks and mode mismatches.'
+            : '将冷却切换从配额降级码扩展到所有 Robin 静默回落或模式不一致场景。',
+        },
         [`${prefix}headers`]: {
           type: 'object',
           title: en ? 'Headers (JSON)' : '自定义请求头 (JSON)',
@@ -181,6 +213,7 @@ export const GEMINI_GATEWAY = {
       const fallbacks = robinCatalogLookupIds(model, acct.plan, acct.userTier, observed?.attribution);
       return catalog.get(model, fallbacks) ?? geminiBaseline(model);
     };
+    const routing = new AsyncLocalStorage<GenerationRouting>();
     const gateway = new GatewayClient({
       ...options,
       headers,
@@ -200,12 +233,19 @@ export const GEMINI_GATEWAY = {
           return oauth.pickAccountOrder(configuration(current()).accountRouting, model);
         },
         accessTokenFor: (accountId, force) => {
+          const run = routing.getStore();
+          if (run?.retried) delete run.latest;
           oauth.refreshBundledConfig();
           oauth.setProxyUrl(configuration(current()).proxyUrl);
           return oauth.auth.accessTokenFor(accountId, force);
         },
         onAccountSuccess: accountId => {
-          oauth.clearAccountCooldown(accountId);
+          const run = routing.getStore();
+          // streamGrpcAttempt emits onRobinRouting (which may set a downgrade cooldown)
+          // right before stream() calls onAccountSuccess; do not wipe that cooldown.
+          if (!run?.latest?.downgraded || run.latest.accountId !== accountId) {
+            oauth.clearAccountCooldown(accountId);
+          }
           const cur = current();
           const curCfg = configuration(cur);
           if (curCfg.protocol === 'robin') {
@@ -220,6 +260,8 @@ export const GEMINI_GATEWAY = {
           }
         },
         onAccountFailure: (accountId, status, detail) => {
+          const run = routing.getStore();
+          if (run) run.retried = true;
           const isTermsError = Boolean(detail && /accept our terms of service|terms of service|服务条款/i.test(detail));
           if (isTermsError) {
             oauth.markAccountTermsRequired(accountId);
@@ -254,28 +296,40 @@ export const GEMINI_GATEWAY = {
       onRobinRouting: (obs, accountId) => {
         oauth.recordRouting(obs, accountId);
         const routingData = {
-          ...(accountId ? { accountId } : {}),
           requestedModel: obs.requestedModel,
-          requestedModeCategory: obs.requestedModeCategory,
-          resolvedModeCategory: obs.resolvedModeCategory,
           requestedThinkingLevel: obs.requestedThinkingLevel,
           resolvedThinkingLevel: obs.resolvedThinkingLevel,
-          attribution: obs.attribution,
           thoughtChars: obs.thoughtChars ?? 0,
           ...(obs.fallback !== undefined ? { fallback: obs.fallback } : {}),
-          ...(obs.downgradeReason !== undefined ? { downgradeReason: obs.downgradeReason } : {}),
         };
-        host.log.debug('Robin routing observed', routingData);
         const downgraded = obs.fallback === 1
           || (obs.downgradeReason !== undefined && obs.downgradeReason > 0)
           || (obs.requestedModeCategory !== undefined
             && obs.resolvedModeCategory !== undefined
             && obs.resolvedModeCategory !== obs.requestedModeCategory);
+        const telemetry = {
+          ...(accountId ? { accountId } : {}),
+          downgraded,
+          requestedModeCategory: obs.requestedModeCategory,
+          resolvedModeCategory: obs.resolvedModeCategory,
+          downgradeReason: obs.downgradeReason,
+          attribution: obs.attribution,
+          downgradeReasonLabel: describeRobinDowngradeReason(obs.downgradeReason),
+          resolvedModeLabel: describeRobinModeCategory(obs.resolvedModeCategory),
+        };
+        const run = routing.getStore();
+        if (run) run.latest = telemetry;
+        const details = { ...routingData, ...telemetry };
+        host.log.debug('Robin routing observed', details);
         if (downgraded) {
-          host.log.warn('Robin backend routed or downgraded model', routingData);
+          host.log.warn('Robin backend routed or downgraded model', details);
         }
       },
-      onRobinTransientError: info => host.log.warn('Robin backend transient failure', info),
+      onRobinTransientError: info => {
+        const run = routing.getStore();
+        if (run) run.retried = true;
+        host.log.warn('Robin backend transient failure', info);
+      },
       onToolCallRepair: info => host.log.info('Repaired malformed tool_call JSON', info),
       onCleanupError: error => host.log.warn('Gemini gateway conversation cleanup failed', {
         error: error instanceof Error ? error.message : String(error),
@@ -327,11 +381,46 @@ export const GEMINI_GATEWAY = {
         await Promise.all(tasks);
       },
     };
+    const client = new CustomGeminiProvider(name, gateway, host, model => {
+      void catalog.refresh();
+      return mime => acceptsGatewayMime(current(), resolveModelMeta(model), mime);
+    });
+    if (options.protocol === 'robin') {
+      const respond = client.respond.bind(client);
+      client.respond = (...args) => {
+        const run: GenerationRouting = { retried: false };
+        return routing.run(run, async () => {
+          let attempts: Generation['attempts'] | undefined;
+          try {
+            const generation = await respond(...args);
+            attempts = generation.attempts;
+            const latest = run.latest;
+            if (latest?.downgraded && !run.retried && attempts.length === 1 && configuration(current()).strictModelRouting) {
+              const reason = latest.downgradeReasonLabel;
+              if (latest.accountId) oauth.markAccountCooldown(latest.accountId, 120_000, `Robin downgrade: ${reason}`);
+              host.log.warn('Strict Robin routing observed a downgraded response', { accountId: latest.accountId, reason });
+            }
+            return generation;
+          } catch (error) {
+            if (error && typeof error === 'object' && 'attempts' in error && Array.isArray((error as { attempts?: unknown }).attempts)) {
+              attempts = (error as { attempts: Generation['attempts'] }).attempts;
+            }
+            throw error;
+          } finally {
+            const last = attempts?.at(-1);
+            if (last && run.latest) {
+              if (last.meters.native && typeof last.meters.native === 'object') {
+                Object.assign(last.meters.native, run.latest);
+              } else {
+                last.meters.native = { ...run.latest };
+              }
+            }
+          }
+        });
+      };
+    }
     return {
-      client: new CustomGeminiProvider(name, gateway, host, model => {
-        void catalog.refresh();
-        return mime => acceptsGatewayMime(current(), resolveModelMeta(model), mime);
-      }),
+      client,
       control,
       start: () => {
         const cur = current();
