@@ -689,7 +689,12 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
       }
       if (method === 'set-routing') {
         const routing = raw.routing;
-        if (routing !== 'failover' && routing !== 'round-robin' && routing !== 'least-used') {
+        if (
+          routing !== 'failover'
+          && routing !== 'round-robin'
+          && routing !== 'least-used'
+          && routing !== 'least-used-5h'
+        ) {
           throw new Error(en ? 'Invalid account routing strategy.' : '无效的多账号调度策略。');
         }
         entry = ensureDraftDefaults(name, entry);

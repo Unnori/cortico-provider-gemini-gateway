@@ -34,15 +34,31 @@ function setPanelTitle(root: HTMLElement, title: string): void {
   }
 }
 
-function sortLeastUsed<T>(
+function isQuotaRouting(routing: AccountRoutingMode): routing is 'least-used' | 'least-used-5h' {
+  return routing === 'least-used' || routing === 'least-used-5h';
+}
+
+function sortByQuotaPriority<T>(
   items: readonly T[],
   info: (item: T) => { cooled: boolean; cooldownUntil?: number; fiveHourRemaining?: number; weeklyRemaining?: number },
+  mode: 'least-used' | 'least-used-5h',
 ): T[] {
   return [...items].sort((a, b) => {
     const ia = info(a);
     const ib = info(b);
     if (ia.cooled !== ib.cooled) return ia.cooled ? 1 : -1;
     if (ia.cooled && ib.cooled) return (ia.cooldownUntil ?? 0) - (ib.cooldownUntil ?? 0);
+    if (mode === 'least-used-5h') {
+      const exhA = ia.weeklyRemaining !== undefined && ia.weeklyRemaining <= 5;
+      const exhB = ib.weeklyRemaining !== undefined && ib.weeklyRemaining <= 5;
+      if (exhA !== exhB) return exhA ? 1 : -1;
+      const fiveA = ia.fiveHourRemaining ?? ia.weeklyRemaining ?? 50;
+      const fiveB = ib.fiveHourRemaining ?? ib.weeklyRemaining ?? 50;
+      if (fiveA !== fiveB) return fiveB - fiveA;
+      const weekA = ia.weeklyRemaining ?? 50;
+      const weekB = ib.weeklyRemaining ?? 50;
+      return weekB - weekA;
+    }
     const exhA = ia.fiveHourRemaining !== undefined && ia.fiveHourRemaining <= 5;
     const exhB = ib.fiveHourRemaining !== undefined && ib.fiveHourRemaining <= 5;
     if (exhA !== exhB) return exhA ? 1 : -1;
@@ -165,9 +181,10 @@ const authPanel: WebUiPanel = {
 
     const routingSelect = ui.select({
       options: [
-        { value: 'failover', label: t('主备故障转移（默认：优先主用号，429/降级自动切备用）', 'Failover (default: primary first, auto-switch on 429)') },
+        { value: 'failover', label: t('主备故障转移（默认：优先主用号，429/降级自动切备用）', 'Failover (default: primary first, auto-switch on 429/downgrade)') },
         { value: 'round-robin', label: t('轮询均衡（无主从区分，平等轮流使用健康账号）', 'Round-robin (equal peers, rotate healthy accounts)') },
-        { value: 'least-used', label: t('按余量优先（优先使用周额度剩余最多的可用账号）', 'Least-used (highest weekly remaining quota first)') },
+        { value: 'least-used', label: t('周额度余量优先（优先使用每周剩余额度最多的可用账号）', 'Weekly quota first (highest weekly remaining quota first)') },
+        { value: 'least-used-5h', label: t('5小时窗口余量优先（优先使用 5h 窗口剩余额度最多的可用账号）', '5-hour quota first (highest 5-hour window remaining quota first)') },
       ],
       onChange: value => {
         // Capture selected value BEFORE run() invokes paint() so it is never reset to stale state.
@@ -177,7 +194,7 @@ const authPanel: WebUiPanel = {
           broadcastPanelSync({ kind: 'routing', instanceName: name, routing });
           const needsQuotaFetch = routing !== 'failover'
             && state.signedIn
-            && state.accounts.some(a => a.weeklyRemaining === undefined);
+            && state.accounts.some(a => a.weeklyRemaining === undefined || a.fiveHourRemaining === undefined);
           if (needsQuotaFetch) {
             state = await invoke<AuthPanelStatus>('refresh-quotas');
             broadcastPanelSync({ kind: 'quota', instanceName: name, source: 'auth' });
@@ -445,28 +462,38 @@ const authPanel: WebUiPanel = {
       });
     }
 
-    function renderInlineWeeklyQuota(acct: AuthAccountItem, routing: AccountRoutingMode, barMode: QuotaBarMode): HTMLElement {
+    function renderInlineAccountQuota(acct: AuthAccountItem, routing: AccountRoutingMode, barMode: QuotaBarMode): HTMLElement {
       const box = ui.h('div', 'ggw-acct-quota');
       const head = ui.h('div', 'ggw-acct-quota-head');
+      const isFiveHourPriority = routing === 'least-used-5h';
+      const primaryRemainingRaw = isFiveHourPriority ? acct.fiveHourRemaining : acct.weeklyRemaining;
+      const secondaryRemainingRaw = isFiveHourPriority ? acct.weeklyRemaining : acct.fiveHourRemaining;
+      const primaryResetAt = isFiveHourPriority ? acct.fiveHourResetsAt : acct.weeklyResetsAt;
       const lbl = ui.h(
         'span',
         'ggw-qbar-lbl',
-        routing === 'least-used' ? t('周额度余量（调度依据）', 'Weekly quota left (priority)') : t('每周额度', 'Weekly quota'),
+        isFiveHourPriority
+          ? t('5h 窗口余量（调度依据）', '5h quota left (priority)')
+          : routing === 'least-used'
+            ? t('周额度余量（调度依据）', 'Weekly quota left (priority)')
+            : t('每周额度', 'Weekly quota'),
       );
-      if (acct.weeklyRemaining === undefined) {
+      if (primaryRemainingRaw === undefined) {
         const val = ui.h('span', 'ggw-acct-quota-sub', t('待查询（点「刷新各号额度」获取）', 'Not loaded yet'));
         head.append(lbl, val);
         box.append(head);
         return box;
       }
-      const remaining = Math.min(Math.max(acct.weeklyRemaining, 0), 100);
+      const remaining = Math.min(Math.max(primaryRemainingRaw, 0), 100);
       const used = Math.round((100 - remaining) * 10) / 10;
       const showRemaining = barMode !== 'used';
       const tone = remaining <= 10 ? 'bad' : remaining <= 25 ? 'warn' : '';
       const val = ui.h(
         'span',
         tone ? `ggw-acct-quota-main ${tone}` : 'ggw-acct-quota-main',
-        showRemaining ? t(`周剩余 ${remaining}%`, `${remaining}% left`) : t(`周已用 ${used}%`, `${used}% used`),
+        isFiveHourPriority
+          ? (showRemaining ? t(`5h 剩余 ${remaining}%`, `5h ${remaining}% left`) : t(`5h 已用 ${used}%`, `5h ${used}% used`))
+          : (showRemaining ? t(`周剩余 ${remaining}%`, `${remaining}% left`) : t(`周已用 ${used}%`, `${used}% used`)),
       );
       head.append(lbl, val);
 
@@ -478,17 +505,17 @@ const authPanel: WebUiPanel = {
       const subParts: string[] = [
         showRemaining ? t(`已用 ${used}%`, `${used}% used`) : t(`剩余 ${remaining}%`, `${remaining}% left`),
       ];
-      if (acct.fiveHourRemaining !== undefined) {
-        const fiveRemaining = Math.min(Math.max(acct.fiveHourRemaining, 0), 100);
-        const fiveUsed = Math.round((100 - fiveRemaining) * 10) / 10;
+      if (secondaryRemainingRaw !== undefined) {
+        const secRemaining = Math.min(Math.max(secondaryRemainingRaw, 0), 100);
+        const secUsed = Math.round((100 - secRemaining) * 10) / 10;
         subParts.push(
-          showRemaining
-            ? t(`5h 剩余 ${fiveRemaining}%`, `5h left ${fiveRemaining}%`)
-            : t(`5h 已用 ${fiveUsed}%`, `5h used ${fiveUsed}%`),
+          isFiveHourPriority
+            ? (showRemaining ? t(`周剩余 ${secRemaining}%`, `weekly left ${secRemaining}%`) : t(`周已用 ${secUsed}%`, `weekly used ${secUsed}%`))
+            : (showRemaining ? t(`5h 剩余 ${secRemaining}%`, `5h left ${secRemaining}%`) : t(`5h 已用 ${secUsed}%`, `5h used ${secUsed}%`)),
         );
       }
-      if (acct.weeklyResetsAt) {
-        const resetMs = Date.parse(acct.weeklyResetsAt) - Date.now();
+      if (primaryResetAt) {
+        const resetMs = Date.parse(primaryResetAt) - Date.now();
         if (Number.isFinite(resetMs)) subParts.push(formatDuration(resetMs, zh));
       }
       const sub = ui.h('div', 'ggw-acct-quota-sub', subParts.join(' · '));
@@ -506,7 +533,7 @@ const authPanel: WebUiPanel = {
       isTopPriority: boolean,
     ): HTMLElement {
       const showRemaining = barMode !== 'used';
-      const highlight = routing === 'failover' ? acct.isPrimary : (routing === 'least-used' && isTopPriority);
+      const highlight = routing === 'failover' ? acct.isPrimary : (isQuotaRouting(routing) && isTopPriority);
       const card = ui.h('div', highlight ? 'ggw-account-card is-primary' : 'ggw-account-card');
 
       const head = ui.h('div', 'ggw-account-head');
@@ -544,6 +571,15 @@ const authPanel: WebUiPanel = {
           'span',
           `ggw-tag ${tone}`,
           showRemaining ? t(`周余 ${weeklyRem}%`, `${weeklyRem}% wk`) : t(`周用 ${weeklyUsed}%`, `${weeklyUsed}% used`),
+        ));
+      } else if (routing === 'least-used-5h' && acct.fiveHourRemaining !== undefined) {
+        const fiveRem = Math.min(Math.max(acct.fiveHourRemaining, 0), 100);
+        const fiveUsed = Math.round((100 - fiveRem) * 10) / 10;
+        const tone = fiveRem <= 10 ? 'bad' : fiveRem <= 25 ? 'warn' : 'primary';
+        rightTags.append(ui.h(
+          'span',
+          `ggw-tag ${tone}`,
+          showRemaining ? t(`5h 余 ${fiveRem}%`, `${fiveRem}% 5h`) : t(`5h 用 ${fiveUsed}%`, `${fiveUsed}% 5h used`),
         ));
       }
       if (protocol === 'robin') {
@@ -654,7 +690,7 @@ const authPanel: WebUiPanel = {
 
       card.append(head);
       if (routing !== 'failover') {
-        card.append(renderInlineWeeklyQuota(acct, routing, barMode));
+        card.append(renderInlineAccountQuota(acct, routing, barMode));
       }
       card.append(meta);
       if (acct.cooldownReason || acct.lastError) {
@@ -786,18 +822,23 @@ const authPanel: WebUiPanel = {
       routingHint.hidden = !state.authEnabled || count === 0;
       if (routing === 'round-robin') {
         routingHint.textContent = t(
-          '当前为轮询模式：所有账号平等参与轮流调用（无主从区分），卡片中平等展示各号周额度。',
-          'Round-robin: all accounts rotate equally without primary/backup roles, showing weekly quota side by side.',
+          '当前为轮询模式：所有账号平等参与轮流调用（无主从区分）；若某号触发模型降级会自动瞬间转切其他可用账号。',
+          'Round-robin: all accounts rotate equally without primary/backup roles, and auto-failover if any account gets downgraded.',
         );
       } else if (routing === 'least-used') {
         routingHint.textContent = t(
-          '当前为额度优先模式：自动按周额度剩余比例从高到低排序调度（自动避开冷却或 5h 耗尽账号）。',
-          'Least-used: routes to the available account with the highest weekly quota remaining.',
+          '当前为周额度余量优先模式：按每周剩余额度比例从高到低调度（自动避开冷却、降级或 5h 耗尽账号）。',
+          'Weekly quota first: routes to the available account with the highest weekly quota remaining.',
+        );
+      } else if (routing === 'least-used-5h') {
+        routingHint.textContent = t(
+          '当前为 5 小时窗口余量优先模式：按 5 小时窗口剩余额度比例从高到低调度（自动避开冷却、降级或周额度耗尽账号）。',
+          '5-hour quota first: routes to the available account with the highest 5-hour window quota remaining.',
         );
       } else {
         routingHint.textContent = t(
-          '当前为主备故障转移模式：优先使用「主用」账号，遇 429 / 配额降级 / 认证异常自动切换备用号。',
-          'Failover: uses the primary account first and automatically switches to backups on 429 or downgrade.',
+          '当前为主备故障转移模式：优先使用「主用」账号，遇 429 / 瞬间模型降级 / 认证异常自动切换其他可用账号。',
+          'Failover: uses the primary account first and automatically switches to backups on 429 or model downgrade.',
         );
       }
 
@@ -849,15 +890,15 @@ const authPanel: WebUiPanel = {
           accountsBox.replaceChildren();
         } else {
           const now = Date.now();
-          const displayed = routing === 'least-used'
-            ? sortLeastUsed(state.accounts, a => ({
+          const displayed = isQuotaRouting(routing)
+            ? sortByQuotaPriority(state.accounts, a => ({
                 cooled: Boolean(a.cooldownUntil && a.cooldownUntil > now),
                 cooldownUntil: a.cooldownUntil,
                 fiveHourRemaining: a.fiveHourRemaining,
                 weeklyRemaining: a.weeklyRemaining,
-              }))
+              }), routing)
             : state.accounts;
-          const topId = routing === 'least-used' ? displayed[0]?.id : undefined;
+          const topId = isQuotaRouting(routing) ? displayed[0]?.id : undefined;
           accountsBox.replaceChildren(
             ...displayed.map((acct, index) => renderAccountCard(
               acct,
@@ -1313,7 +1354,7 @@ const quotaPanel: WebUiPanel = {
       isTopPriority: boolean,
       titleOverride?: string,
     ): HTMLElement {
-      const highlight = !titleOverride && (routing === 'failover' ? acct.isPrimary : (routing === 'least-used' && isTopPriority));
+      const highlight = !titleOverride && (routing === 'failover' ? acct.isPrimary : (isQuotaRouting(routing) && isTopPriority));
       const card = ui.h('div', highlight ? 'ggw-quota-card is-primary' : 'ggw-quota-card');
 
       const head = ui.h('div', 'ggw-quota-card-head');
@@ -1325,7 +1366,7 @@ const quotaPanel: WebUiPanel = {
       if (!titleOverride) {
         if (routing === 'failover' && acct.isPrimary) {
           tags.append(ui.h('span', 'ggw-tag primary', t('主用', 'Primary')));
-        } else if (routing === 'least-used' && isTopPriority) {
+        } else if (isQuotaRouting(routing) && isTopPriority) {
           tags.append(ui.h('span', 'ggw-tag primary', t('当前优先', 'Next up')));
         }
       }
@@ -1345,9 +1386,11 @@ const quotaPanel: WebUiPanel = {
         card.append(ui.h('div', 'sh-desc', t('接口未返回时间窗口额度数据。', 'No quota windows returned.')));
       } else {
         const bars = ui.h('div', 'ggw-qbars');
-        const orderedWins = routing !== 'failover'
-          ? [...acct.windows].sort((a, b) => (a.id === 'weekly' ? -1 : b.id === 'weekly' ? 1 : 0))
-          : acct.windows;
+        const orderedWins = routing === 'least-used-5h'
+          ? [...acct.windows].sort((a, b) => (a.id === 'fiveHour' ? -1 : b.id === 'fiveHour' ? 1 : 0))
+          : routing !== 'failover'
+            ? [...acct.windows].sort((a, b) => (a.id === 'weekly' ? -1 : b.id === 'weekly' ? 1 : 0))
+            : acct.windows;
         for (const win of orderedWins) {
           bars.append(renderCompactBar(win));
         }
@@ -1418,15 +1461,15 @@ const quotaPanel: WebUiPanel = {
         }
 
         const now = Date.now();
-        const orderedCards = accountRouting === 'least-used'
-          ? sortLeastUsed(acctCards, a => ({
+        const orderedCards = isQuotaRouting(accountRouting)
+          ? sortByQuotaPriority(acctCards, a => ({
               cooled: Boolean(a.cooldownUntil && a.cooldownUntil > now) || Boolean(a.error),
               cooldownUntil: a.cooldownUntil,
               fiveHourRemaining: a.windows.find(w => w.id === 'fiveHour')?.remainingPercent,
               weeklyRemaining: a.windows.find(w => w.id === 'weekly')?.remainingPercent,
-            }))
+            }), accountRouting)
           : acctCards;
-        const topId = accountRouting === 'least-used'
+        const topId = isQuotaRouting(accountRouting)
           ? orderedCards.find(a => !a.error && !(a.cooldownUntil && a.cooldownUntil > now))?.accountId
           : undefined;
 

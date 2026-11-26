@@ -535,6 +535,15 @@ describe('multi-account OAuth pool, routing strategies, failover, and WebUI', ()
       const ctrl = (inst.control as { oauth: GatewayControl }).oauth;
       expect(ctrl.pickAccountOrder('least-used')).toEqual([bob.id, alice.id]);
 
+      // Switch routing to least-used-5h -> persisted cleanly and reflected in quota labels.
+      const fiveHourRouting = await ui.invoke!('auth', 'set-routing', [{ name: 'pool', routing: 'least-used-5h' }]) as AuthPanelStatus;
+      expect(fiveHourRouting.accountRouting).toBe('least-used-5h');
+      expect(currentEntry.options?.accountRouting).toBe('least-used-5h');
+      const fiveHourLabels = await ui.invoke!('quota', 'account-labels', [{ name: 'pool' }]) as QuotaAccountLabels;
+      expect(fiveHourLabels.accountRouting).toBe('least-used-5h');
+      // Restore least-used for subsequent assertions below.
+      await ui.invoke!('auth', 'set-routing', [{ name: 'pool', routing: 'least-used' }]);
+
       // Query SINGLE selected account (Bob) -> still includes all accountOptions & accountRouting!
       const singleQuota = await ui.invoke!('quota', 'query', [{ name: 'pool', accountId: bob.id }]) as QuotaSnapshot;
       expect(singleQuota.selectedAccountId).toBe(bob.id);
@@ -715,6 +724,127 @@ describe('multi-account OAuth pool, routing strategies, failover, and WebUI', ()
       const effectiveCarbon = ctrlLoaded.resolveEffectiveAccountId('failover', 'gemini-4-carbon');
       expect(effectiveCarbon).toBe('acct_ultra');
       expect(ctrlLoaded.getCachedAccountInfo(effectiveCarbon)).toMatchObject({ plan: 'Ultra', userTier: 'TIER2' });
+    } finally {
+      await new Promise<void>(resolve => robinServer.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('orders least-used-5h by 5-hour remaining quota, prioritizes entitled Pro accounts over Free on paid models, and cools down on attribution downgrade', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ggw-5h-entitle-pool-'));
+    const robinServer = http2.createServer();
+    robinServer.on('stream', (stream, headers) => {
+      const auth = String(headers.authorization ?? '');
+      stream.resume();
+      stream.on('end', () => {
+        if (headers[':path'] === ROBIN_GRPC_GET_USAGE_INFO) {
+          stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+          // acct_free: Free (tier 1), 100% 5h left, 100% weekly left
+          // acct_pro_a: Pro (tier 2), 40% 5h left (0.6 used), 90% weekly left (0.1 used)
+          // acct_pro_b: Pro (tier 2), 90% 5h left (0.1 used), 60% weekly left (0.4 used)
+          // acct_pro_tie: Pro (tier 2), 90% 5h left (0.1 used), 75% weekly left (0.25 used)
+          // acct_pro_week_empty: Pro (tier 2), 100% 5h left (0.0 used), 3% weekly left (0.97 used -> weekly exhausted)
+          let payload: Buffer;
+          if (auth.includes('tok-free')) payload = encodeUsage(1, 0.0, 0.0);
+          else if (auth.includes('tok-pro-a')) payload = encodeUsage(2, 0.6, 0.1);
+          else if (auth.includes('tok-pro-b')) payload = encodeUsage(2, 0.1, 0.4);
+          else if (auth.includes('tok-pro-tie')) payload = encodeUsage(2, 0.1, 0.25);
+          else payload = encodeUsage(2, 0.0, 0.97);
+          stream.write(frameGrpcMessage(payload));
+          stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+          stream.end();
+          return;
+        }
+        stream.respond({ ':status': 404 });
+        stream.end();
+      });
+    });
+    await new Promise<void>(resolve => robinServer.listen(0, '127.0.0.1', resolve));
+    const port = (robinServer.address() as { port: number }).port;
+
+    try {
+      const oauthDir = join(dir, 'oauth');
+      mkdirSync(oauthDir, { recursive: true });
+      const ctrlInit = new GatewayControl(oauthDir);
+      ctrlInit.saveOAuthConfig(JSON.stringify(GOOGLE_TEST_CONFIG));
+      writeFileSync(join(oauthDir, OAUTH_ACCOUNTS_FILE), JSON.stringify({
+        version: 2,
+        profile: testProfileHash(GOOGLE_TEST_CONFIG),
+        primaryId: 'acct_free',
+        accounts: [
+          { id: 'acct_free', email: 'free@example.com', accessToken: 'tok-free', refreshToken: 'r0', expiresAt: Date.now() + 3_600_000 },
+          { id: 'acct_pro_a', email: 'proa@example.com', accessToken: 'tok-pro-a', refreshToken: 'r1', expiresAt: Date.now() + 3_600_000 },
+          { id: 'acct_pro_b', email: 'prob@example.com', accessToken: 'tok-pro-b', refreshToken: 'r2', expiresAt: Date.now() + 3_600_000 },
+          { id: 'acct_pro_tie', email: 'protie@example.com', accessToken: 'tok-pro-tie', refreshToken: 'r3', expiresAt: Date.now() + 3_600_000 },
+          { id: 'acct_pro_week_empty', email: 'proempty@example.com', accessToken: 'tok-pro-empty', refreshToken: 'r4', expiresAt: Date.now() + 3_600_000 },
+        ],
+      }));
+      const ctrl = new GatewayControl(oauthDir);
+      const entry: LLMProviderEntry = {
+        kind: 'gemini-gateway',
+        baseUrl: `http://127.0.0.1:${port}`,
+        spec: { model: 'gemini-4-neon', thinking: true },
+        options: { protocol: 'robin', authMode: 'oauth', accountRouting: 'least-used-5h', quotaEndpoint: ROBIN_GRPC_GET_USAGE_INFO },
+      };
+      await ctrl.queryQuota(entry, { secret: () => '' });
+
+      // Without model hint:
+      // least-used ranks by weekly remaining: acct_free (100) > acct_pro_a (90) > acct_pro_tie (75) > acct_pro_b (60) > acct_pro_week_empty (3)
+      expect(ctrl.pickAccountOrder('least-used')).toEqual([
+        'acct_free',
+        'acct_pro_a',
+        'acct_pro_tie',
+        'acct_pro_b',
+        'acct_pro_week_empty',
+      ]);
+      // least-used-5h ranks by 5h remaining, tie-breaking by weekly remaining, deprioritizing weekly <= 5% exhausted accounts:
+      // acct_free (100/100) > acct_pro_tie (90/75) > acct_pro_b (90/60) > acct_pro_a (40/90) > acct_pro_week_empty (100/3 exhausted)
+      expect(ctrl.pickAccountOrder('least-used-5h')).toEqual([
+        'acct_free',
+        'acct_pro_tie',
+        'acct_pro_b',
+        'acct_pro_a',
+        'acct_pro_week_empty',
+      ]);
+
+      // For paid model gemini-4-neon (mode 3), Free (TIER_BASIC) is pushed behind ALL entitled Pro accounts across every routing mode!
+      expect(ctrl.pickAccountOrder('least-used', 'gemini-4-neon')).toEqual([
+        'acct_pro_a',
+        'acct_pro_tie',
+        'acct_pro_b',
+        'acct_pro_week_empty',
+        'acct_free',
+      ]);
+      expect(ctrl.pickAccountOrder('least-used-5h', 'gemini-4-neon')).toEqual([
+        'acct_pro_tie',
+        'acct_pro_b',
+        'acct_pro_a',
+        'acct_pro_week_empty',
+        'acct_free',
+      ]);
+      expect(ctrl.pickAccountOrder('failover', 'gemini-4-neon')).toEqual([
+        'acct_pro_a',
+        'acct_pro_b',
+        'acct_pro_tie',
+        'acct_pro_week_empty',
+        'acct_free',
+      ]);
+
+      // For Free-entitled gemini-3.5-flash-lite (mode 6), primary Free account remains first in failover!
+      expect(ctrl.pickAccountOrder('failover', 'gemini-3.5-flash-lite')[0]).toBe('acct_free');
+
+      // Attribution-only downgrade (no fallback/downgradeReason, e.g. 4 Neon -> Used 3.1 Pro model) cools down the account immediately.
+      ctrl.recordRouting({
+        requestedModel: 'gemini-4-neon',
+        requestedModeCategory: 3,
+        requestedThinkingLevel: 4,
+        resolvedModeCategory: 3,
+        resolvedThinkingLevel: 1,
+        attribution: 'Used 3.1 Pro model',
+        observedAt: '2026-11-27T01:28:00.000Z',
+      }, 'acct_pro_a');
+      expect(ctrl.getAccountRuntime('acct_pro_a').cooldownUntil).toBeGreaterThan(Date.now());
+      expect(ctrl.pickAccountOrder('failover', 'gemini-4-neon')[0]).toBe('acct_pro_b');
     } finally {
       await new Promise<void>(resolve => robinServer.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });

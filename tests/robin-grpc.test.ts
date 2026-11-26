@@ -32,6 +32,7 @@ import {
 import {
   buildRobinListedModels,
   buildRobinRouteSummary,
+  detectRobinDowngrade,
   robinCatalogLookupIds,
 } from '../src/robin-models.ts';
 import { geminiBaseline } from '../src/catalog.ts';
@@ -50,6 +51,10 @@ function encodeProcessQueryResponse(opts: {
   responseId?: string;
   conversationId?: string;
   attribution?: string;
+  fallback?: number;
+  downgradeReason?: number;
+  resolvedModeCategory?: number;
+  resolvedThinkingLevel?: number;
   completed?: boolean;
 }): Buffer {
   const modelParts: Buffer[] = [];
@@ -61,7 +66,11 @@ function encodeProcessQueryResponse(opts: {
   if (modelParts.length) clientParts.push(lengthDelimited(1, Buffer.concat(modelParts)));
   if (opts.conversationId) clientParts.push(lengthDelimited(2, stringField(1, opts.conversationId)));
   if (opts.completed) clientParts.push(varintField(9, 1));
+  if (opts.fallback !== undefined) clientParts.push(varintField(11, opts.fallback));
   if (opts.attribution) clientParts.push(stringField(30, opts.attribution));
+  if (opts.downgradeReason !== undefined) clientParts.push(varintField(31, opts.downgradeReason));
+  if (opts.resolvedModeCategory !== undefined) clientParts.push(varintField(41, opts.resolvedModeCategory));
+  if (opts.resolvedThinkingLevel !== undefined) clientParts.push(varintField(42, opts.resolvedThinkingLevel));
 
   return lengthDelimited(1003, lengthDelimited(1, Buffer.concat(clientParts)));
 }
@@ -2116,6 +2125,246 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
         { functionCall: { name: 'wechat_send', args: { text: '附带工具调用' } } },
       ]);
       expect(callCount).toBe(1);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it('detects silent Robin model downgrade and immediately transfers to another account without leaking downgraded output', async () => {
+    // 1. Unit checks for detectRobinDowngrade (positives and negatives).
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-neon',
+      requestedModeCategory: 3,
+      resolvedModeCategory: 3,
+      attribution: 'Used 3.1 Pro model',
+    })).toBe('mode 3 -> Used 3.1 Pro model');
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-neon',
+      requestedModeCategory: 3,
+      attribution: 'Used auto model selection',
+    })).toBe('mode 3 -> Used auto model selection');
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-carbon',
+      requestedModeCategory: 8,
+      resolvedModeCategory: 8,
+      attribution: 'Used 4 Neon Medium model',
+    })).toBe('mode 8 -> Used 4 Neon Medium model');
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-hydrogen',
+      requestedModeCategory: 1,
+      resolvedModeCategory: 1,
+      attribution: 'Used 3.5 Flash-Lite model',
+    })).toBe('mode 1 -> Used 3.5 Flash-Lite model');
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-neon',
+      requestedModeCategory: 3,
+      resolvedModeCategory: 6,
+    })).toBe('mode 3 -> 6');
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-neon',
+      requestedModeCategory: 3,
+      fallback: 1,
+    })).toBe('fallback=1');
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-neon',
+      requestedModeCategory: 3,
+      downgradeReason: 2,
+    })).toBe('downgradeReason=2');
+
+    // Non-downgraded & explicit lower-tier models must NOT false-positive.
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-neon',
+      requestedModeCategory: 3,
+      resolvedModeCategory: 3,
+      attribution: 'Used 4 Neon Medium model',
+    })).toBeNull();
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-hydrogen',
+      requestedModeCategory: 1,
+      resolvedModeCategory: 1,
+      attribution: 'Gemini 4 Hydrogen',
+    })).toBeNull();
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-4-carbon',
+      requestedModeCategory: 8,
+      resolvedModeCategory: 8,
+      attribution: 'Used 4 Carbon High model',
+    })).toBeNull();
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-auto',
+      attribution: 'Used auto model selection',
+    })).toBeNull();
+    expect(detectRobinDowngrade({
+      requestedModel: 'gemini-3.1-pro',
+      requestedModeCategory: 3,
+      resolvedModeCategory: 3,
+      attribution: 'Used 3.1 Pro model',
+    })).toBeNull();
+
+    // 2. End-to-end HTTP/2 gRPC instant downgrade failover tests.
+    type Scenario = 'frame1-downgrade-failover' | 'meta-frame1-then-frame2-downgrade' | 'all-accounts-downgraded';
+    let scenario: Scenario = 'frame1-downgrade-failover';
+    const seenTokens: string[] = [];
+    const server = http2.createServer();
+
+    server.on('stream', (stream, headers) => {
+      if (headers[':path'] !== ROBIN_GRPC_PROCESS_QUERY) {
+        stream.respond({ ':status': 404 });
+        stream.end();
+        return;
+      }
+      const auth = String(headers.authorization ?? '');
+      seenTokens.push(auth);
+      stream.resume();
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        if (scenario === 'frame1-downgrade-failover') {
+          if (auth === 'Bearer tok-acct_1') {
+            stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+              responseId: 'rc_down_1',
+              attribution: 'Used 3.1 Pro model',
+              resolvedModeCategory: 3,
+              resolvedThinkingLevel: 1,
+              text: 'truncated free-tier leakage',
+              completed: true,
+            })));
+          } else {
+            stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+              responseId: 'rc_ok_2',
+              attribution: 'Used 4 Neon Medium model',
+              resolvedModeCategory: 3,
+              resolvedThinkingLevel: 4,
+              text: '<tool_call>{"name":"wechat_send","args":{"text":"切到健康 Pro 号成功！"}}</tool_call>',
+              completed: true,
+            })));
+          }
+        } else if (scenario === 'meta-frame1-then-frame2-downgrade') {
+          if (auth === 'Bearer tok-acct_1') {
+            // Frame 1 carries responseId metadata only; Frame 2 carries downgraded attribution + text.
+            stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+              responseId: 'rc_meta_1',
+              conversationId: 'c_meta_1',
+            })));
+            stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+              responseId: 'rc_meta_1',
+              attribution: 'Used 3.1 Pro model',
+              resolvedModeCategory: 3,
+              text: 'should never leak from frame 2',
+              completed: true,
+            })));
+          } else {
+            stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+              responseId: 'rc_meta_2',
+              attribution: 'Used 4 Neon Medium model',
+              resolvedModeCategory: 3,
+              text: 'Clean recovery on account 2',
+              completed: true,
+            })));
+          }
+        } else {
+          // Both accounts downgrade: acct_1 transfers to acct_2, acct_2 (last account) completes gracefully.
+          if (auth === 'Bearer tok-acct_1') {
+            stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+              responseId: 'rc_all_1',
+              attribution: 'Used 3.1 Pro model',
+              resolvedModeCategory: 3,
+              text: 'first downgraded output',
+              completed: true,
+            })));
+          } else {
+            stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+              responseId: 'rc_all_2',
+              attribution: 'Used auto model selection',
+              resolvedModeCategory: 6,
+              downgradeReason: 2,
+              text: 'fallback output from last account',
+              completed: true,
+            })));
+          }
+        }
+        stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+        stream.end();
+      });
+    });
+
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('Expected TCP address');
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const downgradedEvents: { accountId: string; detail: string }[] = [];
+      const succeededAccounts: string[] = [];
+      const transientEvents: { accountId?: string; action: string }[] = [];
+
+      const client = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        onRobinTransientError: info => transientEvents.push({ accountId: info.accountId, action: info.action }),
+        auth: {
+          accessToken: async () => 'tok-default',
+          selectAccounts: () => ['acct_1', 'acct_2'],
+          accessTokenFor: async id => `tok-${id}`,
+          onAccountDowngrade: (accountId, detail) => downgradedEvents.push({ accountId, detail }),
+          onAccountSuccess: accountId => succeededAccounts.push(accountId),
+        },
+      });
+
+      // Scenario A: Frame 1 silent downgrade transfers instantly with zero leaked chunks.
+      scenario = 'frame1-downgrade-failover';
+      const chunksA = await consume(client.stream({
+        model: 'gemini-4-neon',
+        tools: [{ functionDeclarations: [{ name: 'wechat_send', parametersJsonSchema: { type: 'object' } }] }],
+        contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+      }));
+      expect(chunksA.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { functionCall: { name: 'wechat_send', args: { text: '切到健康 Pro 号成功！' } } },
+      ]);
+      expect(chunksA.some(c => c.responseId === 'rc_down_1')).toBe(false);
+      expect(seenTokens).toEqual(['Bearer tok-acct_1', 'Bearer tok-acct_2']);
+      expect(downgradedEvents).toEqual([{ accountId: 'acct_1', detail: 'mode 3 -> Used 3.1 Pro model' }]);
+      expect(succeededAccounts).toEqual(['acct_2']);
+      expect(transientEvents).toEqual([{ accountId: 'acct_1', action: 'failover' }]);
+
+      // Scenario B: Metadata-only Frame 1 followed by downgraded Frame 2 still transfers with zero leaked chunks.
+      scenario = 'meta-frame1-then-frame2-downgrade';
+      seenTokens.length = 0;
+      downgradedEvents.length = 0;
+      succeededAccounts.length = 0;
+      transientEvents.length = 0;
+      const chunksB = await consume(client.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'hello again' }] }],
+      }));
+      expect(chunksB.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { text: 'Clean recovery on account 2' },
+      ]);
+      expect(chunksB.some(c => c.responseId === 'rc_meta_1')).toBe(false);
+      expect(seenTokens).toEqual(['Bearer tok-acct_1', 'Bearer tok-acct_2']);
+      expect(downgradedEvents).toEqual([{ accountId: 'acct_1', detail: 'mode 3 -> Used 3.1 Pro model' }]);
+      expect(succeededAccounts).toEqual(['acct_2']);
+
+      // Scenario C: All accounts downgraded -> transfers away from acct_1, gracefully finishes on last account acct_2,
+      // reports downgrade for both, and does NOT call onAccountSuccess (so cooldown is not wiped!).
+      scenario = 'all-accounts-downgraded';
+      seenTokens.length = 0;
+      downgradedEvents.length = 0;
+      succeededAccounts.length = 0;
+      transientEvents.length = 0;
+      const chunksC = await consume(client.stream({
+        model: 'gemini-4-neon',
+        contents: [{ role: 'user', parts: [{ text: 'last resort' }] }],
+      }));
+      expect(chunksC.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([
+        { text: 'fallback output from last account' },
+      ]);
+      expect(seenTokens).toEqual(['Bearer tok-acct_1', 'Bearer tok-acct_2']);
+      expect(downgradedEvents).toEqual([
+        { accountId: 'acct_1', detail: 'mode 3 -> Used 3.1 Pro model' },
+        { accountId: 'acct_2', detail: 'downgradeReason=2 (Used auto model selection)' },
+      ]);
+      expect(succeededAccounts).toEqual([]);
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }

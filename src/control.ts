@@ -27,7 +27,7 @@ import {
 import { configuration, resolveHeaders, shouldUseOAuth, type AccountRoutingMode } from './options.ts';
 import { GatewayError } from './queue.ts';
 import { geminiModelId } from './catalog.ts';
-import { isUltraOnlyRobinModel, isUltraPlan, planTierRank } from './robin-models.ts';
+import { detectRobinDowngrade, isUltraOnlyRobinModel, isUltraPlan, planTierRank } from './robin-models.ts';
 import {
   type AccountQuotaOption,
   type AccountQuotaSnapshot,
@@ -38,6 +38,7 @@ import {
 import {
   acceptRobinTermsOfService,
   queryRobinUserStatus,
+  resolveRobinMode,
   type RobinRoutingObservation,
   type RobinTermsResult,
   type RobinUserStatus,
@@ -127,7 +128,7 @@ interface AccountRuntimeState {
 
 const ROBIN_STATUS_TTL_MS = 5 * 60_000;
 const ROBIN_QUOTA_DOWNGRADE_REASONS = new Set([2, 3, 6, 8]);
-const ROBIN_DOWNGRADE_COOLDOWN_MS = 5 * 60_000;
+export const ROBIN_DOWNGRADE_COOLDOWN_MS = 5 * 60_000;
 
 async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
@@ -407,6 +408,31 @@ export class GatewayControl {
     return false;
   }
 
+  isAccountEntitledForModel(accountId: string, model?: string): boolean | undefined {
+    if (!model) return undefined;
+    const targetMode = resolveRobinMode(model).modeCategory;
+    if (targetMode === undefined) return undefined;
+    const rt = this.accountRuntime.get(accountId);
+    if (isUltraOnlyRobinModel(model, targetMode)) {
+      if (this.isAccountUltra(accountId)) return true;
+      if (rt?.userStatus?.value || rt?.plan?.plan || rt?.plan?.userTier) return false;
+      return undefined;
+    }
+    if (targetMode === 3 || targetMode === 1) {
+      const modes = rt?.userStatus?.value?.modes;
+      if (modes && modes.length > 0) {
+        return modes.some(m => m.modeCategory === targetMode && m.entitled !== false);
+      }
+      if (rt?.plan?.plan || rt?.plan?.userTier) {
+        const rank = planTierRank(rt.plan.plan, rt.plan.userTier);
+        if (rank <= 1) return false;
+        if (targetMode === 3) return rank >= 3;
+        return rank >= 2;
+      }
+    }
+    return undefined;
+  }
+
   getPoolPlans(): string[] {
     const seen = new Map<string, number>();
     for (const acct of this.auth.listAccounts()) {
@@ -472,15 +498,38 @@ export class GatewayControl {
         if (fiveA !== fiveB) return fiveB - fiveA;
         return 0;
       });
+    } else if (routing === 'least-used-5h' && healthy.length > 1) {
+      orderedHealthy = [...healthy].sort((a, b) => {
+        const ra = this.getAccountRuntime(a.id);
+        const rb = this.getAccountRuntime(b.id);
+        const exhaustedA = ra.weeklyRemaining !== undefined && ra.weeklyRemaining <= 5;
+        const exhaustedB = rb.weeklyRemaining !== undefined && rb.weeklyRemaining <= 5;
+        if (exhaustedA !== exhaustedB) return exhaustedA ? 1 : -1;
+        const fiveA = ra.fiveHourRemaining ?? ra.weeklyRemaining ?? 50;
+        const fiveB = rb.fiveHourRemaining ?? rb.weeklyRemaining ?? 50;
+        if (fiveA !== fiveB) return fiveB - fiveA;
+        const weekA = ra.weeklyRemaining ?? 50;
+        const weekB = rb.weeklyRemaining ?? 50;
+        if (weekA !== weekB) return weekB - weekA;
+        return 0;
+      });
     }
 
-    // For Ultra-only models (e.g. gemini-4-carbon / mode 8), prioritize Ultra-entitled accounts
-    // ahead of Pro/Free accounts so requests do not silently hit Pro and get downgraded.
+    // Prioritize entitled accounts for tier-restricted models:
+    // - Ultra-only models (e.g. gemini-4-carbon / mode 8) prefer Ultra accounts first.
+    // - Paid Pro/Ultra models (mode 3 / mode 1) push known Free/unentitled accounts behind entitled ones
+    //   so an expired Free account's 100% free quota never outranks healthy Pro/Ultra accounts.
     if (isUltraOnlyRobinModel(model) && orderedHealthy.length > 1) {
       const ultraHealthy = orderedHealthy.filter(a => this.isAccountUltra(a.id));
       if (ultraHealthy.length > 0 && ultraHealthy.length < orderedHealthy.length) {
         const otherHealthy = orderedHealthy.filter(a => !this.isAccountUltra(a.id));
         orderedHealthy = [...ultraHealthy, ...otherHealthy];
+      }
+    } else if (model && orderedHealthy.length > 1) {
+      const qualified = orderedHealthy.filter(a => this.isAccountEntitledForModel(a.id, model) !== false);
+      if (qualified.length > 0 && qualified.length < orderedHealthy.length) {
+        const disqualified = orderedHealthy.filter(a => this.isAccountEntitledForModel(a.id, model) === false);
+        orderedHealthy = [...qualified, ...disqualified];
       }
     }
 
@@ -513,16 +562,15 @@ export class GatewayControl {
       const oldest = this.observedRouting.keys().next().value;
       if (oldest !== undefined) this.observedRouting.delete(oldest);
     }
-    if (
-      accountId
-      && observation.downgradeReason !== undefined
-      && ROBIN_QUOTA_DOWNGRADE_REASONS.has(observation.downgradeReason)
-      && this.auth.listAccounts().length > 1
-    ) {
+    const downgradeDetail = detectRobinDowngrade(observation)
+      ?? (observation.downgradeReason !== undefined && ROBIN_QUOTA_DOWNGRADE_REASONS.has(observation.downgradeReason)
+        ? `code ${observation.downgradeReason}`
+        : null);
+    if (accountId && downgradeDetail && this.auth.listAccounts().length > 1) {
       this.markAccountCooldown(
         accountId,
         ROBIN_DOWNGRADE_COOLDOWN_MS,
-        `Robin 配额降级 (code ${observation.downgradeReason})`,
+        `Robin 模型降级 (${downgradeDetail})`,
       );
     }
   }

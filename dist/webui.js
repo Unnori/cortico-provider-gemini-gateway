@@ -397,12 +397,26 @@ function setPanelTitle(root, title) {
     heading.textContent = title;
   }
 }
-function sortLeastUsed(items, info) {
+function isQuotaRouting(routing) {
+  return routing === "least-used" || routing === "least-used-5h";
+}
+function sortByQuotaPriority(items, info, mode) {
   return [...items].sort((a, b) => {
     const ia = info(a);
     const ib = info(b);
     if (ia.cooled !== ib.cooled) return ia.cooled ? 1 : -1;
     if (ia.cooled && ib.cooled) return (ia.cooldownUntil ?? 0) - (ib.cooldownUntil ?? 0);
+    if (mode === "least-used-5h") {
+      const exhA2 = ia.weeklyRemaining !== void 0 && ia.weeklyRemaining <= 5;
+      const exhB2 = ib.weeklyRemaining !== void 0 && ib.weeklyRemaining <= 5;
+      if (exhA2 !== exhB2) return exhA2 ? 1 : -1;
+      const fiveA2 = ia.fiveHourRemaining ?? ia.weeklyRemaining ?? 50;
+      const fiveB2 = ib.fiveHourRemaining ?? ib.weeklyRemaining ?? 50;
+      if (fiveA2 !== fiveB2) return fiveB2 - fiveA2;
+      const weekA2 = ia.weeklyRemaining ?? 50;
+      const weekB2 = ib.weeklyRemaining ?? 50;
+      return weekB2 - weekA2;
+    }
     const exhA = ia.fiveHourRemaining !== void 0 && ia.fiveHourRemaining <= 5;
     const exhB = ib.fiveHourRemaining !== void 0 && ib.fiveHourRemaining <= 5;
     if (exhA !== exhB) return exhA ? 1 : -1;
@@ -515,16 +529,17 @@ var authPanel = {
     actions.append(loginBtn, viewTermsBtn, cancelBtn, clearAllBtn);
     const routingSelect = ui.select({
       options: [
-        { value: "failover", label: t("\u4E3B\u5907\u6545\u969C\u8F6C\u79FB\uFF08\u9ED8\u8BA4\uFF1A\u4F18\u5148\u4E3B\u7528\u53F7\uFF0C429/\u964D\u7EA7\u81EA\u52A8\u5207\u5907\u7528\uFF09", "Failover (default: primary first, auto-switch on 429)") },
+        { value: "failover", label: t("\u4E3B\u5907\u6545\u969C\u8F6C\u79FB\uFF08\u9ED8\u8BA4\uFF1A\u4F18\u5148\u4E3B\u7528\u53F7\uFF0C429/\u964D\u7EA7\u81EA\u52A8\u5207\u5907\u7528\uFF09", "Failover (default: primary first, auto-switch on 429/downgrade)") },
         { value: "round-robin", label: t("\u8F6E\u8BE2\u5747\u8861\uFF08\u65E0\u4E3B\u4ECE\u533A\u5206\uFF0C\u5E73\u7B49\u8F6E\u6D41\u4F7F\u7528\u5065\u5EB7\u8D26\u53F7\uFF09", "Round-robin (equal peers, rotate healthy accounts)") },
-        { value: "least-used", label: t("\u6309\u4F59\u91CF\u4F18\u5148\uFF08\u4F18\u5148\u4F7F\u7528\u5468\u989D\u5EA6\u5269\u4F59\u6700\u591A\u7684\u53EF\u7528\u8D26\u53F7\uFF09", "Least-used (highest weekly remaining quota first)") }
+        { value: "least-used", label: t("\u5468\u989D\u5EA6\u4F59\u91CF\u4F18\u5148\uFF08\u4F18\u5148\u4F7F\u7528\u6BCF\u5468\u5269\u4F59\u989D\u5EA6\u6700\u591A\u7684\u53EF\u7528\u8D26\u53F7\uFF09", "Weekly quota first (highest weekly remaining quota first)") },
+        { value: "least-used-5h", label: t("5\u5C0F\u65F6\u7A97\u53E3\u4F59\u91CF\u4F18\u5148\uFF08\u4F18\u5148\u4F7F\u7528 5h \u7A97\u53E3\u5269\u4F59\u989D\u5EA6\u6700\u591A\u7684\u53EF\u7528\u8D26\u53F7\uFF09", "5-hour quota first (highest 5-hour window remaining quota first)") }
       ],
       onChange: (value) => {
         const routing = value;
         void run(async () => {
           state = await invoke("set-routing", { routing });
           broadcastPanelSync({ kind: "routing", instanceName: name, routing });
-          const needsQuotaFetch = routing !== "failover" && state.signedIn && state.accounts.some((a) => a.weeklyRemaining === void 0);
+          const needsQuotaFetch = routing !== "failover" && state.signedIn && state.accounts.some((a) => a.weeklyRemaining === void 0 || a.fiveHourRemaining === void 0);
           if (needsQuotaFetch) {
             state = await invoke("refresh-quotas");
             broadcastPanelSync({ kind: "quota", instanceName: name, source: "auth" });
@@ -766,28 +781,32 @@ var authPanel = {
         }
       });
     }
-    function renderInlineWeeklyQuota(acct, routing, barMode) {
+    function renderInlineAccountQuota(acct, routing, barMode) {
       const box = ui.h("div", "ggw-acct-quota");
       const head = ui.h("div", "ggw-acct-quota-head");
+      const isFiveHourPriority = routing === "least-used-5h";
+      const primaryRemainingRaw = isFiveHourPriority ? acct.fiveHourRemaining : acct.weeklyRemaining;
+      const secondaryRemainingRaw = isFiveHourPriority ? acct.weeklyRemaining : acct.fiveHourRemaining;
+      const primaryResetAt = isFiveHourPriority ? acct.fiveHourResetsAt : acct.weeklyResetsAt;
       const lbl = ui.h(
         "span",
         "ggw-qbar-lbl",
-        routing === "least-used" ? t("\u5468\u989D\u5EA6\u4F59\u91CF\uFF08\u8C03\u5EA6\u4F9D\u636E\uFF09", "Weekly quota left (priority)") : t("\u6BCF\u5468\u989D\u5EA6", "Weekly quota")
+        isFiveHourPriority ? t("5h \u7A97\u53E3\u4F59\u91CF\uFF08\u8C03\u5EA6\u4F9D\u636E\uFF09", "5h quota left (priority)") : routing === "least-used" ? t("\u5468\u989D\u5EA6\u4F59\u91CF\uFF08\u8C03\u5EA6\u4F9D\u636E\uFF09", "Weekly quota left (priority)") : t("\u6BCF\u5468\u989D\u5EA6", "Weekly quota")
       );
-      if (acct.weeklyRemaining === void 0) {
+      if (primaryRemainingRaw === void 0) {
         const val2 = ui.h("span", "ggw-acct-quota-sub", t("\u5F85\u67E5\u8BE2\uFF08\u70B9\u300C\u5237\u65B0\u5404\u53F7\u989D\u5EA6\u300D\u83B7\u53D6\uFF09", "Not loaded yet"));
         head.append(lbl, val2);
         box.append(head);
         return box;
       }
-      const remaining = Math.min(Math.max(acct.weeklyRemaining, 0), 100);
+      const remaining = Math.min(Math.max(primaryRemainingRaw, 0), 100);
       const used = Math.round((100 - remaining) * 10) / 10;
       const showRemaining = barMode !== "used";
       const tone = remaining <= 10 ? "bad" : remaining <= 25 ? "warn" : "";
       const val = ui.h(
         "span",
         tone ? `ggw-acct-quota-main ${tone}` : "ggw-acct-quota-main",
-        showRemaining ? t(`\u5468\u5269\u4F59 ${remaining}%`, `${remaining}% left`) : t(`\u5468\u5DF2\u7528 ${used}%`, `${used}% used`)
+        isFiveHourPriority ? showRemaining ? t(`5h \u5269\u4F59 ${remaining}%`, `5h ${remaining}% left`) : t(`5h \u5DF2\u7528 ${used}%`, `5h ${used}% used`) : showRemaining ? t(`\u5468\u5269\u4F59 ${remaining}%`, `${remaining}% left`) : t(`\u5468\u5DF2\u7528 ${used}%`, `${used}% used`)
       );
       head.append(lbl, val);
       const track = ui.h("div", "ggw-qbar-track");
@@ -797,15 +816,15 @@ var authPanel = {
       const subParts = [
         showRemaining ? t(`\u5DF2\u7528 ${used}%`, `${used}% used`) : t(`\u5269\u4F59 ${remaining}%`, `${remaining}% left`)
       ];
-      if (acct.fiveHourRemaining !== void 0) {
-        const fiveRemaining = Math.min(Math.max(acct.fiveHourRemaining, 0), 100);
-        const fiveUsed = Math.round((100 - fiveRemaining) * 10) / 10;
+      if (secondaryRemainingRaw !== void 0) {
+        const secRemaining = Math.min(Math.max(secondaryRemainingRaw, 0), 100);
+        const secUsed = Math.round((100 - secRemaining) * 10) / 10;
         subParts.push(
-          showRemaining ? t(`5h \u5269\u4F59 ${fiveRemaining}%`, `5h left ${fiveRemaining}%`) : t(`5h \u5DF2\u7528 ${fiveUsed}%`, `5h used ${fiveUsed}%`)
+          isFiveHourPriority ? showRemaining ? t(`\u5468\u5269\u4F59 ${secRemaining}%`, `weekly left ${secRemaining}%`) : t(`\u5468\u5DF2\u7528 ${secUsed}%`, `weekly used ${secUsed}%`) : showRemaining ? t(`5h \u5269\u4F59 ${secRemaining}%`, `5h left ${secRemaining}%`) : t(`5h \u5DF2\u7528 ${secUsed}%`, `5h used ${secUsed}%`)
         );
       }
-      if (acct.weeklyResetsAt) {
-        const resetMs = Date.parse(acct.weeklyResetsAt) - Date.now();
+      if (primaryResetAt) {
+        const resetMs = Date.parse(primaryResetAt) - Date.now();
         if (Number.isFinite(resetMs)) subParts.push(formatDuration(resetMs, zh));
       }
       const sub = ui.h("div", "ggw-acct-quota-sub", subParts.join(" \xB7 "));
@@ -814,7 +833,7 @@ var authPanel = {
     }
     function renderAccountCard(acct, protocol, masked, routing, barMode, index, isTopPriority) {
       const showRemaining = barMode !== "used";
-      const highlight = routing === "failover" ? acct.isPrimary : routing === "least-used" && isTopPriority;
+      const highlight = routing === "failover" ? acct.isPrimary : isQuotaRouting(routing) && isTopPriority;
       const card = ui.h("div", highlight ? "ggw-account-card is-primary" : "ggw-account-card");
       const head = ui.h("div", "ggw-account-head");
       const ident = ui.h("div", "ggw-account-ident");
@@ -847,6 +866,15 @@ var authPanel = {
           "span",
           `ggw-tag ${tone}`,
           showRemaining ? t(`\u5468\u4F59 ${weeklyRem}%`, `${weeklyRem}% wk`) : t(`\u5468\u7528 ${weeklyUsed}%`, `${weeklyUsed}% used`)
+        ));
+      } else if (routing === "least-used-5h" && acct.fiveHourRemaining !== void 0) {
+        const fiveRem = Math.min(Math.max(acct.fiveHourRemaining, 0), 100);
+        const fiveUsed = Math.round((100 - fiveRem) * 10) / 10;
+        const tone = fiveRem <= 10 ? "bad" : fiveRem <= 25 ? "warn" : "primary";
+        rightTags.append(ui.h(
+          "span",
+          `ggw-tag ${tone}`,
+          showRemaining ? t(`5h \u4F59 ${fiveRem}%`, `${fiveRem}% 5h`) : t(`5h \u7528 ${fiveUsed}%`, `${fiveUsed}% 5h used`)
         ));
       }
       if (protocol === "robin") {
@@ -952,7 +980,7 @@ var authPanel = {
       cardActions.append(reauthBtn, removeBtn);
       card.append(head);
       if (routing !== "failover") {
-        card.append(renderInlineWeeklyQuota(acct, routing, barMode));
+        card.append(renderInlineAccountQuota(acct, routing, barMode));
       }
       card.append(meta);
       if (acct.cooldownReason || acct.lastError) {
@@ -1056,18 +1084,23 @@ var authPanel = {
       routingHint.hidden = !state.authEnabled || count === 0;
       if (routing === "round-robin") {
         routingHint.textContent = t(
-          "\u5F53\u524D\u4E3A\u8F6E\u8BE2\u6A21\u5F0F\uFF1A\u6240\u6709\u8D26\u53F7\u5E73\u7B49\u53C2\u4E0E\u8F6E\u6D41\u8C03\u7528\uFF08\u65E0\u4E3B\u4ECE\u533A\u5206\uFF09\uFF0C\u5361\u7247\u4E2D\u5E73\u7B49\u5C55\u793A\u5404\u53F7\u5468\u989D\u5EA6\u3002",
-          "Round-robin: all accounts rotate equally without primary/backup roles, showing weekly quota side by side."
+          "\u5F53\u524D\u4E3A\u8F6E\u8BE2\u6A21\u5F0F\uFF1A\u6240\u6709\u8D26\u53F7\u5E73\u7B49\u53C2\u4E0E\u8F6E\u6D41\u8C03\u7528\uFF08\u65E0\u4E3B\u4ECE\u533A\u5206\uFF09\uFF1B\u82E5\u67D0\u53F7\u89E6\u53D1\u6A21\u578B\u964D\u7EA7\u4F1A\u81EA\u52A8\u77AC\u95F4\u8F6C\u5207\u5176\u4ED6\u53EF\u7528\u8D26\u53F7\u3002",
+          "Round-robin: all accounts rotate equally without primary/backup roles, and auto-failover if any account gets downgraded."
         );
       } else if (routing === "least-used") {
         routingHint.textContent = t(
-          "\u5F53\u524D\u4E3A\u989D\u5EA6\u4F18\u5148\u6A21\u5F0F\uFF1A\u81EA\u52A8\u6309\u5468\u989D\u5EA6\u5269\u4F59\u6BD4\u4F8B\u4ECE\u9AD8\u5230\u4F4E\u6392\u5E8F\u8C03\u5EA6\uFF08\u81EA\u52A8\u907F\u5F00\u51B7\u5374\u6216 5h \u8017\u5C3D\u8D26\u53F7\uFF09\u3002",
-          "Least-used: routes to the available account with the highest weekly quota remaining."
+          "\u5F53\u524D\u4E3A\u5468\u989D\u5EA6\u4F59\u91CF\u4F18\u5148\u6A21\u5F0F\uFF1A\u6309\u6BCF\u5468\u5269\u4F59\u989D\u5EA6\u6BD4\u4F8B\u4ECE\u9AD8\u5230\u4F4E\u8C03\u5EA6\uFF08\u81EA\u52A8\u907F\u5F00\u51B7\u5374\u3001\u964D\u7EA7\u6216 5h \u8017\u5C3D\u8D26\u53F7\uFF09\u3002",
+          "Weekly quota first: routes to the available account with the highest weekly quota remaining."
+        );
+      } else if (routing === "least-used-5h") {
+        routingHint.textContent = t(
+          "\u5F53\u524D\u4E3A 5 \u5C0F\u65F6\u7A97\u53E3\u4F59\u91CF\u4F18\u5148\u6A21\u5F0F\uFF1A\u6309 5 \u5C0F\u65F6\u7A97\u53E3\u5269\u4F59\u989D\u5EA6\u6BD4\u4F8B\u4ECE\u9AD8\u5230\u4F4E\u8C03\u5EA6\uFF08\u81EA\u52A8\u907F\u5F00\u51B7\u5374\u3001\u964D\u7EA7\u6216\u5468\u989D\u5EA6\u8017\u5C3D\u8D26\u53F7\uFF09\u3002",
+          "5-hour quota first: routes to the available account with the highest 5-hour window quota remaining."
         );
       } else {
         routingHint.textContent = t(
-          "\u5F53\u524D\u4E3A\u4E3B\u5907\u6545\u969C\u8F6C\u79FB\u6A21\u5F0F\uFF1A\u4F18\u5148\u4F7F\u7528\u300C\u4E3B\u7528\u300D\u8D26\u53F7\uFF0C\u9047 429 / \u914D\u989D\u964D\u7EA7 / \u8BA4\u8BC1\u5F02\u5E38\u81EA\u52A8\u5207\u6362\u5907\u7528\u53F7\u3002",
-          "Failover: uses the primary account first and automatically switches to backups on 429 or downgrade."
+          "\u5F53\u524D\u4E3A\u4E3B\u5907\u6545\u969C\u8F6C\u79FB\u6A21\u5F0F\uFF1A\u4F18\u5148\u4F7F\u7528\u300C\u4E3B\u7528\u300D\u8D26\u53F7\uFF0C\u9047 429 / \u77AC\u95F4\u6A21\u578B\u964D\u7EA7 / \u8BA4\u8BC1\u5F02\u5E38\u81EA\u52A8\u5207\u6362\u5176\u4ED6\u53EF\u7528\u8D26\u53F7\u3002",
+          "Failover: uses the primary account first and automatically switches to backups on 429 or model downgrade."
         );
       }
       if (state.pending) {
@@ -1109,13 +1142,13 @@ var authPanel = {
           accountsBox.replaceChildren();
         } else {
           const now = Date.now();
-          const displayed = routing === "least-used" ? sortLeastUsed(state.accounts, (a) => ({
+          const displayed = isQuotaRouting(routing) ? sortByQuotaPriority(state.accounts, (a) => ({
             cooled: Boolean(a.cooldownUntil && a.cooldownUntil > now),
             cooldownUntil: a.cooldownUntil,
             fiveHourRemaining: a.fiveHourRemaining,
             weeklyRemaining: a.weeklyRemaining
-          })) : state.accounts;
-          const topId = routing === "least-used" ? displayed[0]?.id : void 0;
+          }), routing) : state.accounts;
+          const topId = isQuotaRouting(routing) ? displayed[0]?.id : void 0;
           accountsBox.replaceChildren(
             ...displayed.map((acct, index) => renderAccountCard(
               acct,
@@ -1510,7 +1543,7 @@ var quotaPanel = {
       return bar;
     }
     function renderAccountQuotaCard(acct, masked, routing, isTopPriority, titleOverride) {
-      const highlight = !titleOverride && (routing === "failover" ? acct.isPrimary : routing === "least-used" && isTopPriority);
+      const highlight = !titleOverride && (routing === "failover" ? acct.isPrimary : isQuotaRouting(routing) && isTopPriority);
       const card = ui.h("div", highlight ? "ggw-quota-card is-primary" : "ggw-quota-card");
       const head = ui.h("div", "ggw-quota-card-head");
       const display = titleOverride ?? accountDisplayName(acct.accountId, acct.email, zh, masked);
@@ -1520,7 +1553,7 @@ var quotaPanel = {
       if (!titleOverride) {
         if (routing === "failover" && acct.isPrimary) {
           tags.append(ui.h("span", "ggw-tag primary", t("\u4E3B\u7528", "Primary")));
-        } else if (routing === "least-used" && isTopPriority) {
+        } else if (isQuotaRouting(routing) && isTopPriority) {
           tags.append(ui.h("span", "ggw-tag primary", t("\u5F53\u524D\u4F18\u5148", "Next up")));
         }
       }
@@ -1539,7 +1572,7 @@ var quotaPanel = {
         card.append(ui.h("div", "sh-desc", t("\u63A5\u53E3\u672A\u8FD4\u56DE\u65F6\u95F4\u7A97\u53E3\u989D\u5EA6\u6570\u636E\u3002", "No quota windows returned.")));
       } else {
         const bars = ui.h("div", "ggw-qbars");
-        const orderedWins = routing !== "failover" ? [...acct.windows].sort((a, b) => a.id === "weekly" ? -1 : b.id === "weekly" ? 1 : 0) : acct.windows;
+        const orderedWins = routing === "least-used-5h" ? [...acct.windows].sort((a, b) => a.id === "fiveHour" ? -1 : b.id === "fiveHour" ? 1 : 0) : routing !== "failover" ? [...acct.windows].sort((a, b) => a.id === "weekly" ? -1 : b.id === "weekly" ? 1 : 0) : acct.windows;
         for (const win of orderedWins) {
           bars.append(renderCompactBar(win));
         }
@@ -1600,13 +1633,13 @@ var quotaPanel = {
           planPill.className = okCount > 0 ? "pill on" : "pill off";
         }
         const now = Date.now();
-        const orderedCards = accountRouting === "least-used" ? sortLeastUsed(acctCards, (a) => ({
+        const orderedCards = isQuotaRouting(accountRouting) ? sortByQuotaPriority(acctCards, (a) => ({
           cooled: Boolean(a.cooldownUntil && a.cooldownUntil > now) || Boolean(a.error),
           cooldownUntil: a.cooldownUntil,
           fiveHourRemaining: a.windows.find((w) => w.id === "fiveHour")?.remainingPercent,
           weeklyRemaining: a.windows.find((w) => w.id === "weekly")?.remainingPercent
-        })) : acctCards;
-        const topId = accountRouting === "least-used" ? orderedCards.find((a) => !a.error && !(a.cooldownUntil && a.cooldownUntil > now))?.accountId : void 0;
+        }), accountRouting) : acctCards;
+        const topId = isQuotaRouting(accountRouting) ? orderedCards.find((a) => !a.error && !(a.cooldownUntil && a.cooldownUntil > now))?.accountId : void 0;
         for (const acct of orderedCards) {
           cardsBox.append(renderAccountQuotaCard(acct, emailsMasked, accountRouting, acct.accountId === topId));
         }

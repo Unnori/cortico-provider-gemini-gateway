@@ -63,6 +63,62 @@ export function isUltraOnlyRobinModel(modelOrName?: string, modeCategory?: numbe
   return /\bcarbon\b/i.test(modelOrName);
 }
 
+export interface RobinDowngradeCheckInput {
+  requestedModel: string;
+  requestedModeCategory?: number;
+  resolvedModeCategory?: number;
+  fallback?: number;
+  downgradeReason?: number;
+  attribution?: string;
+}
+
+/**
+ * Returns a concise downgrade reason when Robin's response routing/attribution indicates
+ * the requested model tier was silently downgraded (including Free-tier `4 Neon -> 3.1 Pro`
+ * fallback and explicit `modeCategory` / `fallback` / `downgradeReason` signals).
+ */
+export function detectRobinDowngrade(input: RobinDowngradeCheckInput): string | null {
+  if (input.fallback === 1) {
+    return `fallback=1${input.attribution ? ` (${input.attribution})` : ''}`;
+  }
+  if (input.downgradeReason !== undefined && input.downgradeReason > 0) {
+    return `downgradeReason=${input.downgradeReason}${input.attribution ? ` (${input.attribution})` : ''}`;
+  }
+  if (
+    input.requestedModeCategory !== undefined
+    && input.resolvedModeCategory !== undefined
+    && input.resolvedModeCategory !== input.requestedModeCategory
+  ) {
+    return `mode ${input.requestedModeCategory} -> ${input.resolvedModeCategory}${input.attribution ? ` (${input.attribution})` : ''}`;
+  }
+  if (input.requestedModeCategory !== undefined && input.attribution) {
+    const attr = input.attribution.toLowerCase();
+    const model = geminiModelId(input.requestedModel).toLowerCase();
+    if (attr.includes('auto model selection')) {
+      return `mode ${input.requestedModeCategory} -> ${input.attribution}`;
+    }
+    if (input.requestedModeCategory === 8 || model.includes('carbon')) {
+      if (
+        !attr.includes('carbon')
+        && (attr.includes('neon') || attr.includes('hydrogen') || attr.includes('flash') || attr.includes('3.1 pro') || attr.includes('2.5'))
+      ) {
+        return `mode 8 -> ${input.attribution}`;
+      }
+    }
+    if (input.requestedModeCategory === 3 && (model.includes('neon') || model === ROBIN_PRO_MODEL_ID || model.includes('argon'))) {
+      if (attr.includes('3.1 pro') || attr.includes('2.5') || attr.includes('flash-lite') || attr.includes('flash') || attr.includes('hydrogen')) {
+        return `mode 3 -> ${input.attribution}`;
+      }
+    }
+    if (input.requestedModeCategory === 1 && (model.includes('hydrogen') || model === ROBIN_FAST_MODEL_ID)) {
+      if (attr.includes('flash-lite') || attr.includes('2.5')) {
+        return `mode 1 -> ${input.attribution}`;
+      }
+    }
+  }
+  return null;
+}
+
 function isFreePlan(plan?: string, userTier?: string): boolean {
   return userTier === 'TIER_BASIC' || plan?.toLowerCase() === 'free';
 }
@@ -293,15 +349,7 @@ export function buildRobinRouteSummary(opts: {
   const official = userStatus?.modes.find(m =>
     m.entitled !== false && (m.modelId === geminiModelId(model) || m.modeCategory === resolved.modeCategory),
   );
-  const downgraded = Boolean(
-    observed && (
-      observed.fallback === 1
-      || (observed.downgradeReason !== undefined && observed.downgradeReason > 0)
-      || (observed.requestedModeCategory !== undefined
-        && observed.resolvedModeCategory !== undefined
-        && observed.resolvedModeCategory !== observed.requestedModeCategory)
-    ),
-  );
+  const downgraded = Boolean(observed && detectRobinDowngrade(observed));
   const requestedThinkingLevel = observed?.requestedThinkingLevel ?? resolved.thinkingLevel;
   return {
     ...(plan ? { plan } : {}),

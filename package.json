@@ -1,6 +1,6 @@
 {
   "name": "cortico-provider-gemini-gateway",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "description": "Gemini 多合一粮仓：支持 Robin 桌面 OAuth 多账号调度与额度看板、原生多模态附件上传，以及 Web2API 与自定义 RPC 接入。",
   "author": "云纪 & 云洄",
@@ -36,11 +36,11 @@
     "locales": {
       "zh": {
         "displayName": "🐦 Gemini 多合一粮仓",
-        "description": "### 📦**Gemini 多合一粮仓（Robin / Web2API / 自定义 RPC）**\n给自家桌宠搭的三合一 Gemini 喂食通道，WebUI 面板随切随用：\n- **🐦 知更鸟模式（Robin）**：支持绑多个号轮着喂（主备切号 / 雨露均沾 / 谁额度多先吃谁），自带 5h & 周剩余额度小看板、原生多模态附件上传（图/音/视/PDF）和账号打码防社死。\n- **🔑 Web2API 模式**：切过去填官方 Gemini API Key 或自建反代 Key，零门槛开箱即用。\n- **🛠️ 自定义 RPC**：给喜欢自己搭网关的折腾党留的后门。"
+        "description": "### 📦**Gemini 多合一粮仓（Robin / Web2API / 自定义 RPC）**\n给自家桌宠搭的三合一 Gemini 喂食通道，WebUI 面板随切随用：\n- **🐦 知更鸟模式（Robin）**：支持绑多个号轮着喂（主备切号 / 雨露均沾 / 周额度优先 / 5小时窗口优先，带瞬间降级切号保护），自带 5h & 周剩余额度小看板、原生多模态附件上传（图/音/视/PDF）和账号打码防社死。\n- **🔑 Web2API 模式**：切过去填官方 Gemini API Key 或自建反代 Key，零门槛开箱即用。\n- **🛠️ 自定义 RPC**：给喜欢自己搭网关的折腾党留的后门。"
       },
       "en": {
         "displayName": "🐦 Gemini All-in-One Feeder",
-        "description": "### 📦**Gemini All-in-One Gateway (Robin / Web2API / Custom RPC)**\nA 3-in-1 Gemini feeder for your Cortico desktop companion with adaptive WebUI panels:\n- **🐦 Robin Mode**: Multi-account OAuth pool (failover / round-robin / weekly-quota-first), 5h & weekly remaining-quota dashboard, native multimodal uploads (image/audio/video/PDF), and one-click email masking.\n- **🔑 Web2API Mode**: Paste an official Gemini API Key or self-hosted proxy key and start right away.\n- **🛠️ Custom RPC**: Flexible routing and headers for self-hosted gateway tinkerers."
+        "description": "### 📦**Gemini All-in-One Gateway (Robin / Web2API / Custom RPC)**\nA 3-in-1 Gemini feeder for your Cortico desktop companion with adaptive WebUI panels:\n- **🐦 Robin Mode**: Multi-account OAuth pool (failover / round-robin / weekly-quota-first / 5h-window-first, with instant downgrade failover), 5h & weekly remaining-quota dashboard, native multimodal uploads (image/audio/video/PDF), and one-click email masking.\n- **🔑 Web2API Mode**: Paste an official Gemini API Key or self-hosted proxy key and start right away.\n- **🛠️ Custom RPC**: Flexible routing and headers for self-hosted gateway tinkerers."
       }
     },
     "tags": [

@@ -4,7 +4,7 @@ import type { LLMProviderEntry, ReasoningTier } from 'cortico/core/types.ts';
 import type { ProviderModule } from 'cortico/providers/base.ts';
 import { geminiBaseline, ModelCatalog, type ModelMetadata } from './catalog.ts';
 import { GatewayClient } from './client.ts';
-import { gatewayControl, type GatewayControl } from './control.ts';
+import { gatewayControl, ROBIN_DOWNGRADE_COOLDOWN_MS, type GatewayControl } from './control.ts';
 import { createHttp2Connector, createProxyFetchFor } from './http.ts';
 import { CustomGeminiProvider } from './native.ts';
 import { configuration, option, resolveHeaders } from './options.ts';
@@ -14,6 +14,7 @@ import type { RobinTermsResult, RobinUserStatus } from './robin-grpc.ts';
 import {
   buildRobinListedModels,
   buildRobinRouteSummary,
+  detectRobinDowngrade,
   robinCatalogLookupIds,
   type RobinRouteSummary,
 } from './robin-models.ts';
@@ -181,6 +182,7 @@ export const GEMINI_GATEWAY = {
       const fallbacks = robinCatalogLookupIds(model, acct.plan, acct.userTier, observed?.attribution);
       return catalog.get(model, fallbacks) ?? geminiBaseline(model);
     };
+    const downgradeRefreshAt = new Map<string, number>();
     const gateway = new GatewayClient({
       ...options,
       headers,
@@ -211,12 +213,37 @@ export const GEMINI_GATEWAY = {
           if (curCfg.protocol === 'robin') {
             oauth.markAccountTermsAccepted(accountId);
           }
-          if (curCfg.protocol === 'robin' && curCfg.accountRouting === 'least-used' && oauth.auth.listAccounts().length > 1) {
+          if (
+            curCfg.protocol === 'robin'
+            && (curCfg.accountRouting === 'least-used' || curCfg.accountRouting === 'least-used-5h')
+            && oauth.auth.listAccounts().length > 1
+          ) {
             const rt = oauth.getAccountRuntime(accountId);
             const fetchedAtMs = rt.quotaFetchedAt ? Date.parse(rt.quotaFetchedAt) : 0;
             if (!fetchedAtMs || Date.now() - fetchedAtMs > 2 * 60_000) {
               void oauth.queryQuota(cur, host, undefined, accountId).catch(() => {});
             }
+          }
+        },
+        onAccountDowngrade: (accountId, detail) => {
+          const cur = current();
+          const curCfg = configuration(cur);
+          if (curCfg.protocol === 'robin') {
+            oauth.markAccountTermsAccepted(accountId);
+          }
+          if (oauth.auth.listAccounts().length > 1) {
+            oauth.markAccountCooldown(accountId, ROBIN_DOWNGRADE_COOLDOWN_MS, `模型降级：${detail}`);
+          }
+          host.log.warn('Robin account downgraded; transferring to another account', {
+            accountId,
+            detail,
+            cooldownSec: Math.round(ROBIN_DOWNGRADE_COOLDOWN_MS / 1000),
+          });
+          const now = Date.now();
+          if (curCfg.protocol === 'robin' && now - (downgradeRefreshAt.get(accountId) ?? 0) > 60_000) {
+            downgradeRefreshAt.set(accountId, now);
+            void oauth.queryUserStatus(cur, host, undefined, true, accountId).catch(() => null);
+            void oauth.queryQuota(cur, host, undefined, accountId).catch(() => {});
           }
         },
         onAccountFailure: (accountId, status, detail) => {
@@ -266,12 +293,7 @@ export const GEMINI_GATEWAY = {
           ...(obs.downgradeReason !== undefined ? { downgradeReason: obs.downgradeReason } : {}),
         };
         host.log.debug('Robin routing observed', routingData);
-        const downgraded = obs.fallback === 1
-          || (obs.downgradeReason !== undefined && obs.downgradeReason > 0)
-          || (obs.requestedModeCategory !== undefined
-            && obs.resolvedModeCategory !== undefined
-            && obs.resolvedModeCategory !== obs.requestedModeCategory);
-        if (downgraded) {
+        if (detectRobinDowngrade(obs)) {
           host.log.warn('Robin backend routed or downgraded model', routingData);
         }
       },

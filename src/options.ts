@@ -10,7 +10,7 @@ import type { GatewayProtocol } from './shim.ts';
 import { httpUrl, stringMap } from './state.ts';
 
 export type AuthMode = 'auto' | 'oauth' | 'api-key';
-export type AccountRoutingMode = 'failover' | 'round-robin' | 'least-used';
+export type AccountRoutingMode = 'failover' | 'round-robin' | 'least-used' | 'least-used-5h';
 export type GatewayPresetId = 'robin' | 'gemini' | 'rpc';
 
 export interface GatewayConfiguration extends GatewayClientOptions {
@@ -53,8 +53,13 @@ export function configuration(entry: LLMProviderEntry): GatewayConfiguration {
     throw new Error('Gateway authMode must be auto, oauth or api-key');
   }
   const accountRouting = (option(entry, 'accountRouting') ?? 'failover') as AccountRoutingMode;
-  if (accountRouting !== 'failover' && accountRouting !== 'round-robin' && accountRouting !== 'least-used') {
-    throw new Error('Gateway accountRouting must be failover, round-robin or least-used');
+  if (
+    accountRouting !== 'failover'
+    && accountRouting !== 'round-robin'
+    && accountRouting !== 'least-used'
+    && accountRouting !== 'least-used-5h'
+  ) {
+    throw new Error('Gateway accountRouting must be failover, round-robin, least-used or least-used-5h');
   }
   const temporaryChat = entry.options?.temporaryChat;
   if (temporaryChat !== undefined && typeof temporaryChat !== 'boolean') {

@@ -19,6 +19,7 @@ import {
   type RobinRoutingObservation,
   type RobinUploadedAttachment,
 } from './robin-grpc.ts';
+import { detectRobinDowngrade } from './robin-models.ts';
 import {
   decodeGatewayEvent, RobinPartFilter, toGeminiRequest, toRobinRequest, toRpcRequest, ToolCallStream,
   unwrapRobinAutoLinks,
@@ -34,6 +35,7 @@ export interface GatewayAuthProvider {
   accessTokenFor?: (accountId: string, force?: boolean) => Promise<string>;
   onAccountSuccess?: (accountId: string) => void;
   onAccountFailure?: (accountId: string, status: number | null, detail?: string) => void;
+  onAccountDowngrade?: (accountId: string, detail: string) => void;
 }
 
 export interface GatewayClientOptions {
@@ -369,6 +371,15 @@ class RobinTransientError extends GatewayError {
   }
 }
 
+class RobinDowngradeError extends GatewayError {
+  readonly detail: string;
+
+  constructor(detail: string) {
+    super(503, 'generation', { detail: `Robin model downgraded (${detail})` });
+    this.detail = detail;
+  }
+}
+
 function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve, reject) => {
@@ -636,8 +647,9 @@ export class GatewayClient {
     headers: Headers,
     signal: AbortSignal,
     conversations: Set<string>,
-    onMeta: (meta: { status?: number | null; requestId?: string | null; observed?: boolean; completed?: boolean }) => void,
+    onMeta: (meta: { status?: number | null; requestId?: string | null; observed?: boolean; completed?: boolean; downgraded?: string | null }) => void,
     accountId?: string,
+    allowDowngradeFailover = false,
   ): AsyncGenerator<GeminiChunk> {
     const prepared = await this.prepareRobinGrpcAttachments(input, headers, signal, accountId);
     const prompt = await toRobinRequest(prepared.request, prepared.uploader, this.options.temporaryChat ?? true);
@@ -660,6 +672,7 @@ export class GatewayClient {
     let emittedToolCallCount = 0;
     let emittedVisibleTextCount = 0;
     let emittedThoughtCount = 0;
+    let yieldedAnyChunk = false;
     let truncatedEarly = false;
     let streamSummary: RobinGrpcStreamSummary | undefined;
     let observedAttribution: string | undefined;
@@ -699,6 +712,37 @@ export class GatewayClient {
       }
       if (frame.fallback !== undefined) observedFallback = frame.fallback;
       if (frame.downgradeReason !== undefined) observedDowngrade = frame.downgradeReason;
+      if (
+        allowDowngradeFailover
+        && !yieldedAnyChunk
+        && emittedToolCallCount === 0
+        && emittedVisibleTextCount === 0
+        && emittedThoughtCount === 0
+      ) {
+        const instantDowngrade = detectRobinDowngrade({
+          requestedModel: input.model,
+          ...(requestedMode.modeCategory !== undefined ? { requestedModeCategory: requestedMode.modeCategory } : {}),
+          ...(observedResolvedMode !== undefined ? { resolvedModeCategory: observedResolvedMode } : {}),
+          ...(observedFallback !== undefined ? { fallback: observedFallback } : {}),
+          ...(observedDowngrade !== undefined ? { downgradeReason: observedDowngrade } : {}),
+          ...(observedAttribution ? { attribution: observedAttribution } : {}),
+        });
+        if (instantDowngrade) {
+          this.options.onRobinRouting?.({
+            requestedModel: input.model,
+            ...(requestedMode.modeCategory !== undefined ? { requestedModeCategory: requestedMode.modeCategory } : {}),
+            requestedThinkingLevel: requestedMode.thinkingLevel,
+            ...(observedResolvedMode !== undefined ? { resolvedModeCategory: observedResolvedMode } : {}),
+            ...(observedThinking !== undefined ? { resolvedThinkingLevel: observedThinking } : {}),
+            ...(observedAttribution ? { attribution: observedAttribution } : {}),
+            thoughtChars: observedThoughtChars,
+            ...(observedFallback !== undefined ? { fallback: observedFallback } : {}),
+            ...(observedDowngrade !== undefined ? { downgradeReason: observedDowngrade } : {}),
+            observedAt: new Date().toISOString(),
+          }, accountId);
+          throw new RobinDowngradeError(instantDowngrade);
+        }
+      }
       const rawParts: GeminiPart[] = [];
       if (includeThoughts && typeof frame.thought === 'string' && frame.thought.length > 0) {
         const normalizedThought = unwrapRobinAutoLinks(frame.thought);
@@ -784,9 +828,14 @@ export class GatewayClient {
         parts.push(part);
       }
       const hasEmittedOutput = emittedToolCallCount > 0 || emittedVisibleTextCount > 0 || emittedThoughtCount > 0;
+      const awaitingRoutingSignal = allowDowngradeFailover
+        && !yieldedAnyChunk
+        && !observedAttribution
+        && observedResolvedMode === undefined;
       received ||= Boolean(parts.length || heldCannedText.length > 0 || frame.completed || emittedText.length > 0);
       if (parts.length) onMeta({ observed: true });
-      if (parts.length || (!heldCannedText && (!parser.hasPendingToolMarkup || hasEmittedOutput) && (frame.responseId || frame.modelVersion))) {
+      if (parts.length || (!awaitingRoutingSignal && !heldCannedText && (!parser.hasPendingToolMarkup || hasEmittedOutput) && (frame.responseId || frame.modelVersion))) {
+        yieldedAnyChunk = true;
         yield {
           ...(parts.length ? { candidates: [{ content: { role: 'model', parts } }] } : {}),
           responseId: frame.responseId,
@@ -913,7 +962,15 @@ export class GatewayClient {
         source: 'robin-local-estimate',
       };
     }
-    onMeta({ completed: true });
+    const finalDowngrade = detectRobinDowngrade({
+      requestedModel: input.model,
+      ...(requestedMode.modeCategory !== undefined ? { requestedModeCategory: requestedMode.modeCategory } : {}),
+      ...(observedResolvedMode !== undefined ? { resolvedModeCategory: observedResolvedMode } : {}),
+      ...(observedFallback !== undefined ? { fallback: observedFallback } : {}),
+      ...(observedDowngrade !== undefined ? { downgradeReason: observedDowngrade } : {}),
+      ...(observedAttribution ? { attribution: observedAttribution } : {}),
+    });
+    onMeta({ completed: true, ...(finalDowngrade ? { downgraded: finalDowngrade } : {}) });
     yield {
       candidates: [{ ...(tail.length ? { content: { role: 'model', parts: tail } } : {}), finishReason }],
       ...(estimatedUsage ? { usageMetadata: estimatedUsage } : {}),
@@ -972,6 +1029,7 @@ export class GatewayClient {
           let status: number | null = null;
           let requestId: string | null = null;
           let completed = false;
+          let downgradedDetail: string | null = null;
           try {
             if (useRobinGrpc) {
               started = Date.now();
@@ -980,10 +1038,14 @@ export class GatewayClient {
                 if (meta.requestId !== undefined) requestId = meta.requestId;
                 if (meta.observed) observed = true;
                 if (meta.completed) completed = true;
-              }, accountId)) {
+                if (meta.downgraded !== undefined) downgradedDetail = meta.downgraded;
+              }, accountId, hasNextAccount)) {
                 yield chunk;
               }
-              if (accountId) this.options.auth?.onAccountSuccess?.(accountId);
+              if (accountId) {
+                if (downgradedDetail) this.options.auth?.onAccountDowngrade?.(accountId, downgradedDetail);
+                else this.options.auth?.onAccountSuccess?.(accountId);
+              }
               return;
             }
 
@@ -1049,6 +1111,19 @@ export class GatewayClient {
               refreshed401 = true;
               forceRefresh = true;
               continue;
+            }
+            if (!signal.aborted && !observed && error instanceof RobinDowngradeError) {
+              if (accountId) this.options.auth?.onAccountDowngrade?.(accountId, error.detail);
+              this.options.onRobinTransientError?.({
+                accountId,
+                detail: error.message,
+                action: hasNextAccount ? 'failover' : 'fail',
+              });
+              if (hasNextAccount) {
+                failoverToNext = true;
+                break;
+              }
+              throw error;
             }
             if (!signal.aborted && !observed && error instanceof RobinTransientError) {
               if (hasNextAccount && transientFailovers < 4) {
