@@ -63,6 +63,7 @@ export interface GatewayClientOptions {
   onToolCallRepair?: (info: { name: string; strategy: ToolCallRepairStrategy }) => void;
   onCleanupError?: (error: unknown) => void;
   proxyUrl?: string;
+  robinCompletedGraceMs?: number;
   robinTextIdleTimeoutMs?: number;
   robinOpenToolIdleTimeoutMs?: number;
   robinToolIdleTimeoutMs?: number;
@@ -694,6 +695,7 @@ export class GatewayClient {
       overrideModeCategory,
       temporaryChat: this.options.temporaryChat ?? true,
       signal,
+      ...(this.options.robinCompletedGraceMs !== undefined ? { completedGraceMs: this.options.robinCompletedGraceMs } : {}),
       ...(this.options.robinTextIdleTimeoutMs !== undefined ? { textIdleTimeoutMs: this.options.robinTextIdleTimeoutMs } : {}),
       ...(this.options.robinOpenToolIdleTimeoutMs !== undefined ? { openToolIdleTimeoutMs: this.options.robinOpenToolIdleTimeoutMs } : {}),
       ...(this.options.robinToolIdleTimeoutMs !== undefined ? { toolIdleTimeoutMs: this.options.robinToolIdleTimeoutMs } : {}),

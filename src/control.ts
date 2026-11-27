@@ -123,6 +123,7 @@ interface AccountRuntimeState {
   cooldownUntil?: number;
   cooldownReason?: string;
   lastError?: string;
+  quotaError?: string;
   lastUsedAt?: number;
 }
 
@@ -379,13 +380,14 @@ export class GatewayControl {
     const cd = this.activeCooldown(rt);
     const fiveHour = rt.quota?.windows.find(w => w.id === 'fiveHour');
     const weekly = rt.quota?.windows.find(w => w.id === 'weekly');
+    const visibleError = rt.lastError ?? rt.quotaError;
     return {
       ...(rt.plan?.plan ? { plan: rt.plan.plan } : {}),
       ...(rt.plan?.userTier ? { userTier: rt.plan.userTier } : {}),
       ...(rt.userStatus?.value ? { userStatus: rt.userStatus.value } : {}),
       ...(rt.quota ? { quota: rt.quota, quotaFetchedAt: rt.quota.fetchedAt } : {}),
       ...(cd ? { cooldownUntil: cd.until, ...(cd.reason ? { cooldownReason: cd.reason } : {}) } : {}),
-      ...(rt.lastError ? { lastError: rt.lastError } : {}),
+      ...(visibleError ? { lastError: visibleError } : {}),
       ...(fiveHour ? {
         fiveHourRemaining: fiveHour.remainingPercent,
         ...(fiveHour.resetsAt ? { fiveHourResetsAt: fiveHour.resetsAt } : {}),
@@ -756,6 +758,7 @@ export class GatewayControl {
           ...(config.proxyUrl ? { proxyUrl: config.proxyUrl } : {}),
         }, signal);
         rt.quota = snap;
+        rt.quotaError = undefined;
         if (snap.plan || snap.userTier) {
           rt.plan = {
             plan: snap.plan,
@@ -779,7 +782,7 @@ export class GatewayControl {
       } catch (error) {
         if (signal?.aborted) throw error;
         const msg = error instanceof Error ? error.message : String(error);
-        rt.lastError = msg;
+        rt.quotaError = msg;
         if (/accept our terms of service|terms of service|服务条款/i.test(msg)) {
           this.markAccountTermsRequired(acct.id);
         }
@@ -855,6 +858,7 @@ export class GatewayControl {
         });
         this.markAccountTermsAccepted(resolvedId, { version: result.version, acceptedAt: result.acceptedAt });
         this.clearAccountCooldown(resolvedId);
+        this.ensureRuntime(resolvedId).quotaError = undefined;
         return result;
       } catch (error) {
         if (error instanceof GatewayError && error.status === 401 && attempt === 0 && !signal?.aborted) {

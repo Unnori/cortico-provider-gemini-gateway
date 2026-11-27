@@ -749,8 +749,8 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
     expect(summary.lastAccount).toBe('y***3@gmail.com');
   });
 
-  it('closes cleanly after completed grace period when HTTP/2 END_STREAM stalls, and cancels immediately on tool-call truncation', async () => {
-    let scenario: 'hang-after-completed' | 'hallucinate-after-tool' = 'hang-after-completed';
+  it('closes cleanly after completed grace period (1000ms, resetting on trailing text growth) when HTTP/2 END_STREAM stalls, and cancels immediately on tool-call truncation', async () => {
+    let scenario: 'hang-after-completed' | 'trailing-text-after-completed' | 'hallucinate-after-tool' = 'hang-after-completed';
     let hallucinateStreamClosedEarly = false;
     const openStreams: http2.ServerHttp2Stream[] = [];
     const server = http2.createServer();
@@ -774,6 +774,36 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
             attribution: 'Gemini 4 Hydrogen',
             completed: true,
           })));
+          return;
+        }
+        if (scenario === 'trailing-text-after-completed') {
+          // Server sends `completed: true` early, then continues streaming two trailing text frames > grace window apart cumulatively.
+          stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+            text: 'Part 1 ',
+            responseId: 'rc_tail',
+            attribution: 'Gemini 4 Hydrogen',
+            completed: true,
+          })));
+          setTimeout(() => {
+            if (!stream.destroyed) {
+              stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+                text: 'Part 1 + Part 2 ',
+                responseId: 'rc_tail',
+                attribution: 'Gemini 4 Hydrogen',
+                completed: true,
+              })));
+            }
+          }, 120);
+          setTimeout(() => {
+            if (!stream.destroyed) {
+              stream.write(frameGrpcMessage(encodeProcessQueryResponse({
+                text: 'Part 1 + Part 2 + Final!',
+                responseId: 'rc_tail',
+                attribution: 'Gemini 4 Hydrogen',
+                completed: true,
+              })));
+            }
+          }, 240);
           return;
         }
         // Tool call followed immediately by hallucinated [User] follow-up turn; stream intentionally stays open.
@@ -800,16 +830,35 @@ describe('Robin native HTTP/2 gRPC wire codec and transport', () => {
         auth: { accessToken: async () => 'fresh-token' },
       });
 
-      // Case 1: completed=true arrived, server/proxy never closes H2 stream -> finishes via 500ms grace period.
+      // Case 1: completed=true arrived, server/proxy never closes H2 stream -> finishes via default 1000ms grace period.
       const t0 = Date.now();
       const chunks1 = await consume(client.stream({
         model: 'gemini-robin-fast',
         contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
       }));
       const elapsed1 = Date.now() - t0;
+      expect(elapsed1).toBeGreaterThanOrEqual(850);
       expect(elapsed1).toBeLessThan(2_500);
       expect(chunks1.flatMap(c => c.candidates?.[0]?.content?.parts ?? [])).toEqual([{ text: 'All done!' }]);
       expect(chunks1.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
+
+      // Case 1b: trailing text frames arriving after completed=true reset the grace timer and are never cut off early.
+      scenario = 'trailing-text-after-completed';
+      const fastGraceClient = new GatewayClient({
+        baseUrl,
+        protocol: 'robin',
+        generationEndpoint: ROBIN_GRPC_PROCESS_QUERY,
+        robinCompletedGraceMs: 200,
+        auth: { accessToken: async () => 'fresh-token' },
+      });
+      const chunks1b = await consume(fastGraceClient.stream({
+        model: 'gemini-robin-fast',
+        contents: [{ role: 'user', parts: [{ text: 'hi tail' }] }],
+      }));
+      expect(chunks1b.flatMap(c => c.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('')).toBe(
+        'Part 1 + Part 2 + Final!',
+      );
+      expect(chunks1b.at(-1)?.candidates?.[0]?.finishReason).toBe('STOP');
 
       // Case 2: model hallucinates follow-up turn after <tool_call> -> immediately yields valid call & cancels upstream stream!
       scenario = 'hallucinate-after-tool';

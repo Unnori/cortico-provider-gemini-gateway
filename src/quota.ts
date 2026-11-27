@@ -70,6 +70,7 @@ export interface QuotaQueryOptions {
   proxyUrl?: string;
   fetch?: typeof fetch;
   connectHttp2?: Http2Connector;
+  transientRetryDelayMs?: number;
 }
 
 export function robinPlanName(userTier: unknown): string | undefined {
@@ -210,6 +211,66 @@ export function resolveQuotaEndpoint(baseUrl: string, protocol: 'rpc' | 'gemini'
   return httpUrl(new URL(route, baseUrl.replace(/\/+$/, '') + '/').href).href;
 }
 
+const TRANSIENT_TRANSPORT_CODES = new Set([
+  'ECONNRESET',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ECONNABORTED',
+  'ERR_TLS_HANDSHAKE_TIMEOUT',
+  'ERR_SSL_WRONG_VERSION_NUMBER',
+  'ERR_HTTP2_GOAWAY_SESSION',
+  'ERR_HTTP2_STREAM_CANCEL',
+  'ERR_HTTP2_SESSION_ERROR',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+const TRANSIENT_TRANSPORT_MESSAGE_RE = /before secure TLS connection was established|Client network socket disconnected|socket hang up|ECONNRESET|connection reset|TLS.*disconnect|GOAWAY|stream closed with error/i;
+
+function isTransientTransportLeaf(err: unknown, depth = 0): boolean {
+  if (!err || typeof err !== 'object' || depth > 3) return false;
+  const candidate = err as { code?: unknown; message?: unknown; cause?: unknown; name?: unknown };
+  if (candidate.name === 'AbortError') return false;
+  if (typeof candidate.code === 'string' && TRANSIENT_TRANSPORT_CODES.has(candidate.code)) return true;
+  if (typeof candidate.message === 'string' && TRANSIENT_TRANSPORT_MESSAGE_RE.test(candidate.message)) return true;
+  if (candidate.cause !== undefined && candidate.cause !== err) {
+    return isTransientTransportLeaf(candidate.cause, depth + 1);
+  }
+  return false;
+}
+
+export function isTransientQuotaTransportError(error: unknown): boolean {
+  if (error instanceof GatewayError) {
+    if (error.status !== 502) return false;
+    return isTransientTransportLeaf(error.cause)
+      || /HTTP\/2 connection failed|gRPC stream error/i.test(error.message);
+  }
+  return isTransientTransportLeaf(error);
+}
+
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) {
+    signal?.throwIfAborted();
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error('Aborted'));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error('Aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    timer.unref();
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 export async function queryGatewayQuota(options: QuotaQueryOptions, signal?: AbortSignal): Promise<QuotaSnapshot> {
   const configuredRoute = options.quotaEndpoint?.trim();
   const defaultRoute = options.protocol === 'robin'
@@ -234,11 +295,16 @@ export async function queryGatewayQuota(options: QuotaQueryOptions, signal?: Abo
   const h2Connector = options.connectHttp2 ?? createHttp2Connector(options.proxyUrl);
   const deadline = AbortSignal.timeout(15_000);
   const combinedSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  const retryDelayMs = options.transientRetryDelayMs ?? 250;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  let refreshed401 = false;
+  let retriedTransport = false;
+  let forceRefresh = false;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
     const headers = new Headers(options.headers);
     if (options.auth) {
-      const token = await options.auth.accessToken(attempt === 1);
+      const token = await options.auth.accessToken(forceRefresh);
       headers.set(options.authHeader ?? 'Authorization', `${options.authPrefix ?? 'Bearer '}${token}`);
     }
 
@@ -252,7 +318,15 @@ export async function queryGatewayQuota(options: QuotaQueryOptions, signal?: Abo
           connectHttp2: h2Connector,
         });
       } catch (error) {
-        if (error instanceof GatewayError && error.status === 401 && attempt === 0 && options.auth && !combinedSignal.aborted) {
+        if (error instanceof GatewayError && error.status === 401 && !refreshed401 && options.auth && !combinedSignal.aborted) {
+          refreshed401 = true;
+          forceRefresh = true;
+          continue;
+        }
+        if (isTransientQuotaTransportError(error) && !retriedTransport && !combinedSignal.aborted) {
+          retriedTransport = true;
+          forceRefresh = false;
+          await sleepAbortable(retryDelayMs, combinedSignal);
           continue;
         }
         throw error;
@@ -262,15 +336,28 @@ export async function queryGatewayQuota(options: QuotaQueryOptions, signal?: Abo
     headers.set('Content-Type', headers.get('Content-Type') ?? 'application/x-protobuf');
     headers.set('Accept', headers.get('Accept') ?? 'application/json');
 
-    const response = await request(url, {
-      method: 'POST',
-      headers,
-      redirect: 'error',
-      signal: combinedSignal,
-    });
+    let response: Response;
+    try {
+      response = await request(url, {
+        method: 'POST',
+        headers,
+        redirect: 'error',
+        signal: combinedSignal,
+      });
+    } catch (error) {
+      if (isTransientQuotaTransportError(error) && !retriedTransport && !combinedSignal.aborted) {
+        retriedTransport = true;
+        forceRefresh = false;
+        await sleepAbortable(retryDelayMs, combinedSignal);
+        continue;
+      }
+      throw error;
+    }
 
-    if (response.status === 401 && attempt === 0 && options.auth) {
+    if (response.status === 401 && !refreshed401 && options.auth) {
       await response.body?.cancel().catch(() => {});
+      refreshed401 = true;
+      forceRefresh = true;
       continue;
     }
 

@@ -871,7 +871,7 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
   const origin = new URL(options.baseUrl).origin;
   const path = normalizeGrpcPath(options.path ?? ROBIN_GRPC_PROCESS_QUERY);
   const timeoutMs = options.timeoutMs ?? 180_000;
-  const completedGraceMs = options.completedGraceMs ?? 500;
+  const completedGraceMs = options.completedGraceMs ?? 1_000;
   const textIdleTimeoutMs = options.textIdleTimeoutMs ?? 12_000;
   const openToolIdleTimeoutMs = options.openToolIdleTimeoutMs
     ?? (options.textIdleTimeoutMs !== undefined ? options.textIdleTimeoutMs : 45_000);
@@ -972,6 +972,22 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
       resolve({ value: undefined, done: true });
     }
     stop(true);
+  };
+
+  const armCompletedTimer = () => {
+    if (closed || completedGraceMs < 0) return;
+    clearTimeout(completedTimer);
+    completedTimer = setTimeout(() => {
+      if (closed) return;
+      if (grpcStatus !== null && grpcStatus !== 0) {
+        const mapped = grpcStatusToHttp(grpcStatus);
+        const detail = formatGrpcErrorDetail(grpcStatus, grpcMessage, 'generation');
+        fail(new GatewayError(mapped, 'generation', { detail, body: detail }));
+        return;
+      }
+      finish();
+    }, completedGraceMs);
+    completedTimer.unref();
   };
 
   const armIdleTimer = () => {
@@ -1085,21 +1101,16 @@ export async function* streamRobinGrpc(options: StreamRobinGrpcOptions): AsyncGe
             sawCompleted = true;
             clearTimeout(idleTimer);
             idleTimer = undefined;
-            if (!completedTimer && completedGraceMs >= 0) {
-              completedTimer = setTimeout(() => {
-                if (closed) return;
-                if (grpcStatus !== null && grpcStatus !== 0) {
-                  const mapped = grpcStatusToHttp(grpcStatus);
-                  const detail = formatGrpcErrorDetail(grpcStatus, grpcMessage, 'generation');
-                  fail(new GatewayError(mapped, 'generation', { detail, body: detail }));
-                  return;
-                }
-                finish();
-              }, completedGraceMs);
-              completedTimer.unref();
+            if (!completedTimer) {
+              armCompletedTimer();
             }
           }
         }
+      }
+      // Reset the completed grace countdown if a trailing frame still delivers new text/thought content,
+      // while ignoring empty/heartbeat frames so a stalled END_STREAM still closes cleanly after completedGraceMs.
+      if (sawCompleted && madeProgress) {
+        armCompletedTimer();
       }
       // Only reset the idle countdown when text/thought actually grows (never let empty/heartbeat frames extend it).
       if (sawVisibleText && !sawCompleted && (madeProgress || !idleTimer)) {

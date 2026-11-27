@@ -850,4 +850,111 @@ describe('multi-account OAuth pool, routing strategies, failover, and WebUI', ()
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('clears stale quota errors on subsequent quota success while preserving real generation errors and cooldown state', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ggw-quota-err-clear-'));
+    let failAccountA = false;
+    let failAccountB = false;
+
+    const robinServer = http2.createServer();
+    robinServer.on('stream', (stream, headers) => {
+      const auth = String(headers.authorization ?? '');
+      stream.resume();
+      stream.on('end', () => {
+        if (headers[':path'] === ROBIN_GRPC_GET_USAGE_INFO) {
+          if (auth === 'Bearer tok-a' && failAccountA) {
+            stream.respond({ ':status': 500, 'content-type': 'text/plain' });
+            stream.end('transient quota upstream failure');
+            return;
+          }
+          if (auth === 'Bearer tok-b' && failAccountB) {
+            stream.respond({ ':status': 500, 'content-type': 'text/plain' });
+            stream.end('temporary quota failure on B');
+            return;
+          }
+          stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+          const payload = auth === 'Bearer tok-a' ? encodeUsage(2, 0.2, 0.1) : encodeUsage(2, 0.3, 0.2);
+          stream.write(frameGrpcMessage(payload));
+          stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+          stream.end();
+          return;
+        }
+        stream.respond({ ':status': 404 });
+        stream.end();
+      });
+    });
+    await new Promise<void>(resolve => robinServer.listen(0, '127.0.0.1', resolve));
+    const port = (robinServer.address() as { port: number }).port;
+
+    try {
+      const oauthDir = join(dir, 'oauth');
+      mkdirSync(oauthDir, { recursive: true });
+      const initCtrl = new GatewayControl(oauthDir);
+      initCtrl.saveOAuthConfig(JSON.stringify(GOOGLE_TEST_CONFIG));
+      writeFileSync(join(oauthDir, OAUTH_ACCOUNTS_FILE), JSON.stringify({
+        version: 2,
+        profile: testProfileHash(GOOGLE_TEST_CONFIG),
+        primaryId: 'acct_a',
+        accounts: [
+          { id: 'acct_a', email: 'a@example.com', accessToken: 'tok-a', refreshToken: 'ra', expiresAt: Date.now() + 3_600_000 },
+          { id: 'acct_b', email: 'b@example.com', accessToken: 'tok-b', refreshToken: 'rb', expiresAt: Date.now() + 3_600_000 },
+        ],
+      }));
+
+      const ctrl = new GatewayControl(oauthDir);
+      const entry: LLMProviderEntry = {
+        kind: 'gemini-gateway',
+        baseUrl: `http://127.0.0.1:${port}`,
+        spec: { model: 'gemini-4-neon', thinking: true },
+        options: { protocol: 'robin', authMode: 'oauth', accountRouting: 'failover', quotaEndpoint: ROBIN_GRPC_GET_USAGE_INFO },
+      };
+
+      // Round 1: initial healthy quota fetch populates cached quota with zero errors.
+      await ctrl.queryQuota(entry, { secret: () => '' });
+      expect(ctrl.getAccountRuntime('acct_a').fiveHourRemaining).toBe(80);
+      expect(ctrl.getAccountRuntime('acct_a').lastError).toBeUndefined();
+      expect(ctrl.getAccountRuntime('acct_b').lastError).toBeUndefined();
+
+      // Round 2: acct_a quota query fails -> cached quota preserved, error surfaced on runtime card.
+      failAccountA = true;
+      const failedSnap = await ctrl.queryQuota(entry, { secret: () => '' });
+      expect(failedSnap.accounts?.find(a => a.accountId === 'acct_a')?.error).toContain('HTTP 500');
+      expect(ctrl.getAccountRuntime('acct_a').fiveHourRemaining).toBe(80);
+      expect(ctrl.getAccountRuntime('acct_a').lastError).toContain('HTTP 500');
+      expect(ctrl.getAccountRuntime('acct_b').lastError).toBeUndefined();
+
+      // Round 3: acct_a quota query succeeds again -> stale quota error MUST clear immediately!
+      failAccountA = false;
+      const recoveredSnap = await ctrl.queryQuota(entry, { secret: () => '' });
+      expect(recoveredSnap.accounts?.every(a => !a.error)).toBe(true);
+      expect(ctrl.getAccountRuntime('acct_a').lastError).toBeUndefined();
+      expect(ctrl.getAccountRuntime('acct_b').lastError).toBeUndefined();
+
+      // Round 4: Real generation errors & cooldowns MUST survive subsequent quota queries (both failing and succeeding).
+      ctrl.markAccountCooldown('acct_a', 60_000, 'HTTP 429 rate limited');
+      ctrl.recordAccountError('acct_b', 'Generation stream failed');
+
+      failAccountB = true;
+      await ctrl.queryQuota(entry, { secret: () => '' });
+      expect(ctrl.getAccountRuntime('acct_a').cooldownReason).toBe('HTTP 429 rate limited');
+      expect(ctrl.getAccountRuntime('acct_a').lastError).toBe('HTTP 429 rate limited');
+      // acct_b's real generation error is not overwritten by a transient quota error.
+      expect(ctrl.getAccountRuntime('acct_b').lastError).toBe('Generation stream failed');
+
+      failAccountB = false;
+      await ctrl.queryQuota(entry, { secret: () => '' });
+      // Quota recovery clears only quotaError and keeps both real generation error and active cooldown intact.
+      expect(ctrl.getAccountRuntime('acct_a').cooldownUntil).toBeGreaterThan(Date.now());
+      expect(ctrl.getAccountRuntime('acct_a').cooldownReason).toBe('HTTP 429 rate limited');
+      expect(ctrl.getAccountRuntime('acct_a').lastError).toBe('HTTP 429 rate limited');
+      expect(ctrl.getAccountRuntime('acct_b').lastError).toBe('Generation stream failed');
+
+      // Generation success (clearAccountCooldown) clears the real generation error cleanly.
+      ctrl.clearAccountCooldown('acct_b');
+      expect(ctrl.getAccountRuntime('acct_b').lastError).toBeUndefined();
+    } finally {
+      await new Promise<void>(resolve => robinServer.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

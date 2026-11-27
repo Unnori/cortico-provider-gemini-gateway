@@ -1,6 +1,12 @@
 import http2 from 'node:http2';
 import { describe, expect, it, vi } from 'vitest';
-import { parseQuotaResponse, queryGatewayQuota, robinPlanName } from '../src/quota.ts';
+import {
+  isTransientQuotaTransportError,
+  parseQuotaResponse,
+  queryGatewayQuota,
+  robinPlanName,
+} from '../src/quota.ts';
+import { GatewayError } from '../src/queue.ts';
 import {
   frameGrpcMessage,
   lengthDelimited,
@@ -143,6 +149,92 @@ describe('gateway quota querying', () => {
       expect(seenPaths).toEqual([ROBIN_GRPC_GET_USAGE_INFO]);
       expect(snap.plan).toBe('Pro');
       expect(snap.windows.map(w => w.usedPercent)).toEqual([25, 60]);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it('retries Robin gRPC and REST quota queries once on transient TLS/socket disconnect without force-refreshing token', async () => {
+    // 1. Classifier unit checks (positives & negatives).
+    expect(isTransientQuotaTransportError(new Error('Client network socket disconnected before secure TLS connection was established'))).toBe(true);
+    expect(isTransientQuotaTransportError(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }))).toBe(true);
+    expect(isTransientQuotaTransportError(new GatewayError(502, 'quota', { detail: 'HTTP/2 connection failed: socket hang up' }))).toBe(true);
+    expect(isTransientQuotaTransportError(new GatewayError(502, 'quota', { detail: 'Endpoint returned HTTP 502' }))).toBe(false);
+    expect(isTransientQuotaTransportError(new GatewayError(500, 'quota', { detail: 'Internal error' }))).toBe(false);
+    expect(isTransientQuotaTransportError(new GatewayError(403, 'quota', { detail: 'Permission denied' }))).toBe(false);
+    expect(isTransientQuotaTransportError(Object.assign(new Error('Aborted'), { name: 'AbortError' }))).toBe(false);
+
+    // 2. Robin gRPC: first connect fails TLS handshake before secureConnect, second succeeds.
+    const server = http2.createServer();
+    server.on('stream', (stream) => {
+      stream.resume();
+      stream.on('end', () => {
+        stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+        stream.write(frameGrpcMessage(encodeUsageInfoResponse()));
+        stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+        stream.end();
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const localPort = (server.address() as { port: number }).port;
+
+    try {
+      let connectAttempts = 0;
+      const accessToken = vi.fn(async (force?: boolean) => (force ? 'refreshed-tok' : 'cached-tok'));
+      const snap = await queryGatewayQuota({
+        baseUrl: 'https://robinfrontend-pa.googleapis.com',
+        protocol: 'robin',
+        auth: { accessToken },
+        transientRetryDelayMs: 0,
+        connectHttp2: (_origin, opts) => {
+          connectAttempts += 1;
+          if (connectAttempts === 1) {
+            return Promise.reject(new Error('Client network socket disconnected before secure TLS connection was established'));
+          }
+          const session = http2.connect(`http://127.0.0.1:${localPort}`);
+          opts?.signal?.addEventListener('abort', () => {
+            try { session.close(); } catch { /* ignore */ }
+          }, { once: true });
+          return Promise.resolve(session);
+        },
+      });
+      expect(connectAttempts).toBe(2);
+      expect(accessToken.mock.calls).toEqual([[false], [false]]);
+      expect(snap.plan).toBe('Pro');
+      expect(snap.windows.map(w => w.usedPercent)).toEqual([25, 60]);
+
+      // Persistent TLS disconnect fails after exactly 1 retry (2 total attempts).
+      let persistentAttempts = 0;
+      await expect(queryGatewayQuota({
+        baseUrl: 'https://robinfrontend-pa.googleapis.com',
+        protocol: 'robin',
+        auth: { accessToken: async () => 'cached-tok' },
+        transientRetryDelayMs: 0,
+        connectHttp2: () => {
+          persistentAttempts += 1;
+          return Promise.reject(new Error('Client network socket disconnected before secure TLS connection was established'));
+        },
+      })).rejects.toThrow(/before secure TLS connection was established/);
+      expect(persistentAttempts).toBe(2);
+
+      // 3. REST fetch path also retries once on transient ECONNRESET.
+      const fetch = vi.fn<typeof globalThis.fetch>()
+        .mockRejectedValueOnce(new TypeError('fetch failed', {
+          cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+        }))
+        .mockResolvedValueOnce(Response.json({
+          userTier: 'TIER_PRO',
+          usage: [{ budgetPoolType: 'GXU_FIVE_HOURLY', gxu: { pctUsed: 0.1 } }],
+        }));
+      const restSnap = await queryGatewayQuota({
+        baseUrl: 'https://robinfrontend-pa.googleapis.com',
+        protocol: 'robin',
+        quotaEndpoint: '/$rpc/assistant.mobile.robin.RobinService/GetUsageInfo?$alt=json',
+        transientRetryDelayMs: 0,
+        fetch,
+      });
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(restSnap.windows[0]?.remainingPercent).toBe(90);
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
