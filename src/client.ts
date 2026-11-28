@@ -1012,14 +1012,16 @@ export class GatewayClient {
           try {
             headers = await this.headers(forceRefresh, accountId);
           } catch (error) {
-            if (accountId && hasNextAccount && !signal.aborted) {
+            if (accountId && !signal.aborted) {
               this.options.auth?.onAccountFailure?.(
                 accountId,
                 401,
                 error instanceof Error ? error.message : String(error),
               );
-              failoverToNext = true;
-              break;
+              if (hasNextAccount) {
+                failoverToNext = true;
+                break;
+              }
             }
             if (forceRefresh) throw new GatewayError(401, 'OAuth refresh', { cause: error });
             throw error;

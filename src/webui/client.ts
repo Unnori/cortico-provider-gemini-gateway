@@ -600,7 +600,11 @@ const authPanel: WebUiPanel = {
         }
       }
       const cdText = formatCooldownLeft(acct.cooldownUntil, zh);
-      if (cdText) {
+      if (acct.authInvalid) {
+        const invTag = ui.h('span', 'ggw-tag bad', t('需重新认证', 'Re-auth required'));
+        invTag.title = acct.authInvalidReason || t('OAuth 令牌已失效，已自动暂停调度，请重新认证或移除此账号', 'OAuth token expired/revoked; suspended from routing until re-authenticated');
+        rightTags.append(invTag);
+      } else if (cdText) {
         const cdTag = ui.h('span', 'ggw-tag warn', cdText);
         if (acct.cooldownReason) cdTag.title = acct.cooldownReason;
         rightTags.append(cdTag);
@@ -673,6 +677,7 @@ const authPanel: WebUiPanel = {
       }
       const reauthBtn = ui.button(t('重新认证', 'Re-auth'), {
         size: 'sm',
+        ...(acct.authInvalid ? { variant: 'primary' as const } : {}),
         onClick: () => void beginLogin({ targetAccountId: acct.id, forceAccountSelect: true }),
       });
       reauthBtn.disabled = working || !state?.configured;
@@ -693,8 +698,14 @@ const authPanel: WebUiPanel = {
         card.append(renderInlineAccountQuota(acct, routing, barMode));
       }
       card.append(meta);
-      if (acct.cooldownReason || acct.lastError) {
-        card.append(ui.h('div', 'ggw-account-err', acct.cooldownReason || acct.lastError || ''));
+      if (acct.authInvalidReason || acct.cooldownReason || acct.lastError) {
+        const errText = acct.authInvalid
+          ? t(
+              `认证已失效并已暂停调度（请重新认证或移除）：${acct.authInvalidReason || acct.lastError || ''}`,
+              `Auth invalid (suspended from routing; re-auth or remove): ${acct.authInvalidReason || acct.lastError || ''}`,
+            )
+          : (acct.cooldownReason || acct.lastError || '');
+        card.append(ui.h('div', 'ggw-account-err', errText));
       }
       card.append(cardActions);
       return card;
@@ -892,8 +903,8 @@ const authPanel: WebUiPanel = {
           const now = Date.now();
           const displayed = isQuotaRouting(routing)
             ? sortByQuotaPriority(state.accounts, a => ({
-                cooled: Boolean(a.cooldownUntil && a.cooldownUntil > now),
-                cooldownUntil: a.cooldownUntil,
+                cooled: Boolean(a.authInvalid || (a.cooldownUntil && a.cooldownUntil > now)),
+                cooldownUntil: a.authInvalid ? Number.MAX_SAFE_INTEGER : a.cooldownUntil,
                 fiveHourRemaining: a.fiveHourRemaining,
                 weeklyRemaining: a.weeklyRemaining,
               }), routing)
@@ -907,7 +918,7 @@ const authPanel: WebUiPanel = {
               routing,
               barMode,
               index,
-              Boolean(topId && acct.id === topId && !(acct.cooldownUntil && acct.cooldownUntil > now)),
+              Boolean(topId && acct.id === topId && !acct.authInvalid && !(acct.cooldownUntil && acct.cooldownUntil > now)),
             )),
           );
         }

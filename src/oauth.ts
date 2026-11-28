@@ -196,6 +196,7 @@ export class DesktopOAuth {
   private epoch = 0;
   private lastError?: string;
   private customConfig: boolean;
+  private onAccountUpdated?: (accountId: string) => void;
 
   constructor(config: DesktopOAuthConfig, stateDir: string, request: typeof fetch = proxyFetch, customConfig = false) {
     this.request = request;
@@ -205,6 +206,10 @@ export class DesktopOAuth {
     this.tokenFile = join(stateDir, OAUTH_TOKENS_FILE);
     this.accountsFile = join(stateDir, OAUTH_ACCOUNTS_FILE);
     this.customConfig = customConfig || existsSync(join(stateDir, OAUTH_CONFIG_FILE));
+  }
+
+  setOnAccountUpdated(handler?: (accountId: string) => void): void {
+    this.onAccountUpdated = handler;
   }
 
   reconfigure(config: DesktopOAuthConfig, customConfig: boolean): void {
@@ -504,6 +509,7 @@ export class DesktopOAuth {
     const store = this.readStore();
     const accounts = [...store.accounts];
     let nextPrimary = store.primaryId;
+    let updatedAccountId: string | undefined;
 
     if (previous) {
       const idx = accounts.findIndex(a => a.id === previous.id);
@@ -518,6 +524,7 @@ export class DesktopOAuth {
       if (idx >= 0) accounts[idx] = updated;
       else accounts.push(updated);
       nextPrimary ??= updated.id;
+      updatedAccountId = updated.id;
     } else {
       const normEmail = normalizeEmail(fetchedEmail);
       const emailIdx = normEmail ? accounts.findIndex(a => normalizeEmail(a.email) === normEmail) : -1;
@@ -534,6 +541,7 @@ export class DesktopOAuth {
           ...(fetchedEmail ? { email: fetchedEmail } : {}),
         };
         nextPrimary ??= existing.id;
+        updatedAccountId = existing.id;
       } else {
         const newAccount: StoredAccountTokens = {
           id: `acct_${randomBytes(6).toString('hex')}`,
@@ -547,11 +555,15 @@ export class DesktopOAuth {
         };
         accounts.push(newAccount);
         nextPrimary ??= newAccount.id;
+        updatedAccountId = newAccount.id;
       }
     }
 
     this.writeStore(nextPrimary, accounts);
     this.lastError = undefined;
+    if (!previous && updatedAccountId) {
+      this.onAccountUpdated?.(updatedAccountId);
+    }
     return raw.access_token;
   }
 

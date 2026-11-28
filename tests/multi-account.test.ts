@@ -7,7 +7,7 @@ import type { LLMProviderEntry } from 'cortico/core/types.ts';
 import { nullLogger } from 'cortico/core/util.ts';
 import { describe, expect, it, vi } from 'vitest';
 import { GatewayClient } from '../src/client.ts';
-import { GatewayControl } from '../src/control.ts';
+import { GatewayControl, isPermanentOAuthFailure } from '../src/control.ts';
 import provider from '../src/index.ts';
 import {
   DesktopOAuth,
@@ -952,6 +952,140 @@ describe('multi-account OAuth pool, routing strategies, failover, and WebUI', ()
       // Generation success (clearAccountCooldown) clears the real generation error cleanly.
       ctrl.clearAccountCooldown('acct_b');
       expect(ctrl.getAccountRuntime('acct_b').lastError).toBeUndefined();
+    } finally {
+      await new Promise<void>(resolve => robinServer.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('suspends permanently invalid OAuth accounts (invalid_grant) from routing and pool quota refreshes until re-authenticated', async () => {
+    expect(isPermanentOAuthFailure('OAuth token endpoint returned HTTP 400 (invalid_grant)')).toBe(true);
+    expect(isPermanentOAuthFailure('OAuth token endpoint returned HTTP 401 (unauthorized_client)')).toBe(true);
+    expect(isPermanentOAuthFailure('Token has been expired or revoked.')).toBe(true);
+    expect(isPermanentOAuthFailure('OAuth token endpoint returned HTTP 500')).toBe(false);
+    expect(isPermanentOAuthFailure('Request had invalid authentication credentials.')).toBe(false);
+
+    const dir = mkdtempSync(join(tmpdir(), 'ggw-invalid-grant-'));
+    const tokenEndpointCalls: string[] = [];
+
+    const robinServer = http2.createServer();
+    robinServer.on('stream', (stream, headers) => {
+      stream.resume();
+      stream.on('end', () => {
+        if (headers[':path'] === ROBIN_GRPC_GET_USAGE_INFO) {
+          stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+          stream.write(frameGrpcMessage(encodeUsage(2, 0.2, 0.1)));
+          stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+          stream.end();
+          return;
+        }
+        stream.respond({ ':status': 404 });
+        stream.end();
+      });
+    });
+    await new Promise<void>(resolve => robinServer.listen(0, '127.0.0.1', resolve));
+    const port = (robinServer.address() as { port: number }).port;
+
+    const oauthFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      if (url === GOOGLE_TEST_CONFIG.tokenEndpoint) {
+        const params = new URLSearchParams(String(init?.body));
+        const grantType = params.get('grant_type');
+        if (grantType === 'refresh_token') {
+          const rt = params.get('refresh_token') ?? '';
+          tokenEndpointCalls.push(rt);
+          return Response.json({ error: 'invalid_grant', error_description: 'Token has been expired or revoked.' }, { status: 400 });
+        }
+        if (grantType === 'authorization_code' && params.get('code') === 'reauth-dead-1') {
+          return Response.json({ access_token: 'tok-dead1-new', refresh_token: 'ref-dead1-new', expires_in: 3600 });
+        }
+      }
+      if (url === 'https://openidconnect.googleapis.com/v1/userinfo') {
+        return Response.json({ email: 'dead1@example.com' });
+      }
+      throw new Error(`Unexpected OAuth fetch: ${url}`);
+    });
+
+    try {
+      const oauthDir = join(dir, 'oauth');
+      mkdirSync(oauthDir, { recursive: true });
+      const initCtrl = new GatewayControl(oauthDir, oauthFetch);
+      initCtrl.saveOAuthConfig(JSON.stringify(GOOGLE_TEST_CONFIG));
+      const expiredTs = Date.now() - 60_000;
+      const validTs = Date.now() + 3_600_000;
+      writeFileSync(join(oauthDir, OAUTH_ACCOUNTS_FILE), JSON.stringify({
+        version: 1,
+        profile: testProfileHash(GOOGLE_TEST_CONFIG),
+        primaryId: 'acct_dead_1',
+        accounts: [
+          { id: 'acct_dead_1', email: 'dead1@example.com', accessToken: 'tok-old-1', refreshToken: 'ref-dead-1', expiresAt: expiredTs, addedAt: '2026-11-20T00:00:00Z' },
+          { id: 'acct_dead_2', email: 'dead2@example.com', accessToken: 'tok-old-2', refreshToken: 'ref-dead-2', expiresAt: expiredTs, addedAt: '2026-11-20T00:01:00Z' },
+          { id: 'acct_good', email: 'good@example.com', accessToken: 'tok-good', refreshToken: 'ref-good', expiresAt: validTs, addedAt: '2026-11-20T00:02:00Z' },
+        ],
+      }));
+
+      const ctrl = new GatewayControl(oauthDir, oauthFetch);
+      const entry: LLMProviderEntry = {
+        kind: 'gemini-gateway',
+        baseUrl: `http://127.0.0.1:${port}`,
+        spec: { model: 'gemini-4-neon', thinking: true },
+        options: { protocol: 'robin', authMode: 'oauth', accountRouting: 'round-robin', quotaEndpoint: ROBIN_GRPC_GET_USAGE_INFO },
+      };
+
+      // Round 1 quota refresh discovers invalid_grant on both dead accounts and suspends them immediately.
+      const snap1 = await ctrl.queryQuota(entry, { secret: () => '' });
+      expect(tokenEndpointCalls.sort()).toEqual(['ref-dead-1', 'ref-dead-2']);
+      expect(snap1.accounts?.find(a => a.accountId === 'acct_dead_1')?.error).toContain('invalid_grant');
+      expect(snap1.accounts?.find(a => a.accountId === 'acct_good')?.error).toBeUndefined();
+      expect(ctrl.getAccountRuntime('acct_dead_1').authInvalid).toBe(true);
+      expect(ctrl.getAccountRuntime('acct_dead_2').authInvalid).toBe(true);
+      expect(ctrl.getAccountRuntime('acct_good').authInvalid).toBeUndefined();
+
+      // Dead accounts are excluded from scheduling across every routing mode (even if primary is dead!).
+      expect(ctrl.pickAccountOrder('failover', 'gemini-4-neon')).toEqual(['acct_good']);
+      expect(ctrl.pickAccountOrder('round-robin', 'gemini-4-neon')).toEqual(['acct_good']);
+      expect(ctrl.pickAccountOrder('least-used', 'gemini-4-neon')).toEqual(['acct_good']);
+      expect(ctrl.pickAccountOrder('least-used-5h', 'gemini-4-neon')).toEqual(['acct_good']);
+
+      // Even while acct_good is in temporary cooldown, dead invalid_grant accounts are still skipped.
+      ctrl.markAccountCooldown('acct_good', 60_000, 'HTTP 429');
+      expect(ctrl.pickAccountOrder('round-robin', 'gemini-4-neon')).toEqual(['acct_good']);
+      ctrl.clearAccountCooldown('acct_good');
+
+      // Round 2 pool quota refresh skips dead accounts without burning extra token-endpoint round trips.
+      tokenEndpointCalls.length = 0;
+      const snap2 = await ctrl.queryQuota(entry, { secret: () => '' });
+      expect(tokenEndpointCalls).toEqual([]);
+      expect(snap2.accounts?.find(a => a.accountId === 'acct_dead_1')?.error).toContain('invalid_grant');
+      expect(snap2.accounts?.find(a => a.accountId === 'acct_good')?.error).toBeUndefined();
+
+      // Re-authenticating acct_dead_1 via DesktopOAuth automatically clears its suspension!
+      const login = await ctrl.auth.startLogin(undefined, { targetAccountId: 'acct_dead_1', forceAccountSelect: true });
+      const loginUrl = new URL(login.url);
+      const cb = new URL(login.redirectUri);
+      cb.searchParams.set('code', 'reauth-dead-1');
+      cb.searchParams.set('state', loginUrl.searchParams.get('state')!);
+      await ctrl.auth.completeLogin(cb.href);
+
+      expect(ctrl.getAccountRuntime('acct_dead_1').authInvalid).toBeUndefined();
+      expect(ctrl.getAccountRuntime('acct_dead_1').lastError).toBeUndefined();
+      expect(ctrl.pickAccountOrder('failover', 'gemini-4-neon')).toEqual(['acct_dead_1', 'acct_good']);
+
+      // External disk replacement (e.g. CLI login) updates expiresAt and auto-lifts suspension on acct_dead_2 too.
+      const disk = JSON.parse(readFileSync(join(oauthDir, OAUTH_ACCOUNTS_FILE), 'utf8')) as {
+        primaryId: string;
+        accounts: Array<{ id: string; expiresAt: number }>;
+      };
+      disk.accounts.find(a => a.id === 'acct_dead_2')!.expiresAt = Date.now() + 7_200_000;
+      writeFileSync(join(oauthDir, OAUTH_ACCOUNTS_FILE), JSON.stringify(disk));
+      expect(ctrl.getAccountRuntime('acct_dead_2').authInvalid).toBeUndefined();
+      expect(ctrl.pickAccountOrder('failover', 'gemini-4-neon')).toEqual(['acct_dead_1', 'acct_dead_2', 'acct_good']);
+
+      // Fallback: if ALL accounts are authInvalid, pickAccountOrder still returns them so callers surface an actionable error.
+      ctrl.markAccountAuthInvalid('acct_dead_1', 'invalid_grant');
+      ctrl.markAccountAuthInvalid('acct_dead_2', 'invalid_grant');
+      ctrl.markAccountAuthInvalid('acct_good', 'invalid_grant');
+      expect(ctrl.pickAccountOrder('failover', 'gemini-4-neon')).toEqual(['acct_dead_1', 'acct_dead_2', 'acct_good']);
     } finally {
       await new Promise<void>(resolve => robinServer.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });

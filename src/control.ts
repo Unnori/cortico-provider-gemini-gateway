@@ -107,6 +107,8 @@ export interface AccountRuntimeInfo {
   quota?: QuotaSnapshot;
   cooldownUntil?: number;
   cooldownReason?: string;
+  authInvalid?: boolean;
+  authInvalidReason?: string;
   lastError?: string;
   fiveHourRemaining?: number;
   fiveHourResetsAt?: string;
@@ -122,9 +124,16 @@ interface AccountRuntimeState {
   quota?: QuotaSnapshot;
   cooldownUntil?: number;
   cooldownReason?: string;
+  authInvalid?: { reason: string; tokenExpiresAt?: number; since: number };
   lastError?: string;
   quotaError?: string;
   lastUsedAt?: number;
+}
+
+const PERMANENT_OAUTH_FAILURE_RE = /\b(?:invalid_grant|unauthorized_client|invalid_client|deleted_client)\b|token has been expired or revoked/i;
+
+export function isPermanentOAuthFailure(detail?: string): boolean {
+  return Boolean(detail && PERMANENT_OAUTH_FAILURE_RE.test(detail));
 }
 
 const ROBIN_STATUS_TTL_MS = 5 * 60_000;
@@ -189,6 +198,7 @@ export class GatewayControl {
     const config = custom ?? bundled ?? GatewayControl.emptyOAuthConfig();
     const oauthFetch: typeof fetch = request ?? ((input, init) => this.fetchForProxy()(input, init));
     this.auth = new DesktopOAuth(config, oauthDir, oauthFetch, Boolean(custom));
+    this.auth.setOnAccountUpdated(accountId => this.clearAccountAuthInvalid(accountId));
   }
 
   private fetchForProxy(): typeof fetch {
@@ -341,6 +351,54 @@ export class GatewayControl {
     this.accountRuntime.delete(accountId);
   }
 
+  private activeAuthInvalid(
+    accountId: string,
+    rt: AccountRuntimeState | undefined,
+    currentExpiresAt?: number,
+  ): { reason: string; since: number } | undefined {
+    const invalid = rt?.authInvalid;
+    if (!invalid) return undefined;
+    const storedExpiresAt = currentExpiresAt ?? this.auth.listAccounts().find(a => a.id === accountId)?.expiresAt;
+    // Automatically lift suspension if the stored token on disk was replaced (e.g. re-auth via CLI or WebUI).
+    if (
+      invalid.tokenExpiresAt !== undefined
+      && storedExpiresAt !== undefined
+      && storedExpiresAt !== invalid.tokenExpiresAt
+    ) {
+      rt.authInvalid = undefined;
+      rt.cooldownUntil = undefined;
+      rt.cooldownReason = undefined;
+      rt.lastError = undefined;
+      rt.quotaError = undefined;
+      return undefined;
+    }
+    return { reason: invalid.reason, since: invalid.since };
+  }
+
+  markAccountAuthInvalid(accountId: string, reason: string): void {
+    const rt = this.ensureRuntime(accountId);
+    const storedExpiresAt = this.auth.listAccounts().find(a => a.id === accountId)?.expiresAt;
+    const cleanReason = reason.trim() || 'OAuth 令牌已失效（invalid_grant），请重新认证或移除此账号';
+    rt.authInvalid = {
+      reason: cleanReason,
+      ...(storedExpiresAt !== undefined ? { tokenExpiresAt: storedExpiresAt } : {}),
+      since: Date.now(),
+    };
+    rt.cooldownUntil = undefined;
+    rt.cooldownReason = undefined;
+    rt.lastError = cleanReason;
+  }
+
+  clearAccountAuthInvalid(accountId: string): void {
+    const rt = this.accountRuntime.get(accountId);
+    if (!rt) return;
+    rt.authInvalid = undefined;
+    rt.cooldownUntil = undefined;
+    rt.cooldownReason = undefined;
+    rt.lastError = undefined;
+    rt.quotaError = undefined;
+  }
+
   markAccountCooldown(accountId: string, durationMs: number, reason: string): void {
     const rt = this.ensureRuntime(accountId);
     const until = Date.now() + Math.max(1_000, durationMs);
@@ -363,6 +421,7 @@ export class GatewayControl {
 
   clearAccountCooldown(accountId: string): void {
     const rt = this.ensureRuntime(accountId);
+    rt.authInvalid = undefined;
     rt.cooldownUntil = undefined;
     rt.cooldownReason = undefined;
     rt.lastError = undefined;
@@ -377,16 +436,18 @@ export class GatewayControl {
   getAccountRuntime(accountId: string): AccountRuntimeInfo {
     const rt = this.accountRuntime.get(accountId);
     if (!rt) return {};
-    const cd = this.activeCooldown(rt);
+    const authInvalid = this.activeAuthInvalid(accountId, rt);
+    const cd = authInvalid ? undefined : this.activeCooldown(rt);
     const fiveHour = rt.quota?.windows.find(w => w.id === 'fiveHour');
     const weekly = rt.quota?.windows.find(w => w.id === 'weekly');
-    const visibleError = rt.lastError ?? rt.quotaError;
+    const visibleError = authInvalid?.reason ?? rt.lastError ?? rt.quotaError;
     return {
       ...(rt.plan?.plan ? { plan: rt.plan.plan } : {}),
       ...(rt.plan?.userTier ? { userTier: rt.plan.userTier } : {}),
       ...(rt.userStatus?.value ? { userStatus: rt.userStatus.value } : {}),
       ...(rt.quota ? { quota: rt.quota, quotaFetchedAt: rt.quota.fetchedAt } : {}),
       ...(cd ? { cooldownUntil: cd.until, ...(cd.reason ? { cooldownReason: cd.reason } : {}) } : {}),
+      ...(authInvalid ? { authInvalid: true, authInvalidReason: authInvalid.reason } : {}),
       ...(visibleError ? { lastError: visibleError } : {}),
       ...(fiveHour ? {
         fiveHourRemaining: fiveHour.remainingPercent,
@@ -472,10 +533,20 @@ export class GatewayControl {
     const now = Date.now();
     const healthy: OAuthAccountSummary[] = [];
     const cooled: { acct: OAuthAccountSummary; until: number }[] = [];
+    const invalidAuth: OAuthAccountSummary[] = [];
     for (const acct of ordered) {
-      const cd = this.activeCooldown(this.accountRuntime.get(acct.id), now);
+      const rt = this.accountRuntime.get(acct.id);
+      if (this.activeAuthInvalid(acct.id, rt, acct.expiresAt)) {
+        invalidAuth.push(acct);
+        continue;
+      }
+      const cd = this.activeCooldown(rt, now);
       if (cd) cooled.push({ acct, until: cd.until });
       else healthy.push(acct);
+    }
+
+    if (healthy.length === 0 && cooled.length === 0) {
+      return invalidAuth.map(a => a.id);
     }
 
     cooled.sort((a, b) => a.until - b.until);
@@ -746,6 +817,19 @@ export class GatewayControl {
 
     const results = await mapLimit(targets, 3, async (acct): Promise<AccountQuotaSnapshot> => {
       const rt = this.ensureRuntime(acct.id);
+      const invalid = this.activeAuthInvalid(acct.id, rt, acct.expiresAt);
+      if (invalid && !wantsSingle) {
+        return {
+          accountId: acct.id,
+          ...(acct.email ? { email: acct.email } : {}),
+          isPrimary: acct.isPrimary,
+          ...(rt.plan?.plan ? { plan: rt.plan.plan } : {}),
+          ...(rt.plan?.userTier ? { userTier: rt.plan.userTier } : {}),
+          windows: [],
+          fetchedAt: new Date().toISOString(),
+          error: invalid.reason,
+        };
+      }
       try {
         const snap = await queryGatewayQuota({
           baseUrl: config.baseUrl,
@@ -759,6 +843,7 @@ export class GatewayControl {
         }, signal);
         rt.quota = snap;
         rt.quotaError = undefined;
+        rt.authInvalid = undefined;
         if (snap.plan || snap.userTier) {
           rt.plan = {
             plan: snap.plan,
@@ -782,7 +867,11 @@ export class GatewayControl {
       } catch (error) {
         if (signal?.aborted) throw error;
         const msg = error instanceof Error ? error.message : String(error);
-        rt.quotaError = msg;
+        if (isPermanentOAuthFailure(msg)) {
+          this.markAccountAuthInvalid(acct.id, msg);
+        } else {
+          rt.quotaError = msg;
+        }
         if (/accept our terms of service|terms of service|服务条款/i.test(msg)) {
           this.markAccountTermsRequired(acct.id);
         }

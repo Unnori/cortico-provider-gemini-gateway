@@ -40,6 +40,8 @@ export interface AuthAccountItem {
   userTier?: string;
   cooldownUntil?: number;
   cooldownReason?: string;
+  authInvalid?: boolean;
+  authInvalidReason?: string;
   lastError?: string;
   fiveHourRemaining?: number;
   fiveHourResetsAt?: string;
@@ -176,6 +178,8 @@ function asAuthStatus(control: GatewayInstanceControl, entry: LLMProviderEntry, 
       ...(rt.userTier ? { userTier: rt.userTier } : {}),
       ...(rt.cooldownUntil ? { cooldownUntil: rt.cooldownUntil } : {}),
       ...(rt.cooldownReason ? { cooldownReason: rt.cooldownReason } : {}),
+      ...(rt.authInvalid ? { authInvalid: true } : {}),
+      ...(rt.authInvalidReason ? { authInvalidReason: rt.authInvalidReason } : {}),
       ...(rt.lastError ? { lastError: rt.lastError } : {}),
       ...(rt.fiveHourRemaining !== undefined ? { fiveHourRemaining: rt.fiveHourRemaining } : {}),
       ...(rt.fiveHourResetsAt ? { fiveHourResetsAt: rt.fiveHourResetsAt } : {}),

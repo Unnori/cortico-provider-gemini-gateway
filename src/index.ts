@@ -4,7 +4,12 @@ import type { LLMProviderEntry, ReasoningTier } from 'cortico/core/types.ts';
 import type { ProviderModule } from 'cortico/providers/base.ts';
 import { geminiBaseline, ModelCatalog, type ModelMetadata } from './catalog.ts';
 import { GatewayClient } from './client.ts';
-import { gatewayControl, ROBIN_DOWNGRADE_COOLDOWN_MS, type GatewayControl } from './control.ts';
+import {
+  gatewayControl,
+  isPermanentOAuthFailure,
+  ROBIN_DOWNGRADE_COOLDOWN_MS,
+  type GatewayControl,
+} from './control.ts';
 import { createHttp2Connector, createProxyFetchFor } from './http.ts';
 import { CustomGeminiProvider } from './native.ts';
 import { configuration, option, resolveHeaders } from './options.ts';
@@ -247,6 +252,16 @@ export const GEMINI_GATEWAY = {
           }
         },
         onAccountFailure: (accountId, status, detail) => {
+          if (status === 401 && isPermanentOAuthFailure(detail)) {
+            const label = detail?.trim() || 'OAuth 令牌已失效（invalid_grant），请重新认证或移除';
+            oauth.markAccountAuthInvalid(accountId, label);
+            host.log.warn('Gemini gateway account OAuth token permanently invalid; suspended until re-authenticated', {
+              accountId,
+              status,
+              detail: label,
+            });
+            return;
+          }
           const isTermsError = Boolean(detail && /accept our terms of service|terms of service|服务条款/i.test(detail));
           if (isTermsError) {
             oauth.markAccountTermsRequired(accountId);

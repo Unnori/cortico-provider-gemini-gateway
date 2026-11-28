@@ -895,7 +895,11 @@ var authPanel = {
         }
       }
       const cdText = formatCooldownLeft(acct.cooldownUntil, zh);
-      if (cdText) {
+      if (acct.authInvalid) {
+        const invTag = ui.h("span", "ggw-tag bad", t("\u9700\u91CD\u65B0\u8BA4\u8BC1", "Re-auth required"));
+        invTag.title = acct.authInvalidReason || t("OAuth \u4EE4\u724C\u5DF2\u5931\u6548\uFF0C\u5DF2\u81EA\u52A8\u6682\u505C\u8C03\u5EA6\uFF0C\u8BF7\u91CD\u65B0\u8BA4\u8BC1\u6216\u79FB\u9664\u6B64\u8D26\u53F7", "OAuth token expired/revoked; suspended from routing until re-authenticated");
+        rightTags.append(invTag);
+      } else if (cdText) {
         const cdTag = ui.h("span", "ggw-tag warn", cdText);
         if (acct.cooldownReason) cdTag.title = acct.cooldownReason;
         rightTags.append(cdTag);
@@ -964,6 +968,7 @@ var authPanel = {
       }
       const reauthBtn = ui.button(t("\u91CD\u65B0\u8BA4\u8BC1", "Re-auth"), {
         size: "sm",
+        ...acct.authInvalid ? { variant: "primary" } : {},
         onClick: () => void beginLogin({ targetAccountId: acct.id, forceAccountSelect: true })
       });
       reauthBtn.disabled = working || !state?.configured;
@@ -983,8 +988,12 @@ var authPanel = {
         card.append(renderInlineAccountQuota(acct, routing, barMode));
       }
       card.append(meta);
-      if (acct.cooldownReason || acct.lastError) {
-        card.append(ui.h("div", "ggw-account-err", acct.cooldownReason || acct.lastError || ""));
+      if (acct.authInvalidReason || acct.cooldownReason || acct.lastError) {
+        const errText = acct.authInvalid ? t(
+          `\u8BA4\u8BC1\u5DF2\u5931\u6548\u5E76\u5DF2\u6682\u505C\u8C03\u5EA6\uFF08\u8BF7\u91CD\u65B0\u8BA4\u8BC1\u6216\u79FB\u9664\uFF09\uFF1A${acct.authInvalidReason || acct.lastError || ""}`,
+          `Auth invalid (suspended from routing; re-auth or remove): ${acct.authInvalidReason || acct.lastError || ""}`
+        ) : acct.cooldownReason || acct.lastError || "";
+        card.append(ui.h("div", "ggw-account-err", errText));
       }
       card.append(cardActions);
       return card;
@@ -1143,8 +1152,8 @@ var authPanel = {
         } else {
           const now = Date.now();
           const displayed = isQuotaRouting(routing) ? sortByQuotaPriority(state.accounts, (a) => ({
-            cooled: Boolean(a.cooldownUntil && a.cooldownUntil > now),
-            cooldownUntil: a.cooldownUntil,
+            cooled: Boolean(a.authInvalid || a.cooldownUntil && a.cooldownUntil > now),
+            cooldownUntil: a.authInvalid ? Number.MAX_SAFE_INTEGER : a.cooldownUntil,
             fiveHourRemaining: a.fiveHourRemaining,
             weeklyRemaining: a.weeklyRemaining
           }), routing) : state.accounts;
@@ -1157,7 +1166,7 @@ var authPanel = {
               routing,
               barMode,
               index,
-              Boolean(topId && acct.id === topId && !(acct.cooldownUntil && acct.cooldownUntil > now))
+              Boolean(topId && acct.id === topId && !acct.authInvalid && !(acct.cooldownUntil && acct.cooldownUntil > now))
             ))
           );
         }
