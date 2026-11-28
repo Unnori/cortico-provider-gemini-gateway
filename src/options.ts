@@ -11,7 +11,7 @@ import { httpUrl, stringMap } from './state.ts';
 
 export type AuthMode = 'auto' | 'oauth' | 'api-key';
 export type AccountRoutingMode = 'failover' | 'round-robin' | 'least-used' | 'least-used-5h';
-export type GatewayPresetId = 'robin' | 'gemini' | 'rpc';
+export type GatewayPresetId = 'robin' | 'official' | 'gemini' | 'rpc';
 
 export interface GatewayConfiguration extends GatewayClientOptions {
   protocol: GatewayProtocol;
@@ -173,12 +173,25 @@ export function shouldUseOAuth(entry: LLMProviderEntry, oauthDir: string): boole
 }
 
 export const ROBIN_DEFAULT_BASE_URL = 'https://robinfrontend-pa.googleapis.com';
+export const OFFICIAL_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com';
 export const SELF_HOSTED_DEFAULT_BASE_URL = 'http://127.0.0.1:8080';
+
+export function isOfficialGeminiBaseUrl(rawUrl?: string): boolean {
+  const trimmed = (rawUrl ?? '').trim();
+  if (!trimmed) return false;
+  try {
+    return new URL(trimmed).hostname.toLowerCase() === 'generativelanguage.googleapis.com';
+  } catch {
+    return false;
+  }
+}
 
 export function resolveAutoBaseUrl(protocol: GatewayProtocol, currentBaseUrl?: string): string {
   const trimmed = (currentBaseUrl ?? '').trim().replace(/\/+$/, '');
   if (protocol === 'robin') return ROBIN_DEFAULT_BASE_URL;
-  if (!trimmed || trimmed === ROBIN_DEFAULT_BASE_URL) return SELF_HOSTED_DEFAULT_BASE_URL;
+  if (!trimmed || trimmed === ROBIN_DEFAULT_BASE_URL || isOfficialGeminiBaseUrl(trimmed)) {
+    return SELF_HOSTED_DEFAULT_BASE_URL;
+  }
   return trimmed;
 }
 
@@ -199,6 +212,18 @@ export function presetEntryPatch(preset: GatewayPresetId, currentBaseUrl?: strin
         temporaryChat: true,
         headers: {},
         secretHeaders: {},
+      },
+    };
+  }
+  if (preset === 'official') {
+    return {
+      baseUrl: OFFICIAL_GEMINI_BASE_URL,
+      model: 'gemini-2.5-pro',
+      options: {
+        protocol: 'gemini',
+        authMode: 'api-key',
+        generationEndpoint: 'v1beta/models/{model}:streamGenerateContent?alt=sse',
+        temporaryChat: false,
       },
     };
   }

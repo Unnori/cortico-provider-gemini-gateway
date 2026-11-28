@@ -4,6 +4,7 @@ import { requestJson } from 'cortico/providers/transport/response-http.ts';
 import { canonicalMime } from './catalog.ts';
 import { gatewayFrames } from './frames.ts';
 import { createHttp2Connector, createProxyFetchFor, type Http2Connector } from './http.ts';
+import { isOfficialGeminiBaseUrl } from './options.ts';
 import { GatewayError, inspectHttpError, SerialQueue } from './queue.ts';
 import {
   isRobinGrpcRoute,
@@ -984,8 +985,15 @@ export class GatewayClient {
     try {
       const route = this.resolveGenerationRoute();
       const useRobinGrpc = this.protocol === 'robin' && isRobinGrpcRoute(route) && !this.options.encodeRequest && !this.options.decodeEvent;
+      const isOfficialGemini = this.protocol === 'gemini' && isOfficialGeminiBaseUrl(this.base);
       const url = endpoint(this.base, route.replaceAll('{model}', encodeURIComponent(input.model)));
-      const encode = this.options.encodeRequest ?? (this.protocol === 'gemini' ? toGeminiRequest : this.protocol === 'robin' ? toRobinRequest : toRpcRequest);
+      const encode = this.options.encodeRequest ?? (
+        this.protocol === 'gemini'
+          ? (req, up, temp) => toGeminiRequest(req, up, temp, { officialApi: isOfficialGemini })
+          : this.protocol === 'robin'
+            ? toRobinRequest
+            : toRpcRequest
+      );
       const decode = this.options.decodeEvent ?? decodeGatewayEvent;
       const deadline = AbortSignal.timeout(300_000);
       const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
@@ -1078,7 +1086,7 @@ export class GatewayClient {
               if (event.errorStatus) throw new GatewayError(event.errorStatus, 'generation');
               const rawParts: GeminiPart[] = [];
               for (const part of event.parts ?? []) {
-                if (typeof part.text === 'string' && !part.thought && !part.functionCall) {
+                if (!isOfficialGemini && typeof part.text === 'string' && !part.thought && !part.functionCall) {
                   const parsed = parser.feed(part.text);
                   if (part.thoughtSignature && parsed.length) parsed[parsed.length - 1].thoughtSignature = part.thoughtSignature;
                   rawParts.push(...parsed);

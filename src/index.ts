@@ -2,7 +2,7 @@ import type { ConfigGroup } from 'cortico/core/config-schema.ts';
 import type { Language } from 'cortico/core/language.ts';
 import type { LLMProviderEntry, ReasoningTier } from 'cortico/core/types.ts';
 import type { ProviderModule } from 'cortico/providers/base.ts';
-import { geminiBaseline, ModelCatalog, type ModelMetadata } from './catalog.ts';
+import { fetchOfficialGeminiModels, geminiBaseline, ModelCatalog, type ModelMetadata } from './catalog.ts';
 import { GatewayClient } from './client.ts';
 import {
   gatewayControl,
@@ -12,7 +12,7 @@ import {
 } from './control.ts';
 import { createHttp2Connector, createProxyFetchFor } from './http.ts';
 import { CustomGeminiProvider } from './native.ts';
-import { configuration, option, resolveHeaders } from './options.ts';
+import { configuration, isOfficialGeminiBaseUrl, option, resolveHeaders } from './options.ts';
 import { resolveProviderPrices } from './pricing.ts';
 import type { QuotaSnapshot } from './quota.ts';
 import type { RobinTermsResult, RobinUserStatus } from './robin-grpc.ts';
@@ -88,6 +88,7 @@ export interface GatewayInstanceControl {
   queryUserStatus: (signal?: AbortSignal, force?: boolean, accountId?: string) => Promise<RobinUserStatus | null>;
   robinRouteSummary: (model: string) => RobinRouteSummary | undefined;
   acceptTerms: (language?: string, signal?: AbortSignal, accountId?: string) => Promise<RobinTermsResult>;
+  testOfficialConnection: (signal?: AbortSignal) => Promise<{ modelCount: number; sampleModels: string[] }>;
   metadata: (model: string) => ModelMetadata | undefined;
   refreshCatalog: () => Promise<void>;
 }
@@ -345,6 +346,22 @@ export const GEMINI_GATEWAY = {
         });
       },
       acceptTerms: (language, signal, accountId) => oauth.acceptTerms(current(), host, language, signal, accountId),
+      testOfficialConnection: async signal => {
+        const cur = current();
+        const curCfg = configuration(cur);
+        const headers = resolveHeaders(cur, host, true, oauth.oauthDir);
+        const models = await fetchOfficialGeminiModels(
+          cur.baseUrl,
+          headers,
+          createProxyFetchFor(curCfg.proxyUrl),
+          signal,
+          50,
+        );
+        return {
+          modelCount: models.length,
+          sampleModels: models.slice(0, 3).map(m => m.id),
+        };
+      },
       metadata: model => resolveModelMeta(model),
       refreshCatalog: async () => {
         const cur = current();
@@ -421,6 +438,49 @@ export const GEMINI_GATEWAY = {
             observedRouting: id => oauth.getObservedRouting(id),
           });
         }
+        if (curCfg.protocol === 'gemini' && isOfficialGeminiBaseUrl(cur.baseUrl) && oauth.apiKeyStatus(cur, host).configured) {
+          const [officialModels] = await Promise.all([
+            fetchOfficialGeminiModels(
+              cur.baseUrl,
+              resolveHeaders(cur, host, false, oauth.oauthDir),
+              createProxyFetchFor(curCfg.proxyUrl),
+            ).catch(err => {
+              host.log.warn('Official Gemini model listing failed; falling back to public catalog', {
+                error: err instanceof Error ? err.message : String(err),
+              });
+              return null;
+            }),
+            catalog.refresh().catch(() => undefined),
+          ]);
+          if (officialModels && officialModels.length > 0) {
+            const seen = new Set<string>();
+            const listed = officialModels.map(item => {
+              seen.add(item.id);
+              const meta = resolveModelMeta(item.id);
+              return {
+                id: item.id,
+                displayName: item.displayName ?? meta?.displayName,
+                contextWindow: item.contextWindow || meta?.contextWindow || 1_048_576,
+                maxOutputTokens: item.maxOutputTokens || meta?.maxOutputTokens || 65_536,
+                inputImages: (meta?.inputMimeTypes ?? item.inputMimeTypes).some(mime => mime.startsWith('image/')),
+              };
+            });
+            const configured = cur.spec?.model?.trim();
+            if (configured) {
+              const cfgMeta = resolveModelMeta(configured);
+              if (cfgMeta && !seen.has(cfgMeta.id)) {
+                listed.push({
+                  id: cfgMeta.id,
+                  displayName: cfgMeta.displayName,
+                  contextWindow: cfgMeta.contextWindow,
+                  maxOutputTokens: cfgMeta.maxOutputTokens,
+                  inputImages: cfgMeta.inputMimeTypes.some(mime => mime.startsWith('image/')),
+                });
+              }
+            }
+            return listed;
+          }
+        }
         return (await catalog.list(cur.spec?.model, false)).map(model => ({
           id: model.id,
           displayName: model.displayName,
@@ -430,7 +490,7 @@ export const GEMINI_GATEWAY = {
         }));
       },
       contextWindow: model => resolveModelMeta(model)?.contextWindow,
-      compatibilityKey: () => [options.protocol, options.authMode, useOAuth, options.generationEndpoint, oauth.oauthDir],
+      compatibilityKey: () => [options.protocol, options.authMode, useOAuth, options.generationEndpoint, isOfficialGeminiBaseUrl(current().baseUrl), oauth.oauthDir],
     };
   },
 } satisfies ProviderModule;

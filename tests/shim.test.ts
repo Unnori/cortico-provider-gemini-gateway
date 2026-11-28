@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { decodeGatewayEvent, RobinPartFilter, toGeminiRequest, toRobinRequest, toRpcRequest, ToolCallStream, unwrapRobinAutoLinks, type GeminiRequest } from '../src/shim.ts';
+import { decodeGatewayEvent, RobinPartFilter, SKIP_THOUGHT_SIGNATURE, toGeminiRequest, toOfficialGeminiRequest, toRobinRequest, toRpcRequest, ToolCallStream, unwrapRobinAutoLinks, type GeminiRequest } from '../src/shim.ts';
 
 describe('Gemini request adapters', () => {
   const schema = { type: 'object', properties: { q: { type: 'string' } }, additionalProperties: false };
@@ -46,6 +46,100 @@ describe('Gemini request adapters', () => {
     });
     await expect(toRpcRequest(request)).rejects.toThrow('upload');
     await expect(toRpcRequest(request, async () => '')).rejects.toThrow('reference ID');
+  });
+
+  it('builds strict official Gemini REST v1beta payloads without temporary_chat, normalizes thinkingConfig by model generation, and handles thoughtSignature', async () => {
+    const baseReq: GeminiRequest = {
+      model: 'gemini-3.1-pro',
+      systemInstruction: { parts: [{ text: 'Be helpful.' }] },
+      tools: request.tools,
+      contents: [
+        { role: 'user', parts: [{ text: 'Check docs' }] },
+        {
+          role: 'model',
+          parts: [
+            { functionCall: { name: 'lookup', id: 'call_synth_1', args: { q: 'a' } } },
+            { functionCall: { name: 'lookup', id: 'call_real_2', args: { q: 'b' } }, thoughtSignature: 'sig_real_2' },
+          ],
+        },
+        {
+          role: 'user',
+          parts: [
+            { functionResponse: { name: 'lookup', id: 'call_synth_1', response: { output: 'r1' } } },
+            { functionResponse: { name: 'lookup', id: 'call_real_2', response: { output: 'r2' } } },
+          ],
+        },
+      ],
+      generationConfig: { thinkingConfig: { includeThoughts: true, thinkingLevel: 'high' } },
+    };
+
+    const g3 = await toOfficialGeminiRequest(baseReq);
+    expect('temporary_chat' in g3).toBe(false);
+    expect(g3.generationConfig).toEqual({ thinkingConfig: { includeThoughts: true, thinkingLevel: 'high' } });
+    // Function call/response IDs stripped; missing first signature receives Google's official bypass; real signature preserved.
+    expect(g3.contents).toEqual([
+      { role: 'user', parts: [{ text: 'Check docs' }] },
+      {
+        role: 'model',
+        parts: [
+          { functionCall: { name: 'lookup', args: { q: 'a' } }, thoughtSignature: SKIP_THOUGHT_SIGNATURE },
+          { functionCall: { name: 'lookup', args: { q: 'b' } }, thoughtSignature: 'sig_real_2' },
+        ],
+      },
+      {
+        role: 'user',
+        parts: [
+          { functionResponse: { name: 'lookup', response: { output: 'r1' } } },
+          { functionResponse: { name: 'lookup', response: { output: 'r2' } } },
+        ],
+      },
+    ]);
+
+    // Gemini 3 Flash thinking=off -> minimal; Gemini 3 Pro thinking=off -> low.
+    expect((await toOfficialGeminiRequest({
+      ...baseReq,
+      model: 'gemini-3-flash',
+      generationConfig: { thinkingConfig: { includeThoughts: false } },
+    })).generationConfig).toEqual({ thinkingConfig: { includeThoughts: false, thinkingLevel: 'minimal' } });
+    expect((await toOfficialGeminiRequest({
+      ...baseReq,
+      model: 'gemini-3-pro',
+      generationConfig: { thinkingConfig: { includeThoughts: false } },
+    })).generationConfig).toEqual({ thinkingConfig: { includeThoughts: false, thinkingLevel: 'low' } });
+
+    // Gemini 2.5 Pro maps thinkingLevel -> thinkingBudget, and NEVER sends thinkingBudget: 0 when off.
+    expect((await toOfficialGeminiRequest({
+      ...baseReq,
+      model: 'gemini-2.5-pro',
+      generationConfig: { thinkingConfig: { includeThoughts: true, thinkingLevel: 'medium' } },
+    })).generationConfig).toEqual({ thinkingConfig: { includeThoughts: true, thinkingBudget: 8192 } });
+    expect((await toOfficialGeminiRequest({
+      ...baseReq,
+      model: 'gemini-2.5-pro',
+      generationConfig: { thinkingConfig: { includeThoughts: false } },
+    })).generationConfig).toEqual({ thinkingConfig: { includeThoughts: false } });
+
+    // Gemini 2.5 Flash thinking=off uses thinkingBudget: 0.
+    expect((await toOfficialGeminiRequest({
+      ...baseReq,
+      model: 'gemini-2.5-flash',
+      generationConfig: { thinkingConfig: { includeThoughts: false } },
+    })).generationConfig).toEqual({ thinkingConfig: { thinkingBudget: 0 } });
+
+    // Legacy non-thinking Gemini 2.0 Flash strips thinkingConfig and does not attach thoughtSignature fallback.
+    const g20 = await toOfficialGeminiRequest({
+      ...baseReq,
+      model: 'gemini-2.0-flash',
+      contents: [
+        { role: 'user', parts: [{ text: 'hi' }] },
+        { role: 'model', parts: [{ functionCall: { name: 'lookup', id: 'c1', args: { q: 'x' } } }] },
+      ],
+      generationConfig: { temperature: 0.5, thinkingConfig: { includeThoughts: true, thinkingLevel: 'high' } },
+    });
+    expect(g20.generationConfig).toEqual({ temperature: 0.5 });
+    expect((g20.contents as Array<{ parts: unknown[] }>)[1].parts).toEqual([
+      { functionCall: { name: 'lookup', args: { q: 'x' } } },
+    ]);
   });
 
   it('encodes RobinService StreamGenerate query payload and decodes modelResponses', async () => {

@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { proxyFetch } from './http.ts';
+import { inspectHttpError } from './queue.ts';
 import { httpUrl, readState, record, writeState } from './state.ts';
 
 export const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
@@ -155,6 +156,56 @@ export function parseOpenRouter(raw: unknown): ModelMetadata[] {
       cacheWritePrice: price(cost?.input_cache_write, true),
     }];
   });
+}
+
+export function parseOfficialGeminiModels(raw: unknown): ModelMetadata[] {
+  const rows = record(raw)?.models;
+  if (!Array.isArray(rows)) return [];
+  const out: ModelMetadata[] = [];
+  const seen = new Set<string>();
+  for (const item of rows) {
+    const row = record(item);
+    if (!row || typeof row.name !== 'string') continue;
+    const methods = Array.isArray(row.supportedGenerationMethods) ? row.supportedGenerationMethods : [];
+    if (methods.length > 0 && !methods.includes('generateContent')) continue;
+    const baseline = geminiBaseline(row.name);
+    if (!baseline || seen.has(baseline.id)) continue;
+    seen.add(baseline.id);
+    out.push({
+      ...baseline,
+      displayName: typeof row.displayName === 'string' && row.displayName.trim()
+        ? row.displayName.trim()
+        : baseline.displayName,
+      contextWindow: tokenLimit(row.inputTokenLimit) ?? baseline.contextWindow,
+      maxOutputTokens: tokenLimit(row.outputTokenLimit) ?? baseline.maxOutputTokens,
+      inputMimeTypes: [...MULTIMODAL_VIDEO_MIME],
+    });
+  }
+  return out;
+}
+
+export async function fetchOfficialGeminiModels(
+  baseUrl: string,
+  headers: Headers,
+  fetchFn: typeof fetch = proxyFetch,
+  signal?: AbortSignal,
+  pageSize = 100,
+): Promise<ModelMetadata[]> {
+  const url = httpUrl(new URL(`v1beta/models?pageSize=${pageSize}`, baseUrl.replace(/\/+$/, '') + '/').href).href;
+  const reqHeaders = new Headers(headers);
+  reqHeaders.set('Accept', 'application/json');
+  const deadline = AbortSignal.timeout(12_000);
+  const response = await fetchFn(url, {
+    method: 'GET',
+    headers: reqHeaders,
+    redirect: 'error',
+    signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
+  });
+  if (!response.ok) {
+    const info = await inspectHttpError(response);
+    throw new Error(`Official Gemini API returned HTTP ${info.status}${info.detail ? `: ${info.detail}` : ''}`);
+  }
+  return parseOfficialGeminiModels(await response.json());
 }
 
 export interface CatalogOptions {

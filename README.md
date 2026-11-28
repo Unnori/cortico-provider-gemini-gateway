@@ -2,10 +2,11 @@
   <img src="assets/icon.png" width="120" alt="Gemini 多合一粮仓" />
 </p>
 
-### 📦**Gemini 多合一粮仓（Robin / Web2API / 自定义 RPC）**
-给自家桌宠搭的三合一 Gemini 喂食通道，WebUI 面板随切随用：
+### 📦**Gemini 多合一粮仓（Robin / 官方 API / Web2API / 自定义 RPC）**
+给自家桌宠搭的多合一 Gemini 喂食通道，WebUI 面板随切随用：
 - **🐦 知更鸟模式（Robin）**：支持绑多个号轮着喂（主备切号 / 雨露均沾 / 周额度优先 / 5小时窗口优先，并带瞬间降级切号保护），自带 5h & 周剩余额度小看板、原生多模态附件上传（图/音/视/PDF）和账号打码防社死。
-- **🔑 Web2API 模式**：切过去直接填官方 Gemini API Key 或自建反代 Key，零门槛开箱即用。
+- **✨ 官方 Gemini API**：一键切到 Google 官方接口（`generativelanguage.googleapis.com`），填官方 API Key（`AIzaSy...`）开箱即用，无需自建本地服务，自动按官方 `v1beta` 规范适配思考配置与工具调用签名。
+- **🔑 Web2API 模式（自建反代）**：填你自建的 `gemini-web2api-go` 或第三方兼容反代地址和密钥。
 - **🛠️ 自定义 RPC**：给喜欢自己搭网关的折腾党留的后门。
 
 ---
@@ -17,7 +18,7 @@
    ```text
    cortico-provider-gemini-gateway
    ```
-   > 小提示：刚发新版未满 24 小时想抢鲜体验，记得把版本号带上，比如 `cortico-provider-gemini-gateway@0.2.7`。
+   > 小提示：刚发新版未满 24 小时想抢鲜体验，记得把版本号带上，比如 `cortico-provider-gemini-gateway@0.2.8`。
 3. 点 **「安装」**，装完 **重启 Coopanion**，去 **模型供应商 → 新建** 选它就能开喂啦！
 
 **装不上？先看这两条避坑小纸条：**
@@ -50,17 +51,27 @@
 
 ---
 
-### 2. 🔑 Web2API 模式（官方 API Key / 自建反代）
+### 2. ✨ 官方 Gemini API 模式（Google AI Studio 官方 Key 直连）
 
-不想折腾 OAuth，只想拿个 Key 直接开聊？选它准没错：
+有 Google 官方 Gemini API Key（`AIzaSy...`）、不想搭任何本地服务？选它就对了：
 
-1. 第一步切到 **「Web2API Gemini」**，Base URL 填官方 `https://generativelanguage.googleapis.com` 或者你自己的反代地址（比如 [`gemini-web2api-go`](https://github.com/zexadev/gemini-web2api-go)）。
-2. 第二步会自动变成 **「API 密钥配置」**，直接粘进官方 API Key 或反代 Key，按网关习惯选一下 `x-goog-api-key` / `Authorization: Bearer` / 自定义请求头预设，保存就能聊。
+1. 第一步点击 **「官方 Gemini API」**，会自动指向官方地址 `https://generativelanguage.googleapis.com`（按需也可填独立代理端口）。
+2. 第二步直接粘贴官方 API Key 保存即可，默认走官方 `x-goog-api-key` 请求头，密钥仅以本地文件保存、不写进明文 `config.json`。
+3. 点击第一步 **「测试连接」** 会实时校验密钥与模型列表（`GET /v1beta/models`），请求体自动按 Google 官方 `v1beta` 规范发送（不附带非官方 `temporary_chat` 字段、区分 Gemini 2.5 `thinkingBudget` 与 Gemini 3/4 `thinkingLevel`、并在多轮工具调用中自动缓存/透传 `thoughtSignature`）。
+
+---
+
+### 3. 🔑 Web2API 模式（自建反代）
+
+如果你自己搭了 [`gemini-web2api-go`](https://github.com/zexadev/gemini-web2api-go) 等本地/远程兼容反代服务：
+
+1. 第一步切到 **「Web2API Gemini (自建反代)」**，填入你的反代地址（默认 `http://127.0.0.1:8080`）。
+2. 第二步会自动变成 **「API 密钥配置」**，粘进反代 Key，按网关习惯选一下 `x-goog-api-key` / `Authorization: Bearer` / 自定义请求头预设，保存就能聊。
 3. 密钥单独保存在端点数据目录里（仅当前用户可读），既不进代码仓库，也不会写死进配置模板。
 
 ---
 
-### 3. 🛠️ 自定义 RPC 模式（给折腾党留的后门）
+### 4. 🛠️ 自定义 RPC 模式（给折腾党留的后门）
 
 如果你自己手搓了会话式转发网关，第一步切到 **「自定义 RPC」**：
 - 第二步管鉴权（API Key 或自定义 OAuth 都行）。

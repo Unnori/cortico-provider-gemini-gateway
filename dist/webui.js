@@ -1005,9 +1005,10 @@ var authPanel = {
       oauthSection.hidden = isApiKeyMode;
       apiKeySection.hidden = !isApiKeyMode;
       if (isApiKeyMode) {
+        const isOfficial = state.isOfficialGemini;
         setPanelTitle(
           root,
-          state.protocol === "rpc" ? t("\u81EA\u5B9A\u4E49\u9274\u6743\u4E0E API \u5BC6\u94A5", "Custom Auth & API Key") : t("API \u5BC6\u94A5\u914D\u7F6E", "API Key")
+          isOfficial ? t("\u5B98\u65B9 Gemini API Key", "Official Gemini API Key") : state.protocol === "rpc" ? t("\u81EA\u5B9A\u4E49\u9274\u6743\u4E0E API \u5BC6\u94A5", "Custom Auth & API Key") : t("API \u5BC6\u94A5\u914D\u7F6E", "API Key")
         );
         if (state.apiKeyConfigured) {
           const hintSuffix = state.apiKeyHint ? `\uFF08${state.apiKeyHint}\uFF09` : "";
@@ -1019,20 +1020,21 @@ var authPanel = {
         }
         toggleMaskBtn.hidden = true;
         refreshQuotasBtn.hidden = true;
-        apiKeyDesc.textContent = state.protocol === "rpc" ? t("\u8F93\u5165\u81EA\u5EFA RPC \u7F51\u5173\u7684 API Key\uFF0C\u5E76\u6309\u9700\u81EA\u5B9A\u4E49\u9274\u6743\u8BF7\u6C42\u5934\u4E0E\u524D\u7F00\u3002\u5BC6\u94A5\u4EE5 0600 \u6743\u9650\u4FDD\u5B58\u4E8E\u672C\u5730\u76EE\u5F55\uFF0C\u4E0D\u5199\u5165 config.json\u3002", "Enter the API Key for your custom RPC gateway and customize the auth header/prefix as needed.") : t("\u76F4\u63A5\u7C98\u8D34\u4F60\u7684 Gemini / Web2API \u5BC6\u94A5\u5E76\u70B9\u51FB\u4FDD\u5B58\u3002\u5BC6\u94A5\u4EE5 0600 \u6743\u9650\u4FDD\u5B58\u5728\u672C\u5730\u76EE\u5F55\uFF0C\u4E0D\u4F1A\u5199\u5165\u660E\u6587 config.json\u3002", "Paste your Gemini or Web2API API Key and click Save. Stored locally with 0600 permissions.");
-        apiKeyInput.placeholder = state.apiKeyConfigured ? t(`\u5DF2\u914D\u7F6E\uFF08${state.apiKeyHint ?? "***"}\uFF09\uFF0C\u8F93\u5165\u65B0\u5BC6\u94A5\u53EF\u8986\u76D6`, `Configured (${state.apiKeyHint ?? "***"}); type a new key to replace`) : t("\u7C98\u8D34 API Key\uFF08\u4F8B\u5982 AIzaSy... \u6216 sk-...\uFF09", "Paste API Key (e.g. AIzaSy... or sk-...)");
+        apiKeyDesc.textContent = isOfficial ? t("\u76F4\u63A5\u7C98\u8D34\u4F60\u5728 Google AI Studio \u7533\u8BF7\u7684\u5B98\u65B9 Gemini API Key\uFF08AIzaSy...\uFF09\u5E76\u70B9\u51FB\u4FDD\u5B58\uFF0C\u9ED8\u8BA4\u901A\u8FC7\u5B98\u65B9 x-goog-api-key \u8BF7\u6C42\u5934\u76F4\u8FDE generativelanguage.googleapis.com\u3002\u5BC6\u94A5\u4EE5 0600 \u6743\u9650\u4FDD\u5B58\u5728\u672C\u5730\uFF0C\u4E0D\u4F1A\u5199\u5165\u660E\u6587 config.json\u3002", "Paste your official Google AI Studio Gemini API Key (AIzaSy...) and click Save. Connects directly to generativelanguage.googleapis.com via x-goog-api-key.") : state.protocol === "rpc" ? t("\u8F93\u5165\u81EA\u5EFA RPC \u7F51\u5173\u7684 API Key\uFF0C\u5E76\u6309\u9700\u81EA\u5B9A\u4E49\u9274\u6743\u8BF7\u6C42\u5934\u4E0E\u524D\u7F00\u3002\u5BC6\u94A5\u4EE5 0600 \u6743\u9650\u4FDD\u5B58\u4E8E\u672C\u5730\u76EE\u5F55\uFF0C\u4E0D\u5199\u5165 config.json\u3002", "Enter the API Key for your custom RPC gateway and customize the auth header/prefix as needed.") : t("\u7C98\u8D34\u81EA\u5EFA Web2API / \u53CD\u4EE3\u7F51\u5173\u7684\u5BC6\u94A5\u5E76\u70B9\u51FB\u4FDD\u5B58\u3002\u5BC6\u94A5\u4EE5 0600 \u6743\u9650\u4FDD\u5B58\u5728\u672C\u5730\u76EE\u5F55\uFF0C\u4E0D\u4F1A\u5199\u5165\u660E\u6587 config.json\u3002", "Paste your self-hosted Web2API / proxy API Key and click Save. Stored locally with 0600 permissions.");
+        apiKeyInput.placeholder = state.apiKeyConfigured ? t(`\u5DF2\u914D\u7F6E\uFF08${state.apiKeyHint ?? "***"}\uFF09\uFF0C\u8F93\u5165\u65B0\u5BC6\u94A5\u53EF\u8986\u76D6`, `Configured (${state.apiKeyHint ?? "***"}); type a new key to replace`) : isOfficial ? t("\u7C98\u8D34\u5B98\u65B9 Gemini API Key\uFF08\u4F8B\u5982 AIzaSy...\uFF09", "Paste official Gemini API Key (e.g. AIzaSy...)") : t("\u7C98\u8D34 API Key\uFF08\u4F8B\u5982 AIzaSy... \u6216 sk-...\uFF09", "Paste API Key (e.g. AIzaSy... or sk-...)");
         saveApiKeyBtn.disabled = working;
         clearApiKeyBtn.disabled = working;
         clearApiKeyBtn.hidden = state.apiKeySource !== "stored";
-        const nextFormKey = JSON.stringify([state.protocol, state.credentialHeader, state.credentialPrefix, state.secretVar ?? ""]);
+        headerPresetField.hidden = isOfficial;
+        const nextFormKey = JSON.stringify([state.protocol, isOfficial, state.credentialHeader, state.credentialPrefix, state.secretVar ?? ""]);
         if (!working && nextFormKey !== lastApiKeyFormKey) {
           lastApiKeyFormKey = nextFormKey;
-          credHeaderInput.value = state.credentialHeader;
-          credPrefixInput.value = state.credentialPrefix;
+          credHeaderInput.value = isOfficial ? "x-goog-api-key" : state.credentialHeader;
+          credPrefixInput.value = isOfficial ? "" : state.credentialPrefix;
           secretVarInput.value = state.secretVar ?? "";
           const preset = state.credentialHeader === "x-goog-api-key" && state.credentialPrefix === "" ? "goog" : state.credentialHeader.toLowerCase() === "authorization" && state.credentialPrefix === "Bearer " ? "bearer" : "custom";
           headerPresetSelect.value = preset;
-          customCredGrid.hidden = preset !== "custom" && state.protocol !== "rpc";
+          customCredGrid.hidden = isOfficial || preset !== "custom" && state.protocol !== "rpc";
         }
         wasSignedIn = state.signedIn;
         wasPending = state.pending;
@@ -1331,15 +1333,21 @@ var quotaPanel = {
       currentProtocol = routes.protocol;
       currentQuotaEndpoint = routes.quotaEndpoint.trim();
       const isRobin = routes.protocol === "robin";
+      const isOfficial = routes.isOfficialGemini;
       const isRpc = routes.protocol === "rpc";
       setPanelTitle(
         root,
-        isRobin ? t("\u989D\u5EA6\u67E5\u8BE2", "Quota & Usage") : isRpc ? t("\u81EA\u5B9A\u4E49\u8DEF\u7531\u4E0E\u7AEF\u70B9", "Custom RPC Routes") : t("\u81EA\u5B9A\u4E49\u63A5\u53E3\u4E0E\u989D\u5EA6", "Custom Endpoints & Quota")
+        isRobin ? t("\u989D\u5EA6\u67E5\u8BE2", "Quota & Usage") : isOfficial ? t("\u5B98\u65B9\u63A5\u53E3\u8BF4\u660E", "Official API Info") : isRpc ? t("\u81EA\u5B9A\u4E49\u8DEF\u7531\u4E0E\u7AEF\u70B9", "Custom RPC Routes") : t("\u81EA\u5B9A\u4E49\u63A5\u53E3\u4E0E\u989D\u5EA6", "Custom Endpoints & Quota")
       );
       customRoutesSection.hidden = isRobin;
-      quotaSection.hidden = !isRobin && !currentQuotaEndpoint;
+      quotaSection.hidden = !isRobin && (isOfficial || !currentQuotaEndpoint);
       if (!isRobin) {
-        routesDesc.textContent = isRpc ? t("\u914D\u7F6E\u81EA\u5EFA RPC \u7F51\u5173\u7684\u751F\u6210\u3001\u4E0A\u4F20\u3001\u4F1A\u8BDD\u6E05\u7406\u4E0E\u53EF\u9009\u989D\u5EA6\u67E5\u8BE2\u8DEF\u7531\uFF08\u7559\u7A7A\u5219\u4F7F\u7528\u9ED8\u8BA4\u503C\uFF09\u3002", "Customize generation, upload, cleanup, and optional quota routes for your RPC gateway.") : t("\u6309\u9700\u8986\u76D6 Web2API Gemini \u7684\u6D41\u5F0F\u751F\u6210\u3001\u9644\u4EF6\u4E0A\u4F20\u6216\u989D\u5EA6\u67E5\u8BE2\u8DEF\u7531\uFF08\u7559\u7A7A\u5219\u4F7F\u7528 Gemini \u9ED8\u8BA4\u8DEF\u7531\uFF09\u3002", "Override Web2API Gemini generation, upload, or optional quota routes (leave blank for defaults).");
+        routesDesc.textContent = isOfficial ? t("\u5F53\u524D\u4F7F\u7528 Google \u5B98\u65B9 Gemini API\uFF08generativelanguage.googleapis.com\uFF09\uFF0C\u8BF7\u6C42\u4F1A\u81EA\u52A8\u6309\u5B98\u65B9 v1beta \u534F\u8BAE\u53D1\u9001\uFF08\u542B 2.5 / 3.x \u601D\u8003\u914D\u7F6E\u4E0E\u5DE5\u5177\u8C03\u7528\u7B7E\u540D\u517C\u5BB9\uFF09\uFF0C\u65E0\u9700\u624B\u52A8\u914D\u7F6E\u81EA\u5B9A\u4E49\u8DEF\u7531\uFF1B\u989D\u5EA6\u4E0E\u8BA1\u8D39\u8BF7\u5728 Google AI Studio / Cloud Console \u67E5\u770B\u3002", "Using official Google Gemini API (generativelanguage.googleapis.com) with native v1beta streaming, thinkingConfig normalization, and thoughtSignature handling. Check usage and billing in Google AI Studio or Cloud Console.") : isRpc ? t("\u914D\u7F6E\u81EA\u5EFA RPC \u7F51\u5173\u7684\u751F\u6210\u3001\u4E0A\u4F20\u3001\u4F1A\u8BDD\u6E05\u7406\u4E0E\u53EF\u9009\u989D\u5EA6\u67E5\u8BE2\u8DEF\u7531\uFF08\u7559\u7A7A\u5219\u4F7F\u7528\u9ED8\u8BA4\u503C\uFF09\u3002", "Customize generation, upload, cleanup, and optional quota routes for your RPC gateway.") : t("\u6309\u9700\u8986\u76D6\u81EA\u5EFA Web2API Gemini \u7F51\u5173\u7684\u6D41\u5F0F\u751F\u6210\u3001\u9644\u4EF6\u4E0A\u4F20\u6216\u989D\u5EA6\u67E5\u8BE2\u8DEF\u7531\uFF08\u7559\u7A7A\u5219\u4F7F\u7528 Gemini \u9ED8\u8BA4\u8DEF\u7531\uFF09\u3002", "Override self-hosted Web2API Gemini generation, upload, or optional quota routes (leave blank for defaults).");
+        genRouteField.hidden = isOfficial;
+        uploadRouteField.hidden = isOfficial;
+        quotaRouteField.hidden = isOfficial;
+        routesActions.hidden = isOfficial;
+        routesMsg.hidden = isOfficial;
         genRouteInput.placeholder = isRpc ? "generate?$alt=json" : "v1beta/models/{model}:streamGenerateContent?alt=sse";
         genRouteInput.value = routes.generationEndpoint;
         uploadRouteInput.value = routes.uploadEndpoint;
@@ -1754,7 +1762,11 @@ var gatewayPanel = {
       size: "sm",
       onClick: () => void applyPreset("robin")
     });
-    const geminiBtn = ui.button(t("Web2API Gemini", "Web2API Gemini"), {
+    const officialBtn = ui.button(t("\u5B98\u65B9 Gemini API", "Official Gemini API"), {
+      size: "sm",
+      onClick: () => void applyPreset("official")
+    });
+    const geminiBtn = ui.button(t("Web2API Gemini (\u81EA\u5EFA\u53CD\u4EE3)", "Web2API Gemini (Self-hosted)"), {
       size: "sm",
       onClick: () => void applyPreset("gemini")
     });
@@ -1762,7 +1774,7 @@ var gatewayPanel = {
       size: "sm",
       onClick: () => void applyPreset("rpc")
     });
-    modeRow.append(robinBtn, geminiBtn, rpcBtn);
+    modeRow.append(robinBtn, officialBtn, geminiBtn, rpcBtn);
     const summaryBox = ui.h("div");
     const baseUrlInput = ui.input({
       cls: "mono",
@@ -1779,6 +1791,7 @@ var gatewayPanel = {
       ],
       onChange: (value) => void saveOptions({ authMode: value })
     });
+    const authModeField = ui.field(t("\u8BA4\u8BC1\u6A21\u5F0F", "Auth mode"), authModeSelect);
     const tempCheck = ui.checkbox(t("\u542F\u7528\u65E0\u75D5\u4F1A\u8BDD\u6807\u5FD7 (temporary_chat)", "Send temporary_chat flag"), {
       onChange: () => void saveOptions()
     });
@@ -1799,7 +1812,7 @@ var gatewayPanel = {
       modeRow,
       summaryBox,
       baseUrlField,
-      ui.field(t("\u8BA4\u8BC1\u6A21\u5F0F", "Auth mode"), authModeSelect),
+      authModeField,
       tempCheck.el,
       proxyUrlField,
       testRow,
@@ -1807,28 +1820,34 @@ var gatewayPanel = {
     );
     let saving = false;
     let currentProtocol = "robin";
+    let currentOfficial = false;
     let lastSavedProxyUrl = "";
-    function modeDescription(protocol) {
+    function modeDescription(protocol, isOfficialGemini) {
       if (protocol === "robin") return t("RobinService HTTP/2 gRPC\uFF08\u81EA\u52A8\u5207\u6362\u5B98\u65B9\u7AEF\u70B9\u4E0E\u8DEF\u7531\uFF09", "RobinService HTTP/2 gRPC (auto endpoint & routes)");
-      if (protocol === "gemini") return t("\u539F\u751F Gemini REST SSE\uFF08\u81EA\u52A8\u62FC\u63A5\u6D41\u5F0F\u751F\u6210\u8DEF\u7531\uFF09", "Native Gemini REST SSE (auto stream route)");
+      if (isOfficialGemini) return t("\u5B98\u65B9 Google Gemini REST SSE\uFF08\u4F7F\u7528\u5B98\u65B9 API Key\uFF0C\u65E0\u9700\u81EA\u5EFA\u672C\u5730\u670D\u52A1\uFF09", "Official Google Gemini REST SSE (direct official API Key, no local server)");
+      if (protocol === "gemini") return t("\u81EA\u5EFA Web2API Gemini REST SSE\uFF08\u81EA\u52A8\u62FC\u63A5\u6D41\u5F0F\u751F\u6210\u8DEF\u7531\uFF09", "Self-hosted Web2API Gemini REST SSE (auto stream route)");
       return t("\u81EA\u5B9A\u4E49\u4F1A\u8BDD\u5267\u672C RPC\uFF08\u81EA\u52A8\u62FC\u63A5 generate \u8DEF\u7531\uFF09", "Custom session RPC (auto generate route)");
     }
     function fill(state) {
       currentProtocol = state.protocol;
+      currentOfficial = state.isOfficialGemini;
       robinBtn.classList.toggle("primary", state.protocol === "robin");
-      geminiBtn.classList.toggle("primary", state.protocol === "gemini");
+      officialBtn.classList.toggle("primary", state.isOfficialGemini);
+      geminiBtn.classList.toggle("primary", state.protocol === "gemini" && !state.isOfficialGemini);
       rpcBtn.classList.toggle("primary", state.protocol === "rpc");
       authModeSelect.value = state.authMode;
+      authModeField.hidden = state.isOfficialGemini;
       tempCheck.setChecked(state.temporaryChat);
+      tempCheck.el.hidden = state.isOfficialGemini;
       lastSavedProxyUrl = state.proxyUrl ?? "";
       proxyUrlInput.value = lastSavedProxyUrl;
-      baseUrlField.hidden = state.protocol === "robin";
-      if (state.protocol !== "robin") {
+      baseUrlField.hidden = state.protocol === "robin" || state.isOfficialGemini;
+      if (!baseUrlField.hidden) {
         baseUrlInput.value = state.baseUrl;
       }
       summaryBox.replaceChildren(ui.kv([
         { k: t("\u81EA\u52A8\u63A5\u53E3\u5730\u5740", "Active API URL"), v: state.baseUrl },
-        { k: t("\u4F20\u8F93\u6A21\u5F0F", "Transport"), v: modeDescription(state.protocol) }
+        { k: t("\u4F20\u8F93\u6A21\u5F0F", "Transport"), v: modeDescription(state.protocol, state.isOfficialGemini) }
       ]));
     }
     async function load() {
@@ -1848,12 +1867,14 @@ var gatewayPanel = {
           kind: "gateway",
           instanceName: name,
           protocol: state.protocol,
+          isOfficialGemini: state.isOfficialGemini,
           authMode: state.authMode,
           authEnabled: state.authEnabled
         });
+        const label = preset === "official" ? t("\u5B98\u65B9 Gemini API", "Official Gemini API") : preset === "gemini" ? t("Web2API Gemini", "Web2API Gemini") : preset;
         message.textContent = t(
-          `\u5DF2\u81EA\u52A8\u5207\u6362\u81F3 ${preset} \u6A21\u5F0F\u5E76\u66F4\u65B0\u63A5\u53E3\u5730\u5740\u4E3A ${state.baseUrl}\uFF08\u8BF7\u70B9\u51FB\u9875\u9762\u5E95\u90E8\u300C\u4FDD\u5B58\u300D\u751F\u6548\uFF09\u3002`,
-          `Switched to ${preset} mode (${state.baseUrl}). Click Save below to persist.`
+          `\u5DF2\u81EA\u52A8\u5207\u6362\u81F3 ${label} \u6A21\u5F0F\u5E76\u66F4\u65B0\u63A5\u53E3\u5730\u5740\u4E3A ${state.baseUrl}\uFF08\u8BF7\u70B9\u51FB\u9875\u9762\u5E95\u90E8\u300C\u4FDD\u5B58\u300D\u751F\u6548\uFF09\u3002`,
+          `Switched to ${label} mode (${state.baseUrl}). Click Save below to persist.`
         );
       } catch (err) {
         if (!signal.aborted) {
@@ -1873,10 +1894,10 @@ var gatewayPanel = {
         const state = await ctx.invoke("save-options", [{
           name,
           protocol: currentProtocol,
-          authMode: overrides.authMode ?? authModeSelect.value,
-          temporaryChat: tempCheck.checked,
+          authMode: currentOfficial ? "api-key" : overrides.authMode ?? authModeSelect.value,
+          temporaryChat: currentOfficial ? false : tempCheck.checked,
           proxyUrl: proxyUrlInput.value,
-          ...currentProtocol !== "robin" ? { baseUrl: baseUrlInput.value } : {}
+          ...currentProtocol !== "robin" && !currentOfficial ? { baseUrl: baseUrlInput.value } : {}
         }]);
         if (!signal.aborted) {
           fill(state);
@@ -1884,6 +1905,7 @@ var gatewayPanel = {
             kind: "gateway",
             instanceName: name,
             protocol: state.protocol,
+            isOfficialGemini: state.isOfficialGemini,
             authMode: state.authMode,
             authEnabled: state.authEnabled
           });

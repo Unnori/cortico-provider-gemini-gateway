@@ -117,7 +117,141 @@ export async function toRpcRequest(request: GeminiRequest, upload?: UploadAttach
   };
 }
 
-export async function toGeminiRequest(request: GeminiRequest, upload?: UploadAttachment, temporaryChat = true): Promise<unknown> {
+export const SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
+
+function isGemini3OrNewer(modelId: string): boolean {
+  return /^gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i.test(modelId);
+}
+
+function isGemini25(modelId: string): boolean {
+  return /^gemini-2\.5(?:[.-]|$)/i.test(modelId);
+}
+
+function isOfficialThinkingModel(modelId: string): boolean {
+  return isGemini3OrNewer(modelId) || isGemini25(modelId) || /thinking/i.test(modelId);
+}
+
+function normalizeOfficialThinkingConfig(model: string, rawConfig: JsonObject | undefined): JsonObject | undefined {
+  const modelId = model.replace(/^(?:models\/)?(?:google\/)?/, '').trim().toLowerCase();
+  if (!rawConfig || !isOfficialThinkingModel(modelId)) return undefined;
+
+  const includeThoughts = typeof rawConfig.includeThoughts === 'boolean' ? rawConfig.includeThoughts : undefined;
+  const rawLevel = typeof rawConfig.thinkingLevel === 'string' ? rawConfig.thinkingLevel.trim().toLowerCase() : undefined;
+  const rawBudget = typeof rawConfig.thinkingBudget === 'number' && Number.isFinite(rawConfig.thinkingBudget)
+    ? rawConfig.thinkingBudget
+    : undefined;
+
+  if (isGemini3OrNewer(modelId)) {
+    const out: JsonObject = {};
+    if (includeThoughts === false) {
+      out.includeThoughts = false;
+      // Gemini 3 Flash supports minimal thinking; Gemini 3/3.1 Pro floors at low.
+      out.thinkingLevel = modelId.includes('flash') ? 'minimal' : 'low';
+      return out;
+    }
+    if (includeThoughts === true) out.includeThoughts = true;
+    if (rawLevel === 'minimal' || rawLevel === 'low' || rawLevel === 'medium' || rawLevel === 'high') {
+      out.thinkingLevel = rawLevel;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+
+  if (isGemini25(modelId)) {
+    const out: JsonObject = {};
+    const isPro = modelId.includes('pro');
+    if (includeThoughts === false) {
+      // Gemini 2.5 Pro rejects thinkingBudget: 0 ("This model only works in thinking mode").
+      if (isPro) return { includeThoughts: false };
+      return { thinkingBudget: 0 };
+    }
+    if (includeThoughts === true) out.includeThoughts = true;
+    if (rawBudget !== undefined) {
+      out.thinkingBudget = rawBudget;
+    } else if (rawLevel === 'low') {
+      out.thinkingBudget = 2048;
+    } else if (rawLevel === 'medium') {
+      out.thinkingBudget = 8192;
+    } else if (rawLevel === 'high') {
+      out.thinkingBudget = 24576;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+
+  return includeThoughts !== undefined ? { includeThoughts } : undefined;
+}
+
+function cleanOfficialGeminiPart(part: GeminiPart, ensureThoughtSignature: boolean): GeminiPart {
+  if (part.functionCall) {
+    const { id: _id, ...callRest } = part.functionCall;
+    const cleaned: GeminiPart = {
+      functionCall: callRest,
+      ...(part.thoughtSignature
+        ? { thoughtSignature: part.thoughtSignature }
+        : ensureThoughtSignature
+          ? { thoughtSignature: SKIP_THOUGHT_SIGNATURE }
+          : {}),
+    };
+    return cleaned;
+  }
+  if (part.functionResponse) {
+    const { id: _id, ...respRest } = part.functionResponse;
+    return { functionResponse: respRest };
+  }
+  return part;
+}
+
+export async function toOfficialGeminiRequest(request: GeminiRequest, upload?: UploadAttachment): Promise<JsonObject> {
+  const { model, ...body } = request;
+  const thinkingCapable = isOfficialThinkingModel(model.replace(/^(?:models\/)?(?:google\/)?/, '').trim().toLowerCase());
+  const contents: GeminiRequest['contents'] = [];
+  for (const turn of body.contents) {
+    const parts: GeminiPart[] = [];
+    let attachedFallbackSig = false;
+    for (const rawPart of turn.parts) {
+      const replaced = upload ? await replaceMedia(rawPart, upload) : rawPart;
+      const needsFallbackSig = thinkingCapable && !attachedFallbackSig && Boolean(replaced.functionCall);
+      const cleaned = cleanOfficialGeminiPart(replaced, needsFallbackSig);
+      if (cleaned.functionCall && cleaned.thoughtSignature) {
+        attachedFallbackSig = true;
+      }
+      parts.push(cleaned);
+    }
+    contents.push({ ...turn, parts });
+  }
+  let systemInstruction = body.systemInstruction;
+  if (systemInstruction && upload) {
+    const parts: GeminiPart[] = [];
+    for (const part of systemInstruction.parts) parts.push(await replaceMedia(part, upload));
+    systemInstruction = { ...systemInstruction, parts };
+  }
+  let generationConfig = body.generationConfig;
+  if (generationConfig) {
+    const { thinkingConfig: rawThinking, ...restConfig } = generationConfig;
+    const normalizedThinking = normalizeOfficialThinkingConfig(model, record(rawThinking));
+    generationConfig = {
+      ...restConfig,
+      ...(normalizedThinking ? { thinkingConfig: normalizedThinking } : {}),
+    };
+  }
+  const payload: JsonObject = {
+    contents,
+    ...(systemInstruction ? { systemInstruction } : {}),
+    ...(body.tools ? { tools: body.tools } : {}),
+    ...(body.toolConfig ? { toolConfig: body.toolConfig } : {}),
+    ...(generationConfig && Object.keys(generationConfig).length ? { generationConfig } : {}),
+  };
+  return payload;
+}
+
+export async function toGeminiRequest(
+  request: GeminiRequest,
+  upload?: UploadAttachment,
+  temporaryChat = true,
+  options?: { officialApi?: boolean },
+): Promise<unknown> {
+  if (options?.officialApi) {
+    return toOfficialGeminiRequest(request, upload);
+  }
   const { model: _model, ...body } = request;
   if (!upload) return { ...body, temporary_chat: temporaryChat };
   const contents: GeminiRequest['contents'] = [];

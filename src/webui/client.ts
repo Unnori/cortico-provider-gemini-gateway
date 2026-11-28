@@ -21,7 +21,7 @@ type PanelSyncEvent =
   | { kind: 'quota-bar-mode'; instanceName: string; mode: QuotaBarMode }
   | { kind: 'routing'; instanceName: string; routing: AccountRoutingMode }
   | { kind: 'quota'; instanceName: string; source: 'auth' | 'quota' }
-  | { kind: 'gateway'; instanceName: string; protocol: GatewayProtocol; authMode: AuthMode; authEnabled: boolean };
+  | { kind: 'gateway'; instanceName: string; protocol: GatewayProtocol; isOfficialGemini: boolean; authMode: AuthMode; authEnabled: boolean };
 const panelSyncListeners = new Set<(ev: PanelSyncEvent) => void>();
 function broadcastPanelSync(ev: PanelSyncEvent): void {
   for (const listener of panelSyncListeners) listener(ev);
@@ -719,11 +719,14 @@ const authPanel: WebUiPanel = {
       apiKeySection.hidden = !isApiKeyMode;
 
       if (isApiKeyMode) {
+        const isOfficial = state.isOfficialGemini;
         setPanelTitle(
           root,
-          state.protocol === 'rpc'
-            ? t('自定义鉴权与 API 密钥', 'Custom Auth & API Key')
-            : t('API 密钥配置', 'API Key'),
+          isOfficial
+            ? t('官方 Gemini API Key', 'Official Gemini API Key')
+            : state.protocol === 'rpc'
+              ? t('自定义鉴权与 API 密钥', 'Custom Auth & API Key')
+              : t('API 密钥配置', 'API Key'),
         );
         if (state.apiKeyConfigured) {
           const hintSuffix = state.apiKeyHint ? `（${state.apiKeyHint}）` : '';
@@ -738,21 +741,26 @@ const authPanel: WebUiPanel = {
 
         toggleMaskBtn.hidden = true;
         refreshQuotasBtn.hidden = true;
-        apiKeyDesc.textContent = state.protocol === 'rpc'
-          ? t('输入自建 RPC 网关的 API Key，并按需自定义鉴权请求头与前缀。密钥以 0600 权限保存于本地目录，不写入 config.json。', 'Enter the API Key for your custom RPC gateway and customize the auth header/prefix as needed.')
-          : t('直接粘贴你的 Gemini / Web2API 密钥并点击保存。密钥以 0600 权限保存在本地目录，不会写入明文 config.json。', 'Paste your Gemini or Web2API API Key and click Save. Stored locally with 0600 permissions.');
+        apiKeyDesc.textContent = isOfficial
+          ? t('直接粘贴你在 Google AI Studio 申请的官方 Gemini API Key（AIzaSy...）并点击保存，默认通过官方 x-goog-api-key 请求头直连 generativelanguage.googleapis.com。密钥以 0600 权限保存在本地，不会写入明文 config.json。', 'Paste your official Google AI Studio Gemini API Key (AIzaSy...) and click Save. Connects directly to generativelanguage.googleapis.com via x-goog-api-key.')
+          : state.protocol === 'rpc'
+            ? t('输入自建 RPC 网关的 API Key，并按需自定义鉴权请求头与前缀。密钥以 0600 权限保存于本地目录，不写入 config.json。', 'Enter the API Key for your custom RPC gateway and customize the auth header/prefix as needed.')
+            : t('粘贴自建 Web2API / 反代网关的密钥并点击保存。密钥以 0600 权限保存在本地目录，不会写入明文 config.json。', 'Paste your self-hosted Web2API / proxy API Key and click Save. Stored locally with 0600 permissions.');
         apiKeyInput.placeholder = state.apiKeyConfigured
           ? t(`已配置（${state.apiKeyHint ?? '***'}），输入新密钥可覆盖`, `Configured (${state.apiKeyHint ?? '***'}); type a new key to replace`)
-          : t('粘贴 API Key（例如 AIzaSy... 或 sk-...）', 'Paste API Key (e.g. AIzaSy... or sk-...)');
+          : isOfficial
+            ? t('粘贴官方 Gemini API Key（例如 AIzaSy...）', 'Paste official Gemini API Key (e.g. AIzaSy...)')
+            : t('粘贴 API Key（例如 AIzaSy... 或 sk-...）', 'Paste API Key (e.g. AIzaSy... or sk-...)');
         saveApiKeyBtn.disabled = working;
         clearApiKeyBtn.disabled = working;
         clearApiKeyBtn.hidden = state.apiKeySource !== 'stored';
+        headerPresetField.hidden = isOfficial;
 
-        const nextFormKey = JSON.stringify([state.protocol, state.credentialHeader, state.credentialPrefix, state.secretVar ?? '']);
+        const nextFormKey = JSON.stringify([state.protocol, isOfficial, state.credentialHeader, state.credentialPrefix, state.secretVar ?? '']);
         if (!working && nextFormKey !== lastApiKeyFormKey) {
           lastApiKeyFormKey = nextFormKey;
-          credHeaderInput.value = state.credentialHeader;
-          credPrefixInput.value = state.credentialPrefix;
+          credHeaderInput.value = isOfficial ? 'x-goog-api-key' : state.credentialHeader;
+          credPrefixInput.value = isOfficial ? '' : state.credentialPrefix;
           secretVarInput.value = state.secretVar ?? '';
           const preset = state.credentialHeader === 'x-goog-api-key' && state.credentialPrefix === ''
             ? 'goog'
@@ -760,7 +768,7 @@ const authPanel: WebUiPanel = {
               ? 'bearer'
               : 'custom';
           headerPresetSelect.value = preset;
-          customCredGrid.hidden = preset !== 'custom' && state.protocol !== 'rpc';
+          customCredGrid.hidden = isOfficial || (preset !== 'custom' && state.protocol !== 'rpc');
         }
         wasSignedIn = state.signedIn;
         wasPending = state.pending;
@@ -1099,24 +1107,34 @@ const quotaPanel: WebUiPanel = {
       currentProtocol = routes.protocol;
       currentQuotaEndpoint = routes.quotaEndpoint.trim();
       const isRobin = routes.protocol === 'robin';
+      const isOfficial = routes.isOfficialGemini;
       const isRpc = routes.protocol === 'rpc';
 
       setPanelTitle(
         root,
         isRobin
           ? t('额度查询', 'Quota & Usage')
-          : isRpc
-            ? t('自定义路由与端点', 'Custom RPC Routes')
-            : t('自定义接口与额度', 'Custom Endpoints & Quota'),
+          : isOfficial
+            ? t('官方接口说明', 'Official API Info')
+            : isRpc
+              ? t('自定义路由与端点', 'Custom RPC Routes')
+              : t('自定义接口与额度', 'Custom Endpoints & Quota'),
       );
 
       customRoutesSection.hidden = isRobin;
-      quotaSection.hidden = !isRobin && !currentQuotaEndpoint;
+      quotaSection.hidden = !isRobin && (isOfficial || !currentQuotaEndpoint);
 
       if (!isRobin) {
-        routesDesc.textContent = isRpc
-          ? t('配置自建 RPC 网关的生成、上传、会话清理与可选额度查询路由（留空则使用默认值）。', 'Customize generation, upload, cleanup, and optional quota routes for your RPC gateway.')
-          : t('按需覆盖 Web2API Gemini 的流式生成、附件上传或额度查询路由（留空则使用 Gemini 默认路由）。', 'Override Web2API Gemini generation, upload, or optional quota routes (leave blank for defaults).');
+        routesDesc.textContent = isOfficial
+          ? t('当前使用 Google 官方 Gemini API（generativelanguage.googleapis.com），请求会自动按官方 v1beta 协议发送（含 2.5 / 3.x 思考配置与工具调用签名兼容），无需手动配置自定义路由；额度与计费请在 Google AI Studio / Cloud Console 查看。', 'Using official Google Gemini API (generativelanguage.googleapis.com) with native v1beta streaming, thinkingConfig normalization, and thoughtSignature handling. Check usage and billing in Google AI Studio or Cloud Console.')
+          : isRpc
+            ? t('配置自建 RPC 网关的生成、上传、会话清理与可选额度查询路由（留空则使用默认值）。', 'Customize generation, upload, cleanup, and optional quota routes for your RPC gateway.')
+            : t('按需覆盖自建 Web2API Gemini 网关的流式生成、附件上传或额度查询路由（留空则使用 Gemini 默认路由）。', 'Override self-hosted Web2API Gemini generation, upload, or optional quota routes (leave blank for defaults).');
+        genRouteField.hidden = isOfficial;
+        uploadRouteField.hidden = isOfficial;
+        quotaRouteField.hidden = isOfficial;
+        routesActions.hidden = isOfficial;
+        routesMsg.hidden = isOfficial;
         genRouteInput.placeholder = isRpc
           ? 'generate?$alt=json'
           : 'v1beta/models/{model}:streamGenerateContent?alt=sse';
@@ -1600,7 +1618,11 @@ const gatewayPanel: WebUiPanel = {
       size: 'sm',
       onClick: () => void applyPreset('robin'),
     });
-    const geminiBtn = ui.button(t('Web2API Gemini', 'Web2API Gemini'), {
+    const officialBtn = ui.button(t('官方 Gemini API', 'Official Gemini API'), {
+      size: 'sm',
+      onClick: () => void applyPreset('official'),
+    });
+    const geminiBtn = ui.button(t('Web2API Gemini (自建反代)', 'Web2API Gemini (Self-hosted)'), {
       size: 'sm',
       onClick: () => void applyPreset('gemini'),
     });
@@ -1608,7 +1630,7 @@ const gatewayPanel: WebUiPanel = {
       size: 'sm',
       onClick: () => void applyPreset('rpc'),
     });
-    modeRow.append(robinBtn, geminiBtn, rpcBtn);
+    modeRow.append(robinBtn, officialBtn, geminiBtn, rpcBtn);
 
     const summaryBox = ui.h('div');
 
@@ -1628,6 +1650,7 @@ const gatewayPanel: WebUiPanel = {
       ],
       onChange: value => void saveOptions({ authMode: value as AuthMode }),
     });
+    const authModeField = ui.field(t('认证模式', 'Auth mode'), authModeSelect);
     const tempCheck = ui.checkbox(t('启用无痕会话标志 (temporary_chat)', 'Send temporary_chat flag'), {
       onChange: () => void saveOptions(),
     });
@@ -1652,7 +1675,7 @@ const gatewayPanel: WebUiPanel = {
       modeRow,
       summaryBox,
       baseUrlField,
-      ui.field(t('认证模式', 'Auth mode'), authModeSelect),
+      authModeField,
       tempCheck.el,
       proxyUrlField,
       testRow,
@@ -1661,33 +1684,39 @@ const gatewayPanel: WebUiPanel = {
 
     let saving = false;
     let currentProtocol: GatewayPanelState['protocol'] = 'robin';
+    let currentOfficial = false;
     let lastSavedProxyUrl = '';
 
-    function modeDescription(protocol: GatewayPanelState['protocol']): string {
+    function modeDescription(protocol: GatewayPanelState['protocol'], isOfficialGemini: boolean): string {
       if (protocol === 'robin') return t('RobinService HTTP/2 gRPC（自动切换官方端点与路由）', 'RobinService HTTP/2 gRPC (auto endpoint & routes)');
-      if (protocol === 'gemini') return t('原生 Gemini REST SSE（自动拼接流式生成路由）', 'Native Gemini REST SSE (auto stream route)');
+      if (isOfficialGemini) return t('官方 Google Gemini REST SSE（使用官方 API Key，无需自建本地服务）', 'Official Google Gemini REST SSE (direct official API Key, no local server)');
+      if (protocol === 'gemini') return t('自建 Web2API Gemini REST SSE（自动拼接流式生成路由）', 'Self-hosted Web2API Gemini REST SSE (auto stream route)');
       return t('自定义会话剧本 RPC（自动拼接 generate 路由）', 'Custom session RPC (auto generate route)');
     }
 
     function fill(state: GatewayPanelState) {
       currentProtocol = state.protocol;
+      currentOfficial = state.isOfficialGemini;
       robinBtn.classList.toggle('primary', state.protocol === 'robin');
-      geminiBtn.classList.toggle('primary', state.protocol === 'gemini');
+      officialBtn.classList.toggle('primary', state.isOfficialGemini);
+      geminiBtn.classList.toggle('primary', state.protocol === 'gemini' && !state.isOfficialGemini);
       rpcBtn.classList.toggle('primary', state.protocol === 'rpc');
 
       authModeSelect.value = state.authMode;
+      authModeField.hidden = state.isOfficialGemini;
       tempCheck.setChecked(state.temporaryChat);
+      tempCheck.el.hidden = state.isOfficialGemini;
       lastSavedProxyUrl = state.proxyUrl ?? '';
       proxyUrlInput.value = lastSavedProxyUrl;
 
-      baseUrlField.hidden = state.protocol === 'robin';
-      if (state.protocol !== 'robin') {
+      baseUrlField.hidden = state.protocol === 'robin' || state.isOfficialGemini;
+      if (!baseUrlField.hidden) {
         baseUrlInput.value = state.baseUrl;
       }
 
       summaryBox.replaceChildren(ui.kv([
         { k: t('自动接口地址', 'Active API URL'), v: state.baseUrl },
-        { k: t('传输模式', 'Transport'), v: modeDescription(state.protocol) },
+        { k: t('传输模式', 'Transport'), v: modeDescription(state.protocol, state.isOfficialGemini) },
       ]));
     }
 
@@ -1696,7 +1725,7 @@ const gatewayPanel: WebUiPanel = {
       if (!signal.aborted) fill(state);
     }
 
-    async function applyPreset(preset: 'robin' | 'gemini' | 'rpc') {
+    async function applyPreset(preset: 'robin' | 'official' | 'gemini' | 'rpc') {
       if (saving || signal.aborted) return;
       saving = true;
       message.textContent = '';
@@ -1709,12 +1738,18 @@ const gatewayPanel: WebUiPanel = {
           kind: 'gateway',
           instanceName: name,
           protocol: state.protocol,
+          isOfficialGemini: state.isOfficialGemini,
           authMode: state.authMode,
           authEnabled: state.authEnabled,
         });
+        const label = preset === 'official'
+          ? t('官方 Gemini API', 'Official Gemini API')
+          : preset === 'gemini'
+            ? t('Web2API Gemini', 'Web2API Gemini')
+            : preset;
         message.textContent = t(
-          `已自动切换至 ${preset} 模式并更新接口地址为 ${state.baseUrl}（请点击页面底部「保存」生效）。`,
-          `Switched to ${preset} mode (${state.baseUrl}). Click Save below to persist.`,
+          `已自动切换至 ${label} 模式并更新接口地址为 ${state.baseUrl}（请点击页面底部「保存」生效）。`,
+          `Switched to ${label} mode (${state.baseUrl}). Click Save below to persist.`,
         );
       } catch (err) {
         if (!signal.aborted) {
@@ -1735,10 +1770,10 @@ const gatewayPanel: WebUiPanel = {
         const state = await ctx.invoke<GatewayPanelState>('save-options', [{
           name,
           protocol: currentProtocol,
-          authMode: overrides.authMode ?? authModeSelect.value,
-          temporaryChat: tempCheck.checked,
+          authMode: currentOfficial ? 'api-key' : (overrides.authMode ?? authModeSelect.value),
+          temporaryChat: currentOfficial ? false : tempCheck.checked,
           proxyUrl: proxyUrlInput.value,
-          ...(currentProtocol !== 'robin' ? { baseUrl: baseUrlInput.value } : {}),
+          ...(currentProtocol !== 'robin' && !currentOfficial ? { baseUrl: baseUrlInput.value } : {}),
         }]);
         if (!signal.aborted) {
           fill(state);
@@ -1746,6 +1781,7 @@ const gatewayPanel: WebUiPanel = {
             kind: 'gateway',
             instanceName: name,
             protocol: state.protocol,
+            isOfficialGemini: state.isOfficialGemini,
             authMode: state.authMode,
             authEnabled: state.authEnabled,
           });

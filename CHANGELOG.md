@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.8
+
+✨ 新增独立的「官方 Gemini API」直连模式，支持粘贴 Google 官方 API Key 开箱即用（无需自建本地服务）：
+- **新增「官方 Gemini API」预设入口**：第一步连接模式新增独立的「官方 Gemini API」按钮（与「Web2API Gemini (自建反代)」明确区分），一键指向 `https://generativelanguage.googleapis.com`、使用官方 `x-goog-api-key` 请求头并关闭非官方 `temporary_chat` 字段；第二步自动简化为官方 Key 粘贴界面，并复用独立代理地址与定价配置。
+- **官方 `v1beta` 请求格式兼容**：面向 `generativelanguage.googleapis.com` 发送请求时，不再附带非官方 `temporary_chat` 字段与 `functionCall.id` / `functionResponse.id`；按模型代际自动规范化 `thinkingConfig`（Gemini 3+ 使用 `thinkingLevel`，Gemini 2.5 使用 `thinkingBudget` 且避免对 `2.5-pro` 发送 `0`，非思考模型自动省略）；同时在多轮工具调用中自动缓存并回传真实 `thoughtSignature`（对历史合成帧或跨供应商记录自动补充 `skip_thought_signature_validator`），且原生模式下不把正文里提及的 `<tool_call>` 误解析为工具调用。
+- **官方模式实时连接检测与模型列表拉取**：在官方 Gemini API 模式下，「测试连接」改为真实请求 `GET /v1beta/models` 验证网络、代理与 Key 有效性，模型下拉列表亦会实时拉取当前 Key 可用的官方 `generateContent` 模型并合并 `models.dev` 定价信息。
+
 ## 0.2.7
 
 🛡️ 挂起永久失效的 OAuth 账号（如 `invalid_grant`），避免多账号池每 10 分钟重复白撞 401：

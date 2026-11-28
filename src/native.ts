@@ -79,6 +79,7 @@ function toolConfig(choice: Request['tool_choice']): GeminiRequest['toolConfig']
 export function toGeminiInput(
   request: Request, options: GenerateOptions, host: Pick<ProviderHost, 'readBlob' | 'keepThinking'>,
   accepts: (mime: string) => boolean,
+  thoughtSignatures?: ReadonlyMap<string, string>,
 ): GeminiRequest {
   const spec = requestSpec(request, options);
   const system: GeminiPart[] = [];
@@ -97,7 +98,11 @@ export function toGeminiInput(
         const args = record(JSON.parse(call.function.arguments || '{}'));
         if (!args) throw new Error('Gemini function arguments must be a JSON object');
         names.set(call.id, call.function.name);
-        parts.push({ functionCall: { name: call.function.name, id: call.id, args } });
+        const thoughtSignature = thoughtSignatures?.get(call.id);
+        parts.push({
+          functionCall: { name: call.function.name, id: call.id, args },
+          ...(thoughtSignature ? { thoughtSignature } : {}),
+        });
       }
     } else if (message.role === 'tool') {
       const id = message.tool_call_id;
@@ -347,6 +352,7 @@ export class CustomGeminiProvider extends BaseProvider {
   private readonly client: GatewayClient;
   private readonly host: ProviderHost;
   private readonly prepare: (model: string) => (mime: string) => boolean;
+  private readonly thoughtSignatures = new Map<string, string>();
 
   constructor(
     name: string,
@@ -359,6 +365,15 @@ export class CustomGeminiProvider extends BaseProvider {
     this.client = client;
     this.host = host;
     this.prepare = prepare;
+  }
+
+  private rememberThoughtSignature(callId: string, signature: string): void {
+    this.thoughtSignatures.delete(callId);
+    this.thoughtSignatures.set(callId, signature);
+    if (this.thoughtSignatures.size > 2_000) {
+      const oldest = this.thoughtSignatures.keys().next().value;
+      if (oldest !== undefined) this.thoughtSignatures.delete(oldest);
+    }
   }
 
   get generationRoute(): string {
@@ -396,7 +411,7 @@ export class CustomGeminiProvider extends BaseProvider {
       };
     });
     try {
-      const input = toGeminiInput(request, options, this.host, this.prepare(model));
+      const input = toGeminiInput(request, options, this.host, this.prepare(model), this.thoughtSignatures);
       if (!/^gemini-[\w.:-]+$/.test(input.model)) throw new Error('Configure a Gemini model ID for this gateway');
       const usedCallIds = new Set<string>();
       for (const turn of input.contents) {
@@ -415,8 +430,12 @@ export class CustomGeminiProvider extends BaseProvider {
           const call = part.functionCall;
           if (call) {
             if (!call.name || (call.args !== undefined && !record(call.args))) throw new Error('Invalid Gemini functionCall');
+            const callId = mintUniqueCallId(call.id, usedCallIds, alwaysMintCallId);
+            if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
+              this.rememberThoughtSignature(callId, part.thoughtSignature);
+            }
             assembly.feedFunctionCall({
-              id: mintUniqueCallId(call.id, usedCallIds, alwaysMintCallId),
+              id: callId,
               name: call.name,
               argumentsJson: JSON.stringify(call.args ?? {}),
             }, metadata, emit);

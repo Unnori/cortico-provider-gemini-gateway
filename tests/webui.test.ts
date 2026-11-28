@@ -419,4 +419,208 @@ describe('gateway WebUI browser OAuth, persistence, direct call, and quota panel
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('supports Official Gemini API preset with live /v1beta/models test, model listing, x-goog-api-key, and thoughtSignature replay', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gemini-webui-official-'));
+    const seenBodies: Record<string, unknown>[] = [];
+    const seenHeaders: Headers[] = [];
+    let streamTurn = 0;
+
+    const fetchMock = vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      const url = String(input);
+      const hdrs = new Headers(init?.headers);
+      if (url.startsWith('https://generativelanguage.googleapis.com/v1beta/models?')) {
+        seenHeaders.push(hdrs);
+        if (hdrs.get('x-goog-api-key') !== 'AIzaSyOfficialLiveKey9999') {
+          return Response.json({ error: { code: 400, message: 'API key not valid.' } }, { status: 400 });
+        }
+        return Response.json({
+          models: [
+            {
+              name: 'models/gemini-3-flash',
+              displayName: 'Gemini 3 Flash',
+              inputTokenLimit: 1_048_576,
+              outputTokenLimit: 65_536,
+              supportedGenerationMethods: ['generateContent', 'countTokens'],
+            },
+            {
+              name: 'models/gemini-2.5-pro',
+              displayName: 'Gemini 2.5 Pro',
+              inputTokenLimit: 1_048_576,
+              outputTokenLimit: 65_536,
+              supportedGenerationMethods: ['generateContent'],
+            },
+            {
+              name: 'models/text-embedding-004',
+              displayName: 'Text Embedding',
+              supportedGenerationMethods: ['embedContent'],
+            },
+          ],
+        });
+      }
+      if (url === 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse') {
+        seenHeaders.push(hdrs);
+        seenBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        streamTurn += 1;
+        const sse = streamTurn === 1
+          ? [
+              `data: ${JSON.stringify({
+                candidates: [{
+                  content: {
+                    role: 'model',
+                    parts: [{
+                      functionCall: { name: 'lookup_weather', args: { city: 'Tokyo' } },
+                      thoughtSignature: 'sig_official_turn1_xyz',
+                    }],
+                  },
+                  finishReason: 'STOP',
+                }],
+                responseId: 'resp_off_1',
+                modelVersion: 'gemini-3-flash',
+              })}`,
+              '',
+            ].join('\n\n')
+          : [
+              `data: ${JSON.stringify({
+                candidates: [{
+                  content: {
+                    role: 'model',
+                    parts: [{ text: 'Tokyo is 22C. Example literal tag: <tool_call>{"name":"noop","args":{}}</tool_call>' }],
+                  },
+                  finishReason: 'STOP',
+                }],
+                usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 25, totalTokenCount: 125 },
+                responseId: 'resp_off_2',
+                modelVersion: 'gemini-3-flash',
+              })}`,
+              '',
+            ].join('\n\n');
+        return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      if (url.includes('models.dev') || url.includes('openrouter.ai')) {
+        return new Response(null, { status: 404 });
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      let currentEntry: LLMProviderEntry = {
+        kind: provider.id,
+        baseUrl: provider.defaultBaseUrl,
+        spec: { model: 'gemini-3-flash', thinking: true, reasoningEffort: 'high' },
+        options: {
+          protocol: 'gemini',
+          authMode: 'api-key',
+          credentialHeader: 'Authorization',
+          credentialPrefix: 'Bearer ',
+        },
+      };
+
+      const makeInstance = (name: string, entry: LLMProviderEntry) => provider.create(name, entry, {
+        stateDir: join(root, name),
+        secret: () => '',
+        readBlob: () => null,
+        keepThinking: () => false,
+        log: nullLogger(),
+      });
+
+      const ui = provider.webUi!({
+        language: 'zh',
+        editing: true,
+        entries: () => [{ name: 'official-test', entry: currentEntry }],
+        instance: name => makeInstance(name, currentEntry),
+        save: (_name, next) => { currentEntry = structuredClone(next); },
+      });
+
+      // 1. Applying 'official' preset points directly to generativelanguage.googleapis.com, disables temporary_chat,
+      //    and clears leftover self-hosted Authorization: Bearer header overrides.
+      const gw = await ui.invoke!('gateway', 'apply-preset', [{ name: 'official-test', preset: 'official' }]) as GatewayPanelState;
+      expect(gw.protocol).toBe('gemini');
+      expect(gw.isOfficialGemini).toBe(true);
+      expect(gw.baseUrl).toBe('https://generativelanguage.googleapis.com');
+      expect(gw.authMode).toBe('api-key');
+      expect(gw.temporaryChat).toBe(false);
+      expect(currentEntry.options?.credentialHeader).toBeUndefined();
+      expect(currentEntry.options?.credentialPrefix).toBeUndefined();
+
+      // Test before entering API key guides user to Step 2.
+      const testNoKey = await ui.invoke!('gateway', 'test', [{ name: 'official-test' }]) as GatewayTestResult;
+      expect(testNoKey.ok).toBe(false);
+
+      // 2. Save official Gemini API Key and run live connection test + official model listing.
+      const authStatus = await ui.invoke!('auth', 'save-api-key', [{
+        name: 'official-test',
+        apiKey: 'AIzaSyOfficialLiveKey9999',
+      }]) as AuthPanelStatus;
+      expect(authStatus.isOfficialGemini).toBe(true);
+      expect(authStatus.apiKeyConfigured).toBe(true);
+      expect(authStatus.credentialHeader).toBe('x-goog-api-key');
+
+      const testOk = await ui.invoke!('gateway', 'test', [{ name: 'official-test' }]) as GatewayTestResult;
+      expect(testOk.ok).toBe(true);
+      expect(testOk.summary).toContain('官方 Gemini API');
+      expect(testOk.summary).toContain('2 个模型可用');
+
+      const inst = makeInstance('official-test', currentEntry);
+      const listed = await inst.listModels!();
+      expect(listed.map(m => m.id)).toEqual(['gemini-3-flash', 'gemini-2.5-pro']);
+
+      // 3. Multi-turn tool calling: Turn 1 has synthetic external_event_frame (gets skip_thought_signature_validator);
+      //    Turn 2 replays real thoughtSignature cached from Turn 1 and preserves literal <tool_call> text safely.
+      const turn1 = await inst.client.respond({
+        model: 'gemini-3-flash',
+        reasoning: { effort: 'high' },
+        tools: [{ type: 'function', name: 'lookup_weather', description: 'Get weather', parameters: { type: 'object' } }],
+        input: [
+          { type: 'function_call', call_id: 'evf_1', name: 'external_event_frame', arguments: '{}' },
+          { type: 'function_call_output', call_id: 'evf_1', output: 'What is the weather in Tokyo?' },
+        ],
+      });
+      expect(turn1.response.status).toBe('completed');
+      const emittedCall = turn1.response.output.find(i => i.type === 'function_call');
+      expect(emittedCall?.type).toBe('function_call');
+      const turn1CallId = emittedCall && emittedCall.type === 'function_call' ? emittedCall.call_id : '';
+      expect(turn1CallId).toBeTruthy();
+
+      expect('temporary_chat' in seenBodies[0]).toBe(false);
+      expect(seenBodies[0].generationConfig).toEqual({
+        thinkingConfig: { includeThoughts: true, thinkingLevel: 'high' },
+      });
+      const turn1Contents = seenBodies[0].contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+      expect(turn1Contents[0].parts[0]).toEqual({
+        functionCall: { name: 'external_event_frame', args: {} },
+        thoughtSignature: 'skip_thought_signature_validator',
+      });
+      expect(turn1Contents[1].parts[0]).toEqual({
+        functionResponse: { name: 'external_event_frame', response: { output: 'What is the weather in Tokyo?' } },
+      });
+
+      const turn2 = await inst.client.respond({
+        model: 'gemini-3-flash',
+        reasoning: { effort: 'high' },
+        tools: [{ type: 'function', name: 'lookup_weather', description: 'Get weather', parameters: { type: 'object' } }],
+        input: [
+          { type: 'function_call', call_id: 'evf_1', name: 'external_event_frame', arguments: '{}' },
+          { type: 'function_call_output', call_id: 'evf_1', output: 'What is the weather in Tokyo?' },
+          { type: 'function_call', call_id: turn1CallId, name: 'lookup_weather', arguments: '{"city":"Tokyo"}' },
+          { type: 'function_call_output', call_id: turn1CallId, output: '22C sunny' },
+        ],
+      });
+      expect(turn2.response.status).toBe('completed');
+      // Cached real thoughtSignature from Turn 1 is replayed on Turn 2!
+      const turn2Contents = seenBodies[1].contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+      expect(turn2Contents[2].parts[0]).toEqual({
+        functionCall: { name: 'lookup_weather', args: { city: 'Tokyo' } },
+        thoughtSignature: 'sig_official_turn1_xyz',
+      });
+      // Prose mentioning <tool_call> is NOT turned into a synthetic function call on official API.
+      expect(turn2.response.output.some(i => i.type === 'function_call')).toBe(false);
+      expect(JSON.stringify(turn2.response.output)).toContain('<tool_call>');
+      expect(seenHeaders.every(h => h.get('x-goog-api-key') === 'AIzaSyOfficialLiveKey9999')).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

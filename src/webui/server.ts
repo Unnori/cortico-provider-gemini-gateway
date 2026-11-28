@@ -9,6 +9,7 @@ import { maskProxyDisplay, parseProxyUrlInput } from '../http.ts';
 import type { AccountTermsStatus } from '../oauth.ts';
 import {
   configuration,
+  isOfficialGeminiBaseUrl,
   presetEntryPatch,
   resolveAutoBaseUrl,
   type AccountRoutingMode,
@@ -52,6 +53,7 @@ export interface AuthAccountItem {
 export interface AuthPanelStatus {
   saved: boolean;
   protocol: GatewayProtocol;
+  isOfficialGemini: boolean;
   authMode: AuthMode;
   accountRouting: AccountRoutingMode;
   emailsMasked: boolean;
@@ -87,6 +89,7 @@ export interface QuotaAccountLabels {
 
 export interface CustomRoutesState {
   protocol: GatewayProtocol;
+  isOfficialGemini: boolean;
   baseUrl: string;
   generationEndpoint: string;
   uploadEndpoint: string;
@@ -99,6 +102,7 @@ export interface GatewayPanelState {
   baseUrl: string;
   model: string;
   protocol: GatewayProtocol;
+  isOfficialGemini: boolean;
   authMode: AuthMode;
   generationEndpoint: string;
   uploadEndpoint: string;
@@ -131,17 +135,19 @@ const STRING_OPTION_KEYS = [
 
 function asGatewayState(entry: LLMProviderEntry, authEnabled: boolean): GatewayPanelState {
   const cfg = configuration(entry);
+  const isOfficialGemini = cfg.protocol === 'gemini' && isOfficialGeminiBaseUrl(entry.baseUrl);
   return {
     baseUrl: entry.baseUrl,
     model: entry.spec?.model ?? '',
     protocol: cfg.protocol,
+    isOfficialGemini,
     authMode: cfg.authMode,
     generationEndpoint: cfg.generationEndpoint ?? '',
     uploadEndpoint: cfg.uploadEndpoint ?? '',
     deleteEndpoint: cfg.deleteEndpoint ?? '',
     quotaEndpoint: cfg.quotaEndpoint ?? '',
     proxyUrl: cfg.proxyUrl ?? '',
-    temporaryChat: cfg.temporaryChat ?? true,
+    temporaryChat: cfg.temporaryChat ?? !isOfficialGemini,
     authEnabled,
   };
 }
@@ -150,6 +156,7 @@ function asCustomRoutesState(entry: LLMProviderEntry): CustomRoutesState {
   const cfg = configuration(entry);
   return {
     protocol: cfg.protocol,
+    isOfficialGemini: cfg.protocol === 'gemini' && isOfficialGeminiBaseUrl(entry.baseUrl),
     baseUrl: entry.baseUrl,
     generationEndpoint: cfg.generationEndpoint ?? '',
     uploadEndpoint: cfg.uploadEndpoint ?? '',
@@ -190,6 +197,7 @@ function asAuthStatus(control: GatewayInstanceControl, entry: LLMProviderEntry, 
   return {
     saved,
     protocol: cfg.protocol,
+    isOfficialGemini: cfg.protocol === 'gemini' && isOfficialGeminiBaseUrl(entry.baseUrl),
     authMode: cfg.authMode,
     accountRouting: cfg.accountRouting,
     emailsMasked: status.emailsMasked,
@@ -402,15 +410,19 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
         }
         if (method === 'apply-preset') {
           const presetId = raw.preset;
-          if (presetId !== 'robin' && presetId !== 'gemini' && presetId !== 'rpc') {
+          if (presetId !== 'robin' && presetId !== 'official' && presetId !== 'gemini' && presetId !== 'rpc') {
             throw new Error(en ? 'Unknown gateway preset' : '未知预设类型');
           }
           const preset = presetEntryPatch(presetId as GatewayPresetId, entry.baseUrl);
           const oauthProfile = typeof entry.options?.oauthProfile === 'string' ? entry.options.oauthProfile : undefined;
           const accountRouting = typeof entry.options?.accountRouting === 'string' ? entry.options.accountRouting : undefined;
           const apiKeyConfigured = typeof entry.options?.apiKeyConfigured === 'boolean' ? entry.options.apiKeyConfigured : undefined;
-          const credentialHeader = typeof entry.options?.credentialHeader === 'string' ? entry.options.credentialHeader : undefined;
-          const credentialPrefix = typeof entry.options?.credentialPrefix === 'string' ? entry.options.credentialPrefix : undefined;
+          const credentialHeader = presetId === 'official'
+            ? undefined
+            : typeof entry.options?.credentialHeader === 'string' ? entry.options.credentialHeader : undefined;
+          const credentialPrefix = presetId === 'official'
+            ? undefined
+            : typeof entry.options?.credentialPrefix === 'string' ? entry.options.credentialPrefix : undefined;
           const proxyUrl = typeof entry.options?.proxyUrl === 'string' ? entry.options.proxyUrl : undefined;
           const next: LLMProviderEntry = {
             ...entry,
@@ -477,6 +489,13 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
             nextBaseUrl = resolveAutoBaseUrl(nextProtocol, entry.baseUrl);
           }
 
+          if (nextProtocol === 'gemini' && isOfficialGeminiBaseUrl(nextBaseUrl)) {
+            nextOptions.authMode = 'api-key';
+            nextOptions.temporaryChat = false;
+            delete nextOptions.credentialHeader;
+            delete nextOptions.credentialPrefix;
+          }
+
           const next: LLMProviderEntry = { ...entry, baseUrl: nextBaseUrl, options: nextOptions };
           const nextCfg = configuration(next);
           host.save(name, next);
@@ -538,6 +557,25 @@ export function gatewayWebUi(host: ProviderWebUiHost): Partial<WebUiPageContribu
                 elapsedMs: Date.now() - started,
                 summary: en ? 'Enter an API Key in Step 2 first.' : '请先在第二步填写并保存 API Key。',
               };
+            }
+            if (cfg.protocol === 'gemini' && isOfficialGeminiBaseUrl(entry.baseUrl)) {
+              try {
+                const probe = await control.testOfficialConnection();
+                const sample = probe.sampleModels.length ? ` · ${probe.sampleModels.join(', ')}` : '';
+                return {
+                  ok: true,
+                  elapsedMs: Date.now() - started,
+                  summary: en
+                    ? `Connected (Official Gemini API · ${probe.modelCount} models ready${proxyNote}${sample})`
+                    : `连接正常（官方 Gemini API · 共 ${probe.modelCount} 个模型可用${proxyNote}${sample}）`,
+                };
+              } catch (err) {
+                return {
+                  ok: false,
+                  elapsedMs: Date.now() - started,
+                  summary: err instanceof Error ? err.message : String(err),
+                };
+              }
             }
             return {
               ok: true,
